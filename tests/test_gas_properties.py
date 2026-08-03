@@ -8,6 +8,8 @@ version bump but tight enough to catch a unit error (which would be off by
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from gasperm import units
@@ -123,6 +125,51 @@ class TestCaching:
         cached_provider.state_at(STP_K, STP_PA)
         served = cached_provider.viscosity_cp_at(STP_K + 0.05, STP_PA)
         assert served == pytest.approx(exact, rel=2e-4)
+
+
+class TestViscosityTemperatureSensitivity:
+    """d(ln mu)/d(ln T): the only route by which temperature enters the budget."""
+
+    def test_nitrogen_exponent_is_near_the_kinetic_theory_value(self):
+        # Gas viscosity rises roughly as T^0.7 near ambient (Sutherland).
+        exponent = CoolPropProvider("Nitrogen").viscosity_temperature_exponent(
+            STP_K, STP_PA
+        )
+        assert exponent == pytest.approx(0.72, abs=0.08)
+
+    def test_the_exponent_is_positive_for_gases(self):
+        """Unlike liquids, gases get more viscous when heated."""
+        for gas in ("Nitrogen", "Air", "CarbonDioxide", "Methane"):
+            assert CoolPropProvider(gas).viscosity_temperature_exponent(STP_K, STP_PA) > 0.0
+
+    def test_it_matches_a_coarse_finite_difference(self):
+        provider = CoolPropProvider("Nitrogen")
+        cold = dynamic_viscosity_pa_s("Nitrogen", 290.0, STP_PA)
+        hot = dynamic_viscosity_pa_s("Nitrogen", 310.0, STP_PA)
+        coarse = (math.log(hot) - math.log(cold)) / (math.log(310.0) - math.log(290.0))
+        assert provider.viscosity_temperature_exponent(300.0, STP_PA) == pytest.approx(
+            coarse, rel=0.02
+        )
+
+    def test_probing_the_derivative_does_not_disturb_the_cache(self):
+        provider = CoolPropProvider("Nitrogen")
+        provider.state_at(STP_K, STP_PA)
+        assert provider.lookup_count == 1
+        provider.viscosity_temperature_exponent(STP_K, STP_PA)
+        provider.state_at(STP_K, STP_PA)
+        # The acquisition loop's cached state must still be served.
+        assert provider.cache_hits == 1
+
+    def test_a_fixed_provider_has_no_temperature_sensitivity(self):
+        provider = FixedPropertyProvider("Nitrogen", 0.0178)
+        assert provider.viscosity_temperature_exponent(STP_K, STP_PA) == 0.0
+
+
+class TestUncertaintyPassthrough:
+    def test_the_configured_viscosity_uncertainty_reaches_the_state(self):
+        config = GasConfig(viscosity_relative_uncertainty=0.02)
+        state = build_provider(config).state_at(STP_K, STP_PA)
+        assert state.relative_viscosity_uncertainty == 0.02
 
 
 class TestFixedProvider:

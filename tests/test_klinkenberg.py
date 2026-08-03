@@ -124,6 +124,135 @@ class TestWarnings:
         assert any("slope is negative" in w for w in result.warnings)
 
 
+class TestUncertainty:
+    def test_an_unweighted_fit_reports_the_intercept_standard_error(self):
+        result = fit_klinkenberg(synthetic_points())
+        assert result.weighted is False
+        assert result.intercept_stderr is not None
+        # Noise-free points fit exactly, so the standard error collapses.
+        assert result.intercept_stderr == pytest.approx(0.0, abs=1e-12)
+
+    def test_scatter_produces_a_finite_uncertainty_on_k_l(self):
+        points = synthetic_points((1.0, 2.0, 4.0, 8.0))
+        noisy = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy * factor,
+            )
+            for p, factor in zip(points, (1.01, 0.99, 1.005, 0.995))
+        ]
+        result = fit_klinkenberg(noisy)
+        assert result.intercept_stderr > 0.0
+        assert result.liquid_permeability_expanded_uncertainty_darcy > result.intercept_stderr
+
+    def test_the_coverage_factor_uses_n_minus_two_degrees_of_freedom(self):
+        """Three points leave one degree of freedom, so t is large."""
+        points = synthetic_points((1.0, 2.0, 4.0))
+        noisy = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy * factor,
+            )
+            for p, factor in zip(points, (1.01, 0.99, 1.005))
+        ]
+        result = fit_klinkenberg(noisy, coverage_probability=0.95)
+        assert result.coverage_factor == pytest.approx(12.706, rel=1e-3)
+
+    def test_two_points_cannot_support_an_uncertainty(self):
+        result = fit_klinkenberg(synthetic_points((1.0, 4.0)))
+        assert result.liquid_permeability_expanded_uncertainty_darcy is None
+        assert result.coverage_factor is None
+
+    def test_slippage_uncertainty_is_reported(self):
+        points = synthetic_points((1.0, 2.0, 4.0, 8.0))
+        noisy = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy * factor,
+            )
+            for p, factor in zip(points, (1.01, 0.99, 1.005, 0.995))
+        ]
+        result = fit_klinkenberg(noisy)
+        assert result.slippage_factor_standard_uncertainty_atm > 0.0
+
+
+class TestWeighting:
+    @staticmethod
+    def _weighted_points(uncertainties):
+        points = synthetic_points((1.0, 2.0, 4.0, 8.0))
+        return [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy,
+                standard_uncertainty_darcy=u,
+                label=p.label,
+            )
+            for p, u in zip(points, uncertainties)
+        ]
+
+    def test_uncertainties_on_every_point_trigger_a_weighted_fit(self):
+        result = fit_klinkenberg(self._weighted_points([0.001] * 4))
+        assert result.weighted is True
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-8)
+
+    def test_equal_weights_reproduce_the_unweighted_answer(self):
+        weighted = fit_klinkenberg(self._weighted_points([0.002] * 4))
+        unweighted = fit_klinkenberg(synthetic_points())
+        assert weighted.liquid_permeability_darcy == pytest.approx(
+            unweighted.liquid_permeability_darcy, rel=1e-9
+        )
+
+    def test_a_badly_determined_point_is_down_weighted(self):
+        """A low-differential run must not drag the intercept around."""
+        points = self._weighted_points([0.001, 0.001, 0.001, 0.001])
+        # Corrupt the point at the lowest pressure and mark it as poorly known.
+        corrupted = list(points)
+        corrupted[0] = KlinkenbergPoint(
+            mean_pressure_atm=points[0].mean_pressure_atm,
+            apparent_permeability_darcy=points[0].apparent_permeability_darcy * 1.5,
+            standard_uncertainty_darcy=1.0,  # enormous, so nearly ignored
+        )
+        result = fit_klinkenberg(corrupted)
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-3)
+
+        # The same corruption with equal weights pulls k_L badly off.
+        equal = list(corrupted)
+        equal[0] = KlinkenbergPoint(
+            mean_pressure_atm=corrupted[0].mean_pressure_atm,
+            apparent_permeability_darcy=corrupted[0].apparent_permeability_darcy,
+            standard_uncertainty_darcy=0.001,
+        )
+        assert fit_klinkenberg(equal).liquid_permeability_darcy != pytest.approx(
+            TRUE_K_L, rel=0.05
+        )
+
+    def test_partial_uncertainties_fall_back_to_unweighted_with_a_warning(self):
+        points = self._weighted_points([0.001, None, 0.001, 0.001])
+        result = fit_klinkenberg(points)
+        assert result.weighted is False
+        assert any("unweighted" in w for w in result.warnings)
+
+
+class TestSteadyStateAwareness:
+    def test_points_from_unsteady_runs_are_flagged(self):
+        points = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy,
+                label=f"run-{i}",
+                steady_state=(i != 1),
+            )
+            for i, p in enumerate(synthetic_points((1.0, 2.0, 4.0)))
+        ]
+        result = fit_klinkenberg(points)
+        assert any("never reached steady state" in w for w in result.warnings)
+        assert any("run-1" in w for w in result.warnings)
+
+    def test_all_steady_points_produce_no_such_warning(self):
+        result = fit_klinkenberg(synthetic_points((1.0, 2.0, 4.0)))
+        assert not any("steady state" in w for w in result.warnings)
+
+
 class TestRejectedInputs:
     def test_single_point_is_rejected(self):
         with pytest.raises(ValueError, match="at least 2 points"):

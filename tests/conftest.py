@@ -31,6 +31,22 @@ def base_config() -> GaspermConfig:
 
 
 @pytest.fixture
+def quick_steady_config(base_config: GaspermConfig) -> GaspermConfig:
+    """Defaults retuned so a handful of synthetic samples can reach steady state.
+
+    The shipped criteria (3 x 30 s windows) are right for a real rig and far
+    too slow for a test, so the windows are shrunk rather than the criteria
+    weakened -- the same tests still exercise the real detector.
+    """
+    base_config.run.outlet_pressure_reference = "measured"
+    base_config.run.steady_state.window_s = 0.2
+    base_config.run.steady_state.required_windows = 2
+    base_config.run.steady_state.min_samples = 3
+    base_config.hardware.daq.sample_rate_hz = 1000.0
+    return base_config
+
+
+@pytest.fixture
 def fixed_gas_provider() -> FixedPropertyProvider:
     """A constant 0.0178 cP -- nitrogen at room temperature, to 3 figures.
 

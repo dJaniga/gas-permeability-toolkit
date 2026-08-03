@@ -20,6 +20,7 @@ mean-pressure form of the Darcy equation.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Final
 
 from gasperm import units
@@ -116,6 +117,7 @@ class GasPropertyProvider:
         *,
         temperature_tolerance_k: float = 0.05,
         pressure_tolerance_frac: float = 0.002,
+        relative_uncertainty: float = 0.0,
     ) -> None:
         """Args:
         gas_name: CoolProp fluid name (or a label, for the fixed provider).
@@ -125,10 +127,13 @@ class GasPropertyProvider:
         pressure_tolerance_frac: Same idea for pressure, as a fraction of
             the cached pressure. Gas viscosity is nearly pressure-independent
             near ambient, so 0.2% is conservative.
+        relative_uncertainty: Relative standard uncertainty of the viscosity
+            model, carried on every state for the GUM budget.
         """
         self.gas_name = gas_name
         self.temperature_tolerance_k = temperature_tolerance_k
         self.pressure_tolerance_frac = pressure_tolerance_frac
+        self.relative_uncertainty = relative_uncertainty
         self._cached: GasState | None = None
         self.lookup_count = 0
         self.cache_hits = 0
@@ -164,6 +169,38 @@ class GasPropertyProvider:
         return self.state_at(
             units.celsius_to_kelvin(temperature_c),
             pressure_atm * units.ATM_IN_PA,
+        )
+
+    def viscosity_temperature_exponent(
+        self, temperature_k: float, pressure_pa: float, *, delta_k: float = 0.5
+    ) -> float:
+        """``d ln mu / d ln T`` at the given state, by central difference.
+
+        This is the sensitivity coefficient the GUM budget needs to propagate
+        the temperature measurement's uncertainty into the permeability -- the
+        only route by which temperature enters the Darcy equation at all. For
+        gases it is around +0.7 (viscosity *rises* with temperature, unlike a
+        liquid), so it is not negligible.
+
+        The cache is restored afterwards so probing the derivative never leaves
+        a neighbouring state cached for the acquisition loop.
+        """
+        saved = self._cached
+        try:
+            low = self._lookup(temperature_k - delta_k, pressure_pa).viscosity_cp
+            high = self._lookup(temperature_k + delta_k, pressure_pa).viscosity_cp
+        except (ValueError, CoolPropUnavailable):
+            # A derivative is a diagnostic, not a measurement: if the fluid
+            # model will not evaluate slightly off-state, report no sensitivity
+            # rather than failing the whole budget.
+            return 0.0
+        finally:
+            self._cached = saved
+
+        if low <= 0.0 or high <= 0.0:
+            return 0.0
+        return (math.log(high) - math.log(low)) / (
+            math.log(temperature_k + delta_k) - math.log(temperature_k - delta_k)
         )
 
     # -- hooks ------------------------------------------------------------
@@ -221,6 +258,7 @@ class CoolPropProvider(GasPropertyProvider):
             density_kg_m3=density,
             compressibility_z=z_factor,
             source="coolprop",
+            relative_viscosity_uncertainty=self.relative_uncertainty,
         )
 
 
@@ -232,8 +270,15 @@ class FixedPropertyProvider(GasPropertyProvider):
     log so a result produced this way is never mistaken for a live lookup.
     """
 
-    def __init__(self, gas_name: str, viscosity_cp: float, *, reason: str = "") -> None:
-        super().__init__(gas_name)
+    def __init__(
+        self,
+        gas_name: str,
+        viscosity_cp: float,
+        *,
+        reason: str = "",
+        relative_uncertainty: float = 0.0,
+    ) -> None:
+        super().__init__(gas_name, relative_uncertainty=relative_uncertainty)
         if viscosity_cp <= 0.0:
             raise ValueError(f"fixed viscosity must be positive, got {viscosity_cp}")
         self.viscosity_cp = viscosity_cp
@@ -253,6 +298,7 @@ class FixedPropertyProvider(GasPropertyProvider):
             pressure_pa=pressure_pa,
             viscosity_cp=self.viscosity_cp,
             source="fixed",
+            relative_viscosity_uncertainty=self.relative_uncertainty,
         )
 
     def _within_tolerance(self, cached, temperature_k, pressure_pa) -> bool:
@@ -276,5 +322,9 @@ def build_provider(gas_config) -> GasPropertyProvider:
             gas_config.name,
             gas_config.fixed_viscosity_cp,
             reason=gas_config.fixed_reason,
+            relative_uncertainty=gas_config.viscosity_relative_uncertainty,
         )
-    return CoolPropProvider(gas_config.name)
+    return CoolPropProvider(
+        gas_config.name,
+        relative_uncertainty=gas_config.viscosity_relative_uncertainty,
+    )

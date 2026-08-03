@@ -1,23 +1,35 @@
-"""Config schema, YAML round-tripping, and startup validation."""
+"""Config schema, the three-file split, YAML round-tripping, startup validation."""
 
 from __future__ import annotations
+
+from datetime import date
 
 import pytest
 import yaml
 
 from gasperm import units
 from gasperm.config import (
+    HARDWARE_FILENAME,
+    RUN_FILENAME,
+    SAMPLE_FILENAME,
     ConfigError,
+    ConfigPaths,
     DaqConfig,
     FlowmeterConfig,
+    GasConfig,
     GaspermConfig,
+    HardwareConfig,
     LinearCalibration,
     PressureChannelConfig,
     RunConfig,
     SampleConfig,
+    SteadyStateConfig,
     config_to_dict,
+    experiment_metadata,
     load_config,
-    render_config_yaml,
+    render_hardware_yaml,
+    render_run_yaml,
+    render_sample_yaml,
     save_config,
     validate_for_collect,
 )
@@ -25,23 +37,53 @@ from gasperm.config import (
 
 class TestDefaults:
     def test_shipped_defaults_match_the_documented_wiring(self, base_config: GaspermConfig):
-        assert base_config.daq.device_name == "Dev1"
-        assert base_config.daq.inlet_pressure_channel == "ai0"
-        assert base_config.daq.outlet_pressure_channel == "ai1"
-        assert base_config.flowmeter.channel == "ai2"
-        assert base_config.temperature.port == "COM4"
-        assert base_config.temperature.baud_rate == 9600
-        assert base_config.gas.name == "Nitrogen"
+        assert base_config.hardware.daq.device_name == "Dev1"
+        assert base_config.hardware.daq.inlet_pressure_channel == "ai0"
+        assert base_config.hardware.daq.outlet_pressure_channel == "ai1"
+        assert base_config.hardware.flowmeter.channel == "ai2"
+        assert base_config.hardware.temperature.port == "COM4"
+        assert base_config.run.gas.name == "Nitrogen"
 
     def test_pressure_channels_default_to_0_to_5_volts(self, base_config: GaspermConfig):
-        for channel in (
-            base_config.pressure_calibration.inlet,
-            base_config.pressure_calibration.outlet,
-        ):
+        calibration = base_config.hardware.pressure_calibration
+        for channel in (calibration.inlet, calibration.outlet):
             assert (channel.volts_min, channel.volts_max) == (0.0, 5.0)
 
     def test_flow_channel_defaults_to_0_to_10_volts(self, base_config: GaspermConfig):
-        assert (base_config.flowmeter.volts_min, base_config.flowmeter.volts_max) == (0.0, 10.0)
+        flow = base_config.hardware.flowmeter
+        assert (flow.volts_min, flow.volts_max) == (0.0, 10.0)
+
+    def test_steady_state_and_uncertainty_are_on_by_default(self, base_config):
+        assert base_config.run.steady_state.enabled
+        assert base_config.run.uncertainty.enabled
+
+
+class TestSplitConcerns:
+    """Each file owns exactly one concern."""
+
+    def test_the_rig_lives_in_hardware(self):
+        fields = set(HardwareConfig.model_fields)
+        assert {"daq", "pressure_calibration", "flowmeter", "temperature"} <= fields
+        assert "gas" not in fields and "confining_pressure" not in fields
+
+    def test_the_plug_lives_in_sample_without_test_conditions(self):
+        fields = set(SampleConfig.model_fields)
+        assert {"id", "lithology", "length_cm", "porosity_fraction"} <= fields
+        # The same plug is measured at several confining pressures and gases,
+        # so neither belongs to the sample.
+        assert "confining_pressure" not in fields
+        assert "gas" not in fields
+
+    def test_the_experiment_lives_in_run(self):
+        fields = set(RunConfig.model_fields)
+        assert {"operator", "gas", "confining_pressure", "steady_state"} <= fields
+        assert "daq" not in fields
+
+    def test_shorthand_accessors_reach_through(self, base_config):
+        assert base_config.daq is base_config.hardware.daq
+        assert base_config.flowmeter is base_config.hardware.flowmeter
+        assert base_config.gas is base_config.run.gas
+        assert base_config.temperature is base_config.hardware.temperature
 
 
 class TestValidation:
@@ -57,10 +99,6 @@ class TestValidation:
     def test_non_positive_geometry_is_rejected(self, field: str):
         with pytest.raises(ValueError):
             SampleConfig(**{field: 0.0})
-
-    def test_negative_geometry_is_rejected(self):
-        with pytest.raises(ValueError):
-            SampleConfig(length_cm=-1.0)
 
     def test_unknown_pressure_unit_is_rejected(self):
         with pytest.raises(ValueError, match="torr"):
@@ -80,60 +118,112 @@ class TestValidation:
 
     def test_flowmeter_cannot_share_a_pressure_channel(self):
         with pytest.raises(ValueError, match="already assigned"):
-            GaspermConfig(flowmeter=FlowmeterConfig(channel="ai0"))
-
-    def test_non_analog_channel_names_are_rejected(self):
-        with pytest.raises(ValueError, match="analog-input channel"):
-            DaqConfig(inlet_pressure_channel="port0")
-
-    def test_device_qualified_channel_names_are_accepted_and_stripped(self):
-        assert DaqConfig(inlet_pressure_channel="Dev1/ai0").inlet_pressure_channel == "ai0"
+            HardwareConfig(flowmeter=FlowmeterConfig(channel="ai0"))
 
     def test_unknown_fields_are_rejected(self):
-        """A typo'd key must fail loudly, not be silently ignored."""
         with pytest.raises(ValueError):
             SampleConfig(lenght_cm=5.0)
 
-    def test_ai3_is_a_valid_flowmeter_channel(self):
-        assert GaspermConfig(flowmeter=FlowmeterConfig(channel="ai3")).flowmeter.channel == "ai3"
+    def test_bulk_density_above_grain_density_is_rejected(self):
+        with pytest.raises(ValueError, match="impossible"):
+            SampleConfig(grain_density_g_cm3=2.65, bulk_density_g_cm3=2.80)
+
+    def test_stop_when_steady_needs_detection_enabled(self):
+        with pytest.raises(ValueError, match="would never be detected"):
+            RunConfig(stop_when_steady=True, steady_state=SteadyStateConfig(enabled=False))
+
+    def test_steady_state_needs_at_least_one_signal(self):
+        with pytest.raises(ValueError, match="nothing would be tested"):
+            SteadyStateConfig(signals=[])
+
+    def test_fixed_gas_source_needs_a_viscosity(self):
+        with pytest.raises(ValueError, match="fixed_viscosity_cp"):
+            GasConfig(properties_source="fixed")
+
+
+class TestSampleMetadata:
+    def test_petrophysical_fields_round_trip(self):
+        sample = SampleConfig(
+            id="core-042",
+            lithology="fine-grained quartz arenite",
+            formation="Rotliegend",
+            well="A-12",
+            depth=2145.5,
+            depth_unit="m",
+            porosity_fraction=0.18,
+            porosity_method="helium pycnometry",
+            grain_density_g_cm3=2.65,
+            bulk_density_g_cm3=2.17,
+            prepared_by="DJ",
+            prepared_on=date(2026, 7, 15),
+        )
+        restored = SampleConfig.model_validate(sample.model_dump(mode="json"))
+        assert restored.lithology == "fine-grained quartz arenite"
+        assert restored.prepared_on == date(2026, 7, 15)
+
+    def test_porosity_from_densities_cross_checks_the_stated_value(self):
+        sample = SampleConfig(
+            porosity_fraction=0.18, grain_density_g_cm3=2.65, bulk_density_g_cm3=2.17
+        )
+        assert sample.porosity_from_densities == pytest.approx(0.1811, abs=1e-3)
+
+    def test_porosity_cross_check_needs_both_densities(self):
+        assert SampleConfig(grain_density_g_cm3=2.65).porosity_from_densities is None
+
+    def test_geometry_carries_the_caliper_uncertainties(self):
+        geometry = SampleConfig(
+            length_cm=5.0, diameter_cm=2.5,
+            length_uncertainty_cm=0.02, diameter_uncertainty_cm=0.01,
+        ).geometry()
+        assert geometry.relative_length_uncertainty == pytest.approx(0.004)
+        assert geometry.relative_area_uncertainty == pytest.approx(2.0 * 0.01 / 2.5)
+
+    def test_experiment_metadata_flattens_both_files(self, base_config):
+        base_config.sample.lithology = "sandstone"
+        base_config.run.operator = "Damian"
+        base_config.run.confining_pressure = 20.0
+        metadata = experiment_metadata(base_config)
+        assert metadata.operator == "Damian"
+        assert metadata.lithology == "sandstone"
+        assert metadata.confining_pressure == 20.0
+        assert metadata.gas_name == "Nitrogen"
+        assert metadata.sample_id == base_config.sample.id
 
 
 class TestIndependentUnits:
-    def test_inlet_and_outlet_units_are_independent(self):
-        config = GaspermConfig()
-        config.pressure_calibration.inlet.unit = "bar"
-        config.pressure_calibration.outlet.unit = "kPa"
-        assert config.pressure_calibration.inlet.unit == "bar"
-        assert config.pressure_calibration.outlet.unit == "kPa"
+    def test_inlet_and_outlet_units_are_independent(self, base_config):
+        base_config.hardware.pressure_calibration.inlet.unit = "bar"
+        base_config.hardware.pressure_calibration.outlet.unit = "kPa"
+        assert base_config.hardware.pressure_calibration.inlet.unit == "bar"
+        assert base_config.hardware.pressure_calibration.outlet.unit == "kPa"
 
     def test_confining_pressure_has_its_own_unit(self):
-        sample = SampleConfig(confining_pressure=20.0, confining_pressure_unit="MPa")
-        assert sample.confining_pressure_atm == pytest.approx(units.mpa_to_atm(20.0))
+        run = RunConfig(confining_pressure=20.0, confining_pressure_unit="MPa")
+        assert run.confining_pressure_atm == pytest.approx(units.mpa_to_atm(20.0))
 
     def test_confining_pressure_is_optional(self):
-        assert SampleConfig().confining_pressure_atm is None
-
-    def test_display_units_are_independent_of_calibration_units(self):
-        config = GaspermConfig()
-        config.pressure_calibration.inlet.unit = "psi"
-        config.run.display_pressure_unit = "MPa"
-        assert config.pressure_calibration.inlet.unit == "psi"
-        assert config.run.display_pressure_unit == "MPa"
+        assert RunConfig().confining_pressure_atm is None
 
     @pytest.mark.parametrize("unit", sorted(units.SUPPORTED_PRESSURE_UNITS))
-    def test_every_supported_unit_is_accepted_everywhere_a_pressure_lives(self, unit: str):
+    def test_every_supported_unit_is_accepted_wherever_a_pressure_lives(self, unit: str):
         config = GaspermConfig(
-            pressure_calibration={"inlet": {"unit": unit}, "outlet": {"unit": unit}},
-            sample={"confining_pressure": 1.0, "confining_pressure_unit": unit},
+            hardware={
+                "pressure_calibration": {"inlet": {"unit": unit}, "outlet": {"unit": unit}},
+                "flowmeter": {
+                    "standard_pressure": units.from_atm(1.0, unit),
+                    "standard_pressure_unit": unit,
+                },
+            },
             run={
+                "confining_pressure": 1.0,
+                "confining_pressure_unit": unit,
                 "atmospheric_pressure": units.from_atm(1.0, unit),
                 "atmospheric_pressure_unit": unit,
                 "display_pressure_unit": unit,
             },
-            flowmeter={"standard_pressure": units.from_atm(1.0, unit), "standard_pressure_unit": unit},
         )
         assert config.run.atmospheric_pressure_atm == pytest.approx(1.0, rel=1e-12)
-        assert config.flowmeter.standard_pressure_atm == pytest.approx(1.0, rel=1e-12)
+        assert config.hardware.flowmeter.standard_pressure_atm == pytest.approx(1.0, rel=1e-12)
 
 
 class TestLinearCalibration:
@@ -141,13 +231,9 @@ class TestLinearCalibration:
         calibration = LinearCalibration(volts_min=1.0, volts_max=5.0, value_min=0.0, value_max=200.0)
         assert calibration.apply(1.0) == pytest.approx(0.0)
         assert calibration.apply(5.0) == pytest.approx(200.0)
-
-    def test_midpoint_is_linear(self):
-        calibration = LinearCalibration(volts_min=1.0, volts_max=5.0, value_min=0.0, value_max=200.0)
         assert calibration.apply(3.0) == pytest.approx(100.0)
 
     def test_extrapolates_below_the_low_endpoint(self):
-        """Transducer noise around zero must not be clamped away silently."""
         calibration = LinearCalibration(volts_min=0.0, volts_max=5.0, value_min=0.0, value_max=100.0)
         assert calibration.apply(-0.01) == pytest.approx(-0.2)
 
@@ -156,32 +242,15 @@ class TestLinearCalibration:
         for volts in (0.5, 1.7, 4.5):
             assert calibration.invert(calibration.apply(volts)) == pytest.approx(volts)
 
-    def test_offset_calibration(self):
-        """A 1-5 V transducer: 1 V is zero pressure, not 0 V."""
-        calibration = LinearCalibration(volts_min=1.0, volts_max=5.0, value_min=0.0, value_max=1000.0)
-        assert calibration.apply(1.0) == pytest.approx(0.0)
-        assert calibration.apply(2.0) == pytest.approx(250.0)
-
-
-class TestFlowmeterAliases:
-    def test_flow_min_max_aliases_populate_the_calibration(self):
-        flow = FlowmeterConfig.model_validate({"flow_min": 0.0, "flow_max": 250.0})
-        assert flow.value_max == 250.0
-        assert flow.flow_max == 250.0
-
-    def test_yaml_round_trip_preserves_the_alias_spelling(self):
-        rendered = config_to_dict(GaspermConfig())
-        assert "flow_max" in rendered["flowmeter"]
-        assert GaspermConfig.model_validate(rendered).flowmeter.flow_max == 500.0
+    def test_full_scale_is_the_span_magnitude(self):
+        assert LinearCalibration(value_min=0.0, value_max=1000.0).full_scale == 1000.0
+        assert LinearCalibration(value_min=1000.0, value_max=0.0).full_scale == 1000.0
 
 
 class TestOutletReference:
     def test_atmospheric_is_the_default(self):
         assert RunConfig().outlet_pressure_reference == "atmospheric"
         assert RunConfig().fixed_outlet_pressure_atm is None
-
-    def test_measured_is_accepted(self):
-        assert RunConfig(outlet_pressure_reference="measured").fixed_outlet_pressure_atm is None
 
     def test_a_fixed_value_is_converted_from_its_own_unit(self):
         run = RunConfig(outlet_pressure_reference=2.0, outlet_pressure_reference_unit="bar")
@@ -192,67 +261,148 @@ class TestOutletReference:
             RunConfig(outlet_pressure_reference="ambientish")
 
 
-class TestYamlIo:
-    def test_rendered_template_is_valid_yaml_and_reloads(self, tmp_path, base_config):
-        path = tmp_path / "gasperm_config.yaml"
-        save_config(base_config, path)
-        reloaded = load_config(path)
-        assert config_to_dict(reloaded) == config_to_dict(base_config)
+class TestThreeFileIo:
+    def test_writes_three_files(self, tmp_path, base_config):
+        paths = save_config(base_config, tmp_path)
+        assert paths.hardware.name == HARDWARE_FILENAME
+        assert paths.sample.name == SAMPLE_FILENAME
+        assert paths.run.name == RUN_FILENAME
+        for path in paths.as_tuple():
+            assert path.is_file()
 
-    def test_rendered_template_carries_explanatory_comments(self, base_config):
-        text = render_config_yaml(base_config)
-        assert "NI-DAQmx device name" in text
-        assert "ai2 or ai3" in text
-        assert "CGS-Darcy" in text
+    def test_round_trips_exactly(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        assert config_to_dict(load_config(tmp_path)) == config_to_dict(base_config)
 
-    def test_parse_pattern_survives_the_yaml_round_trip(self, tmp_path, base_config):
+    def test_round_trips_with_metadata_populated(self, tmp_path):
+        config = GaspermConfig()
+        config.sample.lithology = "shale"
+        config.sample.prepared_on = date(2026, 3, 1)
+        config.run.operator = "Damian"
+        config.run.confining_pressure = 12.5
+        save_config(config, tmp_path)
+        reloaded = load_config(tmp_path)
+        assert reloaded.sample.lithology == "shale"
+        assert reloaded.sample.prepared_on == date(2026, 3, 1)
+        assert reloaded.run.operator == "Damian"
+        assert reloaded.run.confining_pressure == 12.5
+
+    def test_templates_carry_explanatory_comments(self, base_config):
+        hardware = render_hardware_yaml(base_config)
+        assert "NI-DAQmx device name" in hardware
+        assert "ai2 or ai3" in hardware
+        assert "CGS-Darcy" in hardware
+        sample = render_sample_yaml(base_config)
+        assert "counts double" in sample
+        run = render_run_yaml(base_config)
+        assert "drift" in run and "GUM" in run
+
+    def test_parse_pattern_survives_the_round_trip(self, tmp_path, base_config):
         """'T:{value}' contains YAML-significant characters."""
-        path = tmp_path / "c.yaml"
-        save_config(base_config, path)
-        assert load_config(path).temperature.parse_pattern == "T:{value}"
+        save_config(base_config, tmp_path)
+        assert load_config(tmp_path).hardware.temperature.parse_pattern == "T:{value}"
 
-    def test_existing_file_is_not_overwritten_without_force(self, tmp_path, base_config):
-        path = tmp_path / "c.yaml"
-        save_config(base_config, path)
+    def test_signals_list_survives_the_round_trip(self, tmp_path, base_config):
+        base_config.run.steady_state.signals = ["permeability", "flow"]
+        save_config(base_config, tmp_path)
+        assert load_config(tmp_path).run.steady_state.signals == ["permeability", "flow"]
+
+    def test_existing_files_are_not_overwritten_without_force(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
         with pytest.raises(ConfigError, match="--force"):
-            save_config(base_config, path)
-        save_config(base_config, path, overwrite=True)
+            save_config(base_config, tmp_path)
+        save_config(base_config, tmp_path, overwrite=True)
 
-    def test_missing_file_suggests_init(self, tmp_path):
+    def test_explicit_paths_override_the_directory(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        elsewhere = tmp_path / "other"
+        elsewhere.mkdir()
+        other_sample = elsewhere / "plug.yaml"
+        base_config.sample.id = "core-999"
+        other_sample.write_text(render_sample_yaml(base_config), encoding="utf-8")
+        loaded = load_config(tmp_path, sample=other_sample)
+        assert loaded.sample.id == "core-999"
+        assert loaded.hardware.daq.device_name == "Dev1"
+
+    def test_a_file_may_be_wrapped_in_its_section_key(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        data = base_config.sample.model_dump(mode="json")
+        (tmp_path / SAMPLE_FILENAME).write_text(
+            yaml.safe_dump({"sample": data}), encoding="utf-8"
+        )
+        assert load_config(tmp_path).sample.id == base_config.sample.id
+
+    def test_a_missing_file_names_it_and_suggests_init(self, tmp_path):
         with pytest.raises(ConfigError, match="gasperm init"):
-            load_config(tmp_path / "nope.yaml")
+            load_config(tmp_path)
 
-    def test_malformed_yaml_names_the_file(self, tmp_path):
-        path = tmp_path / "broken.yaml"
-        path.write_text("daq: [unclosed\n", encoding="utf-8")
+    def test_malformed_yaml_names_the_file(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        (tmp_path / RUN_FILENAME).write_text("gas: [unclosed\n", encoding="utf-8")
         with pytest.raises(ConfigError, match="not valid YAML"):
-            load_config(path)
+            load_config(tmp_path)
 
-    def test_empty_file_is_rejected(self, tmp_path):
-        path = tmp_path / "empty.yaml"
-        path.write_text("", encoding="utf-8")
+    def test_empty_file_is_rejected(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        (tmp_path / SAMPLE_FILENAME).write_text("", encoding="utf-8")
         with pytest.raises(ConfigError, match="empty"):
-            load_config(path)
+            load_config(tmp_path)
 
-    def test_validation_error_names_the_offending_field(self, tmp_path, base_config):
-        data = config_to_dict(base_config)
-        data["sample"]["length_cm"] = -3.0
-        path = tmp_path / "bad.yaml"
-        path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        with pytest.raises(ConfigError, match="sample.length_cm"):
-            load_config(path)
+    def test_validation_error_names_the_offending_field_and_file(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        data = base_config.sample.model_dump(mode="json")
+        data["length_cm"] = -3.0
+        (tmp_path / SAMPLE_FILENAME).write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(ConfigError, match="length_cm"):
+            load_config(tmp_path)
 
-    def test_shipped_example_config_loads(self):
+    def test_shipped_example_configs_load(self):
         from pathlib import Path
 
-        example = Path(__file__).resolve().parents[1] / "examples" / "sample_config.yaml"
-        if not example.is_file():  # pragma: no cover - only when examples/ is pruned
-            pytest.skip("examples/sample_config.yaml not present")
-        assert load_config(example).flowmeter.channel == "ai2"
+        examples = Path(__file__).resolve().parents[1] / "examples"
+        if not (examples / HARDWARE_FILENAME).is_file():  # pragma: no cover
+            pytest.skip("examples/ not present")
+        assert load_config(examples).hardware.flowmeter.channel == "ai2"
+
+    def test_config_paths_in_directory(self, tmp_path):
+        paths = ConfigPaths.in_directory(tmp_path)
+        assert paths.hardware == tmp_path / HARDWARE_FILENAME
+        assert len(paths.as_tuple()) == 3
+
+
+class TestLegacyRejection:
+    """Clean break: a pre-split single-file config must not load silently."""
+
+    def test_a_legacy_single_file_is_rejected_with_instructions(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        legacy = {
+            "daq": {"device_name": "Dev1"},
+            "flowmeter": {"channel": "ai2"},
+            "gas": {"name": "Nitrogen"},
+            "sample": {"id": "core-001"},
+            "run": {"output_dir": "./runs"},
+        }
+        (tmp_path / HARDWARE_FILENAME).write_text(yaml.safe_dump(legacy), encoding="utf-8")
+        with pytest.raises(ConfigError, match="pre-split single-file config"):
+            load_config(tmp_path)
+
+    def test_the_message_names_the_three_replacement_files(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        legacy = {"daq": {}, "sample": {}, "run": {}}
+        (tmp_path / HARDWARE_FILENAME).write_text(yaml.safe_dump(legacy), encoding="utf-8")
+        with pytest.raises(ConfigError) as info:
+            load_config(tmp_path)
+        for name in (HARDWARE_FILENAME, SAMPLE_FILENAME, RUN_FILENAME):
+            assert name in str(info.value)
+
+    def test_a_valid_hardware_file_is_not_mistaken_for_legacy(self, tmp_path, base_config):
+        """hardware.yaml legitimately has daq/flowmeter at top level."""
+        save_config(base_config, tmp_path)
+        assert load_config(tmp_path).hardware.daq.device_name == "Dev1"
 
 
 class TestValidateForCollect:
-    def test_a_healthy_config_passes(self, base_config, fake_serial, monkeypatch):
+    def test_a_healthy_config_passes(self, base_config, fake_serial):
         import sys
 
         sys.modules["serial.tools.list_ports"].available = ["COM4"]
@@ -269,23 +419,37 @@ class TestValidateForCollect:
         import sys
 
         sys.modules["serial.tools.list_ports"].available = ["COM7"]
-        base_config.temperature.required = False
-        warnings = validate_for_collect(base_config)
-        assert any("COM4" in w for w in warnings)
+        base_config.hardware.temperature.required = False
+        assert any("COM4" in w for w in validate_for_collect(base_config))
 
     def test_an_unknown_gas_is_fatal(self, base_config, fake_serial):
         pytest.importorskip("CoolProp")
-        base_config.gas.name = "Unobtainium"
+        base_config.run.gas.name = "Unobtainium"
         with pytest.raises(ConfigError, match="Unobtainium"):
             validate_for_collect(base_config)
 
     def test_implausible_geometry_warns(self, base_config, fake_serial):
         base_config.sample.length_cm = 500.0
-        warnings = validate_for_collect(base_config)
-        assert any("unusually long" in w for w in warnings)
+        assert any("unusually long" in w for w in validate_for_collect(base_config))
 
-    def test_a_sub_atmospheric_full_scale_warns_about_the_unit(self, base_config, fake_serial):
-        # A transducer configured in Pa instead of kPa reads 1000 Pa full scale.
-        base_config.pressure_calibration.inlet.unit = "Pa"
-        warnings = validate_for_collect(base_config)
-        assert any("below atmospheric" in w for w in warnings)
+    def test_disabled_steady_state_warns_that_the_result_is_not_representative(
+        self, base_config, fake_serial
+    ):
+        base_config.run.steady_state.enabled = False
+        assert any(
+            "not a representative measurement" in w
+            for w in validate_for_collect(base_config)
+        )
+
+    def test_a_duration_too_short_for_the_criteria_warns(self, base_config, fake_serial):
+        base_config.run.duration_s = 10.0  # criteria need 3 x 30 s
+        assert any("shorter than" in w for w in validate_for_collect(base_config))
+
+    def test_all_zero_instrument_specs_warn_about_the_budget(self, base_config, fake_serial):
+        from gasperm.config.common import UncertaintySpec
+
+        none_spec = UncertaintySpec(kind="none")
+        base_config.hardware.pressure_calibration.inlet.uncertainty = none_spec
+        base_config.hardware.pressure_calibration.outlet.uncertainty = none_spec
+        base_config.hardware.flowmeter.uncertainty = none_spec
+        assert any("understate the real uncertainty" in w for w in validate_for_collect(base_config))

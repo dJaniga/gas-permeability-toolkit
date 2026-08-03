@@ -1,0 +1,627 @@
+"""Configuration: three files, three concerns.
+
+``hardware.yaml``
+    The bench. DAQ device, transducer calibrations, flowmeter, temperature
+    probe, instrument uncertainties. Changes on rewiring or recalibration.
+``sample.yaml``
+    The rock. Identity, geometry (the only part the physics uses), lithology
+    and petrophysical provenance. Changes when a new plug is loaded.
+``run.yaml``
+    The experiment. Operator, working gas, confining pressure, steady-state
+    criteria, output settings. Changes most often -- every pressure step.
+
+They are combined into a single :class:`GaspermConfig` in memory. Validation
+policy is unchanged: structural problems (unknown units, degenerate
+calibrations, non-positive geometry) are rejected at load; environment
+problems (missing serial port, unknown gas) are checked at ``collect``
+startup by :func:`validate_for_collect`, because a rig is often configured
+before it is fully wired up.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+import yaml
+from pydantic import Field, ValidationError
+
+from gasperm import units
+from gasperm.config._yamldoc import render as _render_yaml
+from gasperm.config.common import (
+    ConfigError,
+    LinearCalibration,
+    PressureUnit,
+    UncertaintySpec,
+    _Base,
+    validated_pressure_unit,
+)
+from gasperm.config.hardware import (
+    FLOWMETER_CHANNEL_HINTS,
+    DaqConfig,
+    FlowmeterConfig,
+    HardwareConfig,
+    InstrumentUncertaintyConfig,
+    PressureCalibrationConfig,
+    PressureChannelConfig,
+    TemperatureConfig,
+)
+from gasperm.config.run import (
+    GasConfig,
+    RunConfig,
+    SteadyStateConfig,
+    UncertaintyReportConfig,
+)
+from gasperm.config.sample import SampleConfig
+from gasperm.models import ExperimentMetadata, SampleGeometry
+
+__all__ = [
+    "ConfigError",
+    "ConfigPaths",
+    "GaspermConfig",
+    "HardwareConfig",
+    "SampleConfig",
+    "RunConfig",
+    "GasConfig",
+    "SteadyStateConfig",
+    "UncertaintyReportConfig",
+    "InstrumentUncertaintyConfig",
+    "DaqConfig",
+    "PressureChannelConfig",
+    "PressureCalibrationConfig",
+    "FlowmeterConfig",
+    "TemperatureConfig",
+    "LinearCalibration",
+    "UncertaintySpec",
+    "PressureUnit",
+    "validated_pressure_unit",
+    "FLOWMETER_CHANNEL_HINTS",
+    "HARDWARE_FILENAME",
+    "SAMPLE_FILENAME",
+    "RUN_FILENAME",
+    "load_config",
+    "save_config",
+    "config_to_dict",
+    "experiment_metadata",
+    "validate_for_collect",
+    "render_hardware_yaml",
+    "render_sample_yaml",
+    "render_run_yaml",
+]
+
+HARDWARE_FILENAME = "hardware.yaml"
+SAMPLE_FILENAME = "sample.yaml"
+RUN_FILENAME = "run.yaml"
+
+#: A pre-split single-file config carried the rig sections *and* the sample or
+#: experiment sections in one document. The new hardware.yaml legitimately has
+#: the rig sections at top level, so the combination is what identifies legacy.
+_LEGACY_RIG_KEYS = frozenset({"daq", "pressure_calibration", "flowmeter"})
+_LEGACY_OTHER_KEYS = frozenset({"sample", "run", "gas"})
+
+
+class GaspermConfig(_Base):
+    """The three config files, combined."""
+
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
+    sample: SampleConfig = Field(default_factory=SampleConfig)
+    run: RunConfig = Field(default_factory=RunConfig)
+
+    # -- convenience accessors used across the package --------------------
+
+    def geometry(self) -> SampleGeometry:
+        """The core plug geometry, with its caliper uncertainties."""
+        return self.sample.geometry()
+
+    @property
+    def daq(self) -> DaqConfig:
+        """Shorthand for ``config.hardware.daq``."""
+        return self.hardware.daq
+
+    @property
+    def flowmeter(self) -> FlowmeterConfig:
+        """Shorthand for ``config.hardware.flowmeter``."""
+        return self.hardware.flowmeter
+
+    @property
+    def pressure_calibration(self) -> PressureCalibrationConfig:
+        """Shorthand for ``config.hardware.pressure_calibration``."""
+        return self.hardware.pressure_calibration
+
+    @property
+    def temperature(self) -> TemperatureConfig:
+        """Shorthand for ``config.hardware.temperature``."""
+        return self.hardware.temperature
+
+    @property
+    def gas(self) -> GasConfig:
+        """Shorthand for ``config.run.gas``."""
+        return self.run.gas
+
+    def daq_channel_path(self, channel: str) -> str:
+        """Fully-qualified NI channel name, e.g. ``Dev1/ai0``."""
+        return self.hardware.daq_channel_path(channel)
+
+    @classmethod
+    def example(cls) -> GaspermConfig:
+        """A fully-populated config matching the shipped rig defaults."""
+        return cls()
+
+
+@dataclass(frozen=True)
+class ConfigPaths:
+    """Where the three config files live."""
+
+    hardware: Path
+    sample: Path
+    run: Path
+
+    @classmethod
+    def in_directory(cls, directory: str | Path) -> ConfigPaths:
+        """The default file names inside ``directory``."""
+        base = Path(directory)
+        return cls(
+            hardware=base / HARDWARE_FILENAME,
+            sample=base / SAMPLE_FILENAME,
+            run=base / RUN_FILENAME,
+        )
+
+    def as_tuple(self) -> tuple[Path, Path, Path]:
+        """``(hardware, sample, run)``."""
+        return (self.hardware, self.sample, self.run)
+
+
+# --------------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------------
+
+
+def _read_mapping(path: Path, what: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise ConfigError(
+            f"{what} config file not found: {path}. Run 'gasperm init' to create the "
+            f"three config files ({HARDWARE_FILENAME}, {SAMPLE_FILENAME}, "
+            f"{RUN_FILENAME})."
+        )
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path} is not valid YAML:\n  {exc}") from exc
+    if raw is None:
+        raise ConfigError(f"{path} is empty.")
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{path} must contain a YAML mapping at the top level, got "
+            f"{type(raw).__name__}."
+        )
+    return raw
+
+
+def _reject_legacy(raw: Mapping[str, Any], path: Path) -> None:
+    """Refuse a pre-split single-file config, pointing at the replacement."""
+    keys = set(raw)
+    if "hardware" in keys:
+        return
+    overlap = _LEGACY_OTHER_KEYS & keys
+    if _LEGACY_RIG_KEYS & keys and overlap:
+        raise ConfigError(
+            f"{path} looks like a pre-split single-file config: it mixes rig sections "
+            f"({', '.join(sorted(_LEGACY_RIG_KEYS & keys))}) with "
+            f"{', '.join(sorted(overlap))} in one file. Configuration is now three "
+            f"files -- {HARDWARE_FILENAME} (the rig), {SAMPLE_FILENAME} (the core plug) "
+            f"and {RUN_FILENAME} (the experiment). Run 'gasperm init' to generate them, "
+            "then copy your calibration numbers across."
+        )
+
+
+def _unwrap(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """Accept a file either wrapped in its section key or written bare."""
+    if set(raw) == {key} and isinstance(raw[key], dict):
+        return raw[key]
+    return raw
+
+
+def _format_validation_error(exc: ValidationError, source: str) -> str:
+    lines = [f"{source} is not valid ({exc.error_count()} problem(s)):"]
+    for err in exc.errors():
+        location = ".".join(str(p) for p in err["loc"]) or "<root>"
+        lines.append(f"  - {location}: {err['msg']}")
+    return "\n".join(lines)
+
+
+def _validate_section(model, data: Mapping[str, Any], path: Path):
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise ConfigError(_format_validation_error(exc, str(path))) from exc
+
+
+def load_config(
+    directory: str | Path | None = None,
+    *,
+    hardware: str | Path | None = None,
+    sample: str | Path | None = None,
+    run: str | Path | None = None,
+) -> GaspermConfig:
+    """Load and validate the three config files.
+
+    Args:
+        directory: Where the default file names live. Defaults to the current
+            directory. Ignored for any section given an explicit path.
+        hardware: Explicit path to the hardware file.
+        sample: Explicit path to the sample file.
+        run: Explicit path to the run file.
+
+    Returns:
+        The combined, validated configuration.
+
+    Raises:
+        ConfigError: a file is missing, malformed, fails validation, or is a
+            pre-split single-file config.
+    """
+    defaults = ConfigPaths.in_directory(directory if directory is not None else ".")
+    paths = ConfigPaths(
+        hardware=Path(hardware) if hardware is not None else defaults.hardware,
+        sample=Path(sample) if sample is not None else defaults.sample,
+        run=Path(run) if run is not None else defaults.run,
+    )
+
+    hardware_raw = _read_mapping(paths.hardware, "Hardware")
+    _reject_legacy(hardware_raw, paths.hardware)
+    sample_raw = _read_mapping(paths.sample, "Sample")
+    run_raw = _read_mapping(paths.run, "Run")
+
+    return GaspermConfig(
+        hardware=_validate_section(
+            HardwareConfig, _unwrap(hardware_raw, "hardware"), paths.hardware
+        ),
+        sample=_validate_section(SampleConfig, _unwrap(sample_raw, "sample"), paths.sample),
+        run=_validate_section(RunConfig, _unwrap(run_raw, "run"), paths.run),
+    )
+
+
+def config_to_dict(config: GaspermConfig) -> dict[str, Any]:
+    """Plain-dict form of the config, suitable for YAML/JSON serialisation."""
+    return config.model_dump(mode="json", by_alias=True)
+
+
+def experiment_metadata(config: GaspermConfig) -> ExperimentMetadata:
+    """Flatten the metadata every run should be traceable by."""
+    sample = config.sample
+    run = config.run
+    return ExperimentMetadata(
+        operator=run.operator,
+        institution=run.institution,
+        project=run.project,
+        experiment_id=run.experiment_id,
+        notes=run.notes,
+        sample_id=sample.id,
+        sample_description=sample.description,
+        lithology=sample.lithology,
+        formation=sample.formation,
+        well=sample.well,
+        depth=sample.depth,
+        depth_unit=sample.depth_unit,
+        porosity_fraction=sample.porosity_fraction,
+        porosity_method=sample.porosity_method,
+        grain_density_g_cm3=sample.grain_density_g_cm3,
+        bulk_density_g_cm3=sample.bulk_density_g_cm3,
+        prepared_by=sample.prepared_by,
+        prepared_on=sample.prepared_on,
+        length_cm=sample.length_cm,
+        diameter_cm=sample.diameter_cm,
+        gas_name=run.gas.name,
+        confining_pressure=run.confining_pressure,
+        confining_pressure_unit=run.confining_pressure_unit,
+    )
+
+
+# --------------------------------------------------------------------------
+# Rendering the commented templates
+# --------------------------------------------------------------------------
+
+_SUPPORTED_PRESSURE = ", ".join(sorted(units.SUPPORTED_PRESSURE_UNITS))
+
+
+def render_hardware_yaml(config: GaspermConfig) -> str:
+    """``hardware.yaml`` with the comments that prevent a wrong calibration."""
+    data = config.hardware.model_dump(mode="json", by_alias=True)
+    header = (
+        "gasperm -- HARDWARE configuration (the bench)\n"
+        "\n"
+        "NI USB-6421 DAQ for pressures and flow, plus an Arduino temperature probe\n"
+        "on USB serial. Change this file when the rig is rewired or recalibrated.\n"
+        "The core plug lives in sample.yaml; the experiment lives in run.yaml.\n"
+        "\n"
+        f"Supported pressure units: {_SUPPORTED_PRESSURE}\n"
+        "Each pressure-bearing field carries its OWN unit. All internal physics\n"
+        "runs in CGS-Darcy (atm, cm, cP, cm3/s) regardless of what you set here."
+    )
+    notes = {
+        "pressure_calibration": (
+            "Each channel is added to the DAQ task with its own min_val/max_val, so\n"
+            "the 0-5 V transducers and the 0-10 V flowmeter never share a range."
+        ),
+        "pressure_calibration.inlet.uncertainty": (
+            "Type B uncertainty (GUM 4.3). 'a' is the specification limit; the\n"
+            "standard uncertainty is a/sqrt(3) for a rectangular distribution."
+        ),
+        "pressure_calibration.correlation": (
+            "Covariance between the two pressure channels. Same transducer model\n"
+            "calibrated against the same reference => correlated systematic error.\n"
+            "P1 and P2 enter the Darcy equation with opposite signs, so a positive\n"
+            "correlation REDUCES the combined uncertainty."
+        ),
+        "flowmeter": (
+            "Exactly ONE flowmeter is active per run. The other analog input is\n"
+            "never added to the DAQ task."
+        ),
+        "flowmeter.reading_basis": (
+            "What state the reported volume refers to -- the single most common\n"
+            "source of a silently wrong permeability on this kind of rig.\n"
+            "  standard -> mass-based meter, referenced to the standard state below\n"
+            "  actual   -> volume at line conditions, paired with actual_pressure_source"
+        ),
+        "temperature": (
+            "Separate device from the DAQ; a dropout degrades the run, never aborts it."
+        ),
+        "uncertainty": "Rig-level terms that belong to no single channel.",
+    }
+    comments = {
+        "daq.device_name": "NI-DAQmx device name, from NI MAX",
+        "daq.inlet_pressure_channel": "0-5 V transducer",
+        "daq.outlet_pressure_channel": "0-5 V transducer",
+        "daq.terminal_config": "DEFAULT | RSE | NRSE | DIFF | PSEUDO_DIFF",
+        "pressure_calibration.inlet.value_min": "pressure at volts_min",
+        "pressure_calibration.inlet.value_max": "pressure at volts_max",
+        "pressure_calibration.inlet.reading_type": "absolute | gauge",
+        "pressure_calibration.inlet.uncertainty.kind": (
+            "percent_full_scale | percent_reading | absolute | none"
+        ),
+        "pressure_calibration.inlet.uncertainty.distribution": (
+            "rectangular | triangular | normal"
+        ),
+        "pressure_calibration.outlet.unit": "independent of inlet: may be 'bar' here",
+        "pressure_calibration.outlet.reading_type": "gauge adds run.atmospheric_pressure",
+        "flowmeter.channel": "ai2 or ai3",
+        "flowmeter.volts_max": "0-10 V, unlike the pressure channels",
+        "flowmeter.flow_max": "full-scale flow, for THIS meter's range",
+        "flowmeter.actual_pressure_source": "only used when reading_basis == actual",
+        "flowmeter.uncertainty.kind": "flowmeters are usually spec'd % of reading",
+        "temperature.parse_pattern": "'{value}' marks the number; null = first float",
+        "temperature.units": "C | K | F",
+        "temperature.required": "refuse to start collect if the port will not open",
+        "temperature.uncertainty.value": "degC",
+        "uncertainty.daq_relative": "relative, dimensionless",
+        "uncertainty.repeatability_relative": "bench repeatability not otherwise captured",
+    }
+    return _render_yaml(data, header=header, notes=notes, comments=comments)
+
+
+def render_sample_yaml(config: GaspermConfig) -> str:
+    """``sample.yaml`` -- the core plug."""
+    data = config.sample.model_dump(mode="json", by_alias=True)
+    header = (
+        "gasperm -- SAMPLE configuration (the core plug)\n"
+        "\n"
+        "Change this file when a new plug is loaded. Confining pressure and working\n"
+        "gas are NOT here: the same plug is routinely measured at several of each,\n"
+        "so they belong to run.yaml.\n"
+        "\n"
+        "Only length_cm and diameter_cm enter the Darcy calculation. Everything else\n"
+        "is provenance, carried into every run so a number stays traceable to a rock."
+    )
+    notes = {
+        "length_cm": (
+            "Geometry. Area goes as diameter^2, so the diameter uncertainty enters\n"
+            "the uncertainty budget doubled -- it is usually the largest single term."
+        ),
+        "porosity_fraction": "Petrophysics. Informational; not used by the Darcy calc.",
+        "prepared_by": "Provenance.",
+    }
+    comments = {
+        "depth_unit": "m | ft",
+        "length_uncertainty_cm": "standard uncertainty, cm (caliper)",
+        "diameter_uncertainty_cm": "standard uncertainty, cm -- counts double",
+        "porosity_method": "helium pycnometry, MICP, image analysis, ...",
+        "prepared_on": "YYYY-MM-DD",
+    }
+    return _render_yaml(data, header=header, notes=notes, comments=comments)
+
+
+def render_run_yaml(config: GaspermConfig) -> str:
+    """``run.yaml`` -- the experiment."""
+    data = config.run.model_dump(mode="json", by_alias=True)
+    header = (
+        "gasperm -- RUN configuration (the experiment)\n"
+        "\n"
+        "The file that changes most often: a new pressure step, a different gas, a\n"
+        "different operator. The rig is in hardware.yaml; the plug is in sample.yaml.\n"
+        "\n"
+        f"Supported pressure units: {_SUPPORTED_PRESSURE}"
+    )
+    notes = {
+        "operator": "Who ran it. Copied into every run's metadata for traceability.",
+        "gas": "Working gas and where its properties come from.",
+        "confining_pressure": (
+            "Confining/overburden pressure for this run. Usually MPa-scale while\n"
+            "pore pressure is kPa-scale, hence its own independent unit."
+        ),
+        "outlet_pressure_reference": (
+            "How P2 in the Darcy equation is determined."
+        ),
+        "steady_state": (
+            "Permeability is only representative once the rig has equilibrated, so\n"
+            "the reported result is taken from the detected steady-state window.\n"
+            "Two criteria must hold on every listed signal, over consecutive windows:\n"
+            "  scatter -- coefficient of variation <= relative_stddev_tolerance\n"
+            "  drift   -- fractional change of an OLS line across the window\n"
+            "             <= relative_drift_tolerance\n"
+            "The drift test is the important one: a slow ramp has small scatter in\n"
+            "any short window and would pass a scatter-only test forever."
+        ),
+        "uncertainty": (
+            "ISO/IEC Guide 98-3 (GUM) evaluation. Type A comes from the scatter of\n"
+            "the steady-state window; Type B from the specs in hardware.yaml and\n"
+            "the caliper figures in sample.yaml."
+        ),
+        "output_dir": "Output.",
+        "duration_s": "Stop conditions.",
+    }
+    comments = {
+        "gas.name": "any CoolProp fluid: Air, CarbonDioxide, Methane, ...",
+        "gas.properties_source": "coolprop (recommended) | fixed",
+        "gas.fixed_viscosity_cp": "only when properties_source == fixed",
+        "gas.viscosity_relative_uncertainty": "relative, for the GUM budget",
+        "gas.real_gas_correction": "divide reference flow by Z",
+        "outlet_pressure_reference": "atmospheric | measured | a number",
+        "outlet_pressure_reference_unit": "used only if the above is a number",
+        "steady_state.window_s": "trailing window each test runs over",
+        "steady_state.required_windows": "consecutive passes before declaring steady",
+        "steady_state.settling_time_s": "ignore this much of the run start outright",
+        "steady_state.slope_significance": "null = use the drift bound alone",
+        "steady_state.max_wait_s": "null = wait indefinitely",
+        "uncertainty.coverage_probability": "0.95 -> k ~ 2 for large dof",
+        "uncertainty.fixed_coverage_factor": "null = derive from Student-t",
+        "averaging_window_s": "live display only; the result uses the steady window",
+        "display_pressure_unit": "console/plot only",
+        "display_permeability_unit": "mD | D | uD | um2 | m2",
+        "duration_s": "null = run until Ctrl+C",
+        "stop_when_steady": "end the run once steady state is confirmed",
+    }
+    return _render_yaml(data, header=header, notes=notes, comments=comments)
+
+
+def save_config(
+    config: GaspermConfig, directory: str | Path = ".", *, overwrite: bool = False
+) -> ConfigPaths:
+    """Write the three config files into ``directory``.
+
+    Raises:
+        ConfigError: any target exists and ``overwrite`` is False.
+    """
+    paths = ConfigPaths.in_directory(directory)
+    existing = [p for p in paths.as_tuple() if p.exists()]
+    if existing and not overwrite:
+        raise ConfigError(
+            "Refusing to overwrite: "
+            + ", ".join(str(p) for p in existing)
+            + ". Pass --force to replace them."
+        )
+    paths.hardware.parent.mkdir(parents=True, exist_ok=True)
+    paths.hardware.write_text(render_hardware_yaml(config), encoding="utf-8")
+    paths.sample.write_text(render_sample_yaml(config), encoding="utf-8")
+    paths.run.write_text(render_run_yaml(config), encoding="utf-8")
+    return paths
+
+
+# --------------------------------------------------------------------------
+# Startup validation
+# --------------------------------------------------------------------------
+
+
+def validate_for_collect(config: GaspermConfig) -> list[str]:
+    """Environment checks run at ``collect`` startup, before opening the DAQ.
+
+    Fails loudly and specifically here rather than three minutes into a run.
+
+    Returns:
+        Non-fatal warnings. Fatal problems raise :class:`ConfigError`.
+    """
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    # -- gas name must be one CoolProp recognises ------------------------
+    if config.run.gas.properties_source == "coolprop":
+        from gasperm.gas_properties import CoolPropUnavailable, validate_gas_name
+
+        try:
+            validate_gas_name(config.run.gas.name)
+        except CoolPropUnavailable as exc:
+            problems.append(
+                f"gas.properties_source is 'coolprop' but CoolProp is unusable: {exc}. "
+                "Install CoolProp, or set gas.properties_source: fixed with a "
+                "fixed_viscosity_cp."
+            )
+        except ValueError as exc:
+            problems.append(str(exc))
+
+    # -- serial port ------------------------------------------------------
+    from gasperm.hardware.temperature import serial_port_exists
+
+    port_state = serial_port_exists(config.hardware.temperature.port)
+    if port_state is False:
+        message = (
+            f"temperature.port {config.hardware.temperature.port!r} was not found among "
+            "the ports this machine reports."
+        )
+        if config.hardware.temperature.required:
+            problems.append(
+                message + " Fix the port, or set temperature.required: false to run "
+                "without the probe."
+            )
+        else:
+            warnings.append(
+                message + " temperature.required is false, so the run will proceed using "
+                f"fallback_temperature_c = "
+                f"{config.hardware.temperature.fallback_temperature_c}."
+            )
+
+    # -- geometry sanity --------------------------------------------------
+    if config.sample.length_cm > 100.0:
+        warnings.append(
+            f"sample.length_cm = {config.sample.length_cm} is unusually long for a core "
+            "plug; check the unit."
+        )
+    if config.sample.diameter_cm > 30.0:
+        warnings.append(
+            f"sample.diameter_cm = {config.sample.diameter_cm} is unusually wide for a "
+            "core plug; check the unit."
+        )
+
+    # -- pressure plausibility -------------------------------------------
+    inlet = config.hardware.pressure_calibration.inlet
+    if units.to_atm(inlet.value_max, inlet.unit) < config.run.atmospheric_pressure_atm:
+        warnings.append(
+            "The inlet transducer's full-scale reading is below atmospheric pressure; "
+            "check pressure_calibration.inlet.unit."
+        )
+
+    # -- analysis settings ------------------------------------------------
+    if not config.run.steady_state.enabled:
+        warnings.append(
+            "run.steady_state.enabled is false. Permeability will be reported from the "
+            "trailing averaging window without any check that the rig had equilibrated, "
+            "which is not a representative measurement of the sample."
+        )
+    elif config.run.duration_s is not None:
+        needed = config.run.steady_state.settling_time_s + config.run.steady_state.window_s * (
+            config.run.steady_state.required_windows
+        )
+        if config.run.duration_s < needed:
+            warnings.append(
+                f"run.duration_s ({config.run.duration_s} s) is shorter than the "
+                f"{needed:g} s the steady-state criteria need at minimum, so the run "
+                "will almost certainly end before steady state can be confirmed."
+            )
+
+    if config.run.uncertainty.enabled:
+        specs = [
+            config.hardware.pressure_calibration.inlet.uncertainty,
+            config.hardware.pressure_calibration.outlet.uncertainty,
+            config.hardware.flowmeter.uncertainty,
+        ]
+        if all(spec.kind == "none" or spec.value == 0.0 for spec in specs):
+            warnings.append(
+                "Every instrument uncertainty in hardware.yaml is zero, so the GUM "
+                "budget would report only the Type A scatter and understate the real "
+                "uncertainty. Fill in the transducer and flowmeter specifications."
+            )
+
+    if problems:
+        raise ConfigError(
+            "Configuration cannot be used for a collect run:\n"
+            + "\n".join(f"  - {p}" for p in problems)
+        )
+    return warnings

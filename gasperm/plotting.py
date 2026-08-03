@@ -81,6 +81,7 @@ class LivePlot:
         self._outlet: deque[float] = deque(maxlen=max_points)
         self._flow: deque[float] = deque(maxlen=max_points)
         self._permeability: deque[float] = deque(maxlen=max_points)
+        self._steady: deque[bool] = deque(maxlen=max_points)
         self._last_redraw = 0.0
         self._figure: Any = None
         self._axes: Any = None
@@ -153,6 +154,7 @@ class LivePlot:
             if value is not None
             else float("nan")
         )
+        self._steady.append(reading.steady_state)
 
     def maybe_redraw(self, now: float | None = None) -> bool:
         """Redraw if ``redraw_interval_s`` has elapsed. Returns whether it did.
@@ -194,8 +196,39 @@ class LivePlot:
         permeability_axis.set_ylabel(f"k ({run.display_permeability_unit})")
         permeability_axis.set_xlabel("elapsed (s)")
 
+        # Shade the stretch the detector has confirmed steady -- the part of
+        # the run that will actually be reported.
+        for start, end in self._steady_spans(times):
+            for axis in self._axes:
+                axis.axvspan(start, end, color="tab:green", alpha=0.12, zorder=0)
+        if any(self._steady):
+            permeability_axis.legend(
+                handles=[
+                    self._plt.Line2D(
+                        [], [], color="tab:green", alpha=0.35, linewidth=8,
+                        label="steady state (reported)",
+                    )
+                ],
+                loc="lower right",
+                fontsize="small",
+            )
+
         self._figure.canvas.draw_idle()
         self._figure.canvas.flush_events()
+
+    def _steady_spans(self, times: list[float]) -> list[tuple[float, float]]:
+        """Contiguous ``(start, end)`` stretches flagged steady."""
+        spans: list[tuple[float, float]] = []
+        start: float | None = None
+        for moment, steady in zip(times, self._steady):
+            if steady and start is None:
+                start = moment
+            elif not steady and start is not None:
+                spans.append((start, moment))
+                start = None
+        if start is not None and times:
+            spans.append((start, times[-1]))
+        return spans
 
 
 def plot_klinkenberg(
@@ -233,6 +266,21 @@ def plot_klinkenberg(
     ]
 
     figure, axis = plt.subplots(figsize=(7.5, 5))
+
+    # Error bars where the runs carried an uncertainty budget. Without them the
+    # eye weights every point equally, which is exactly what the weighted fit
+    # is there to avoid.
+    y_errors = [
+        units.darcy_to(point.standard_uncertainty_darcy, permeability_unit)
+        if point.standard_uncertainty_darcy is not None
+        else 0.0
+        for point in result.points
+    ]
+    if any(y_errors):
+        axis.errorbar(
+            x_values, y_values, yerr=y_errors, fmt="none", ecolor="tab:blue",
+            elinewidth=1.2, capsize=4, zorder=2,
+        )
     axis.scatter(x_values, y_values, color="tab:blue", zorder=3, label="runs")
 
     x_max = max(x_values) * 1.08 if x_values else 1.0
@@ -253,9 +301,20 @@ def plot_klinkenberg(
             f"{pressure_unit}  (R^2 = {result.r_squared:.4f})"
         ),
     )
+    intercept_label = "k_L (1/P -> 0)"
+    expanded = result.liquid_permeability_expanded_uncertainty_darcy
+    if expanded is not None:
+        expanded_display = units.darcy_to(expanded, permeability_unit)
+        axis.errorbar(
+            [0.0], [intercept_display], yerr=[expanded_display], fmt="none",
+            ecolor="tab:red", elinewidth=1.5, capsize=6, zorder=4,
+        )
+        intercept_label += (
+            f" +/- {expanded_display:.3g} (k = {result.coverage_factor:.2f})"
+        )
     axis.scatter(
-        [0.0], [intercept_display], color="tab:red", marker="*", s=140, zorder=4,
-        label="k_L (1/P -> 0)",
+        [0.0], [intercept_display], color="tab:red", marker="*", s=140, zorder=5,
+        label=intercept_label,
     )
 
     for point, x, y in zip(result.points, x_values, y_values):

@@ -44,20 +44,89 @@ RECOMMENDED_POINTS = 3
 POOR_FIT_R_SQUARED = 0.95
 
 
-def fit_klinkenberg(points: Sequence[KlinkenbergPoint]) -> KlinkenbergResult:
+def _weighted_fit(
+    x: np.ndarray, y: np.ndarray, u: np.ndarray
+) -> tuple[float, float, float, float, float, float]:
+    """Weighted least squares with ``w = 1/u^2``.
+
+    Returns:
+        ``(intercept, slope, u_intercept, u_slope, covariance, r_squared)``.
+
+    Weighting matters here because the points come from runs at different mean
+    pressures, and a low-differential run has a far larger uncertainty (the
+    ``P1^2 - P2^2`` denominator) than a high-differential one. An unweighted
+    fit lets the worst-determined run pull the intercept -- which *is* the
+    reported answer.
+    """
+    weights = 1.0 / np.square(u)
+    s = float(np.sum(weights))
+    s_x = float(np.sum(weights * x))
+    s_y = float(np.sum(weights * y))
+    s_xx = float(np.sum(weights * x * x))
+    s_xy = float(np.sum(weights * x * y))
+
+    delta = s * s_xx - s_x * s_x
+    if delta == 0.0:
+        raise ValueError("weighted regression is singular; the points share one pressure")
+
+    intercept = (s_xx * s_y - s_x * s_xy) / delta
+    slope = (s * s_xy - s_x * s_y) / delta
+    u_intercept = math.sqrt(s_xx / delta)
+    u_slope = math.sqrt(s / delta)
+    covariance = -s_x / delta
+
+    predicted = intercept + slope * x
+    weighted_mean = s_y / s
+    ss_residual = float(np.sum(weights * np.square(y - predicted)))
+    ss_total = float(np.sum(weights * np.square(y - weighted_mean)))
+    r_squared = 1.0 - ss_residual / ss_total if ss_total > 0 else 1.0
+    return intercept, slope, u_intercept, u_slope, covariance, r_squared
+
+
+def _slippage_uncertainty(
+    intercept: float, slope: float, u_intercept: float, u_slope: float, covariance: float
+) -> float | None:
+    """Standard uncertainty of ``b = slope / intercept``, with covariance.
+
+    The slope and intercept of a straight-line fit are strongly (negatively)
+    correlated, so the covariance term is not optional -- dropping it can
+    misstate u(b) by tens of percent.
+    """
+    if intercept == 0.0:
+        return None
+    d_slope = 1.0 / intercept
+    d_intercept = -slope / intercept**2
+    variance = (
+        (d_slope * u_slope) ** 2
+        + (d_intercept * u_intercept) ** 2
+        + 2.0 * d_slope * d_intercept * covariance
+    )
+    return math.sqrt(variance) if variance > 0.0 else 0.0
+
+
+def fit_klinkenberg(
+    points: Sequence[KlinkenbergPoint],
+    *,
+    coverage_probability: float = 0.95,
+) -> KlinkenbergResult:
     """Regress ``k_g`` against ``1 / P_mean`` and recover ``k_L`` and ``b``.
 
-    Ordinary least squares is sufficient here: the points are few, the
-    relationship is genuinely linear over the usable pressure range, and the
-    scatter is dominated by run-to-run steady-state error rather than by
-    anything structured.
+    When every point carries a standard uncertainty -- which they do when the
+    runs came from ``collect`` with the GUM budget enabled -- the fit is
+    weighted by ``1/u^2``; otherwise it is ordinary least squares.
+
+    The reported ``k_L`` is the intercept, so its uncertainty is the intercept's
+    standard error, expanded by a Student-t coverage factor at ``n - 2``
+    degrees of freedom.
 
     Args:
         points: Two or more ``(mean pressure, apparent permeability)`` pairs
             for the **same** sample, at different mean pressures.
+        coverage_probability: Level of confidence for the expanded uncertainty
+            on ``k_L``.
 
     Returns:
-        The fit, including R^2 and any warnings worth showing the operator.
+        The fit, including R^2, uncertainties, and any warnings worth showing.
 
     Raises:
         ValueError: fewer than two points, duplicate mean pressures (no spread
@@ -84,12 +153,48 @@ def fit_klinkenberg(points: Sequence[KlinkenbergPoint]) -> KlinkenbergResult:
             "to extrapolate over. Run the sample at genuinely different mean pressures."
         )
 
-    regression = stats.linregress(inverse_pressure, apparent_k)
-    slope = float(regression.slope)
-    intercept = float(regression.intercept)
-    r_squared = float(regression.rvalue**2)
+    uncertainties = [p.standard_uncertainty_darcy for p in points]
+    weighted = all(u is not None and u > 0.0 for u in uncertainties) and len(points) > 2
 
     warnings: list[str] = []
+    covariance = 0.0
+    if weighted:
+        (
+            intercept,
+            slope,
+            u_intercept,
+            u_slope,
+            covariance,
+            r_squared,
+        ) = _weighted_fit(inverse_pressure, apparent_k, np.array(uncertainties, dtype=float))
+    else:
+        regression = stats.linregress(inverse_pressure, apparent_k)
+        slope = float(regression.slope)
+        intercept = float(regression.intercept)
+        r_squared = float(regression.rvalue**2)
+        u_intercept = float(regression.intercept_stderr)
+        u_slope = float(regression.stderr)
+        if len(points) > 2:
+            mean_x = float(np.mean(inverse_pressure))
+            s_xx = float(np.sum(np.square(inverse_pressure - mean_x)))
+            # cov(a, b) = -mean_x * var(b) for an unweighted straight-line fit.
+            covariance = -mean_x * u_slope**2 if s_xx > 0 else 0.0
+        if any(u is not None for u in uncertainties) and not weighted:
+            warnings.append(
+                "Not every point carried a standard uncertainty, so the fit is "
+                "unweighted. Runs at a small pressure differential therefore carry the "
+                "same influence on k_L as well-determined ones."
+            )
+
+    unsteady = [p for p in points if not p.steady_state]
+    if unsteady:
+        warnings.append(
+            f"{len(unsteady)} of {len(points)} points come from runs that never reached "
+            "steady state ("
+            + ", ".join(p.label or "unlabelled" for p in unsteady)
+            + "). Those are not representative permeabilities and the extrapolated k_L "
+            "inherits the problem."
+        )
 
     if len(points) < RECOMMENDED_POINTS:
         warnings.append(
@@ -133,14 +238,32 @@ def fit_klinkenberg(points: Sequence[KlinkenbergPoint]) -> KlinkenbergResult:
             "undefined."
         )
 
+    # Expand the intercept's standard error to a coverage interval. The fit
+    # has n - 2 degrees of freedom (two parameters estimated), so with the
+    # handful of points these experiments produce the t factor is appreciably
+    # larger than 2 and pretending otherwise would understate k_L's uncertainty.
+    factor: float | None = None
+    expanded: float | None = None
+    if len(points) > 2 and math.isfinite(u_intercept):
+        tail = 1.0 - (1.0 - coverage_probability) / 2.0
+        factor = float(stats.t.ppf(tail, len(points) - 2))
+        expanded = factor * u_intercept
+
     return KlinkenbergResult(
         liquid_permeability_darcy=intercept,
         slippage_factor_atm=slippage_factor,
         slope=slope,
         intercept=intercept,
         r_squared=r_squared,
-        intercept_stderr=float(regression.intercept_stderr),
-        slope_stderr=float(regression.stderr),
+        intercept_stderr=u_intercept,
+        slope_stderr=u_slope,
+        liquid_permeability_expanded_uncertainty_darcy=expanded,
+        slippage_factor_standard_uncertainty_atm=_slippage_uncertainty(
+            intercept, slope, u_intercept, u_slope, covariance
+        ),
+        coverage_factor=factor,
+        coverage_probability=coverage_probability if factor is not None else None,
+        weighted=weighted,
         points=list(points),
         warnings=warnings,
     )

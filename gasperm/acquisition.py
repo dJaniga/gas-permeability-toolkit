@@ -1,16 +1,20 @@
-"""Real-time sampling loop, rolling averages, and live permeability.
+"""Real-time sampling loop, steady-state gating, and live permeability.
 
-Split deliberately in two:
+Split deliberately in three:
 
-* :class:`SampleProcessor` -- pure computation. Takes raw voltages and a
-  temperature, returns a :class:`~gasperm.models.Reading`. No device imports,
-  no I/O, no clock. This is where every unit conversion and the Darcy call
-  happen, and it is directly unit-testable.
-* :class:`AcquisitionLoop` -- the timing, the sources, the CSV writer and the
-  plot queue. Talks to its inputs through the
-  :class:`~gasperm.hardware.daq.AnalogInputSource` and
-  :class:`~gasperm.hardware.temperature.TemperatureSource` protocols, so the
-  tests drive it with fakes.
+* :class:`SampleProcessor` -- pure computation. Raw voltages plus a temperature
+  in, one :class:`~gasperm.models.Reading` out. No device imports, no I/O, no
+  clock. Every unit conversion and the Darcy call live here.
+* :class:`AcquisitionLoop` -- timing, sources, the CSV writer, the plot queue,
+  and the steady-state detector. Talks to its inputs through the
+  ``AnalogInputSource`` / ``TemperatureSource`` protocols, so tests drive it
+  with fakes.
+* :func:`summarize_run` -- reduces a finished run to its reported result,
+  taken from the **detected steady-state window** and accompanied by a GUM
+  uncertainty budget.
+
+The reported permeability comes only from the steady window: a value measured
+while the rig is still equilibrating describes the transient, not the rock.
 """
 
 from __future__ import annotations
@@ -25,18 +29,26 @@ from datetime import datetime, timezone
 from typing import Callable, Sequence
 
 from gasperm import units
-from gasperm.config import GaspermConfig
+from gasperm.config import GaspermConfig, experiment_metadata
 from gasperm.gas_properties import GasPropertyProvider
 from gasperm.hardware.daq import AnalogInputSource
 from gasperm.hardware.flowmeter import FlowChannel
 from gasperm.hardware.pressure import PressureChannel
 from gasperm.hardware.temperature import TemperatureSample, TemperatureSource
-from gasperm.models import Reading, RunSummary
+from gasperm.models import (
+    Reading,
+    RunSummary,
+    SteadyStateStatus,
+    SteadyStateWindow,
+    UncertaintyBudget,
+)
 from gasperm.permeability import (
     PermeabilityInputError,
     compute_gas_permeability,
     mean_pressure,
 )
+from gasperm.steady_state import SteadyStateDetector, signals_from_reading
+from gasperm.uncertainty import MeasurementPoint, build_budget
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +56,11 @@ __all__ = [
     "RollingWindow",
     "SampleProcessor",
     "AcquisitionLoop",
+    "summarize_run",
     "trailing_window_mean",
     "steady_state_stats",
+    "format_reading_line",
+    "console_header",
 ]
 
 
@@ -57,10 +72,9 @@ __all__ = [
 class RollingWindow:
     """Time-based rolling window over ``(time, value)`` pairs.
 
-    Used for the live permeability display, for the run summary, and -- via
-    :func:`steady_state_stats` -- by ``klinkenberg`` when reducing a stored run
-    to a single point, so all three share one definition of "the trailing
-    N seconds".
+    Drives the live display. The *reported* result does not come from here --
+    it comes from the steady-state window -- but a rolling mean is what makes
+    the console readable while the rig settles.
     """
 
     def __init__(self, window_s: float) -> None:
@@ -72,8 +86,7 @@ class RollingWindow:
     def add(self, timestamp_s: float, value: float) -> None:
         """Add a sample, dropping anything older than the window.
 
-        Non-finite values are ignored rather than poisoning the mean; a run
-        with a few unusable samples still reports a sensible average.
+        Non-finite values are ignored rather than poisoning the mean.
         """
         if not math.isfinite(value):
             return
@@ -120,17 +133,19 @@ def trailing_window_mean(
 def steady_state_stats(
     timestamps: Sequence[float], values: Sequence[float], window_s: float
 ) -> tuple[float | None, float | None, int]:
-    """``(mean, stddev, n)`` over the trailing ``window_s`` seconds.
-
-    The same reduction ``collect`` uses for its run summary and ``klinkenberg``
-    uses to turn a stored run into one regression point -- deliberately shared
-    rather than reimplemented, so the two never disagree about what
-    "steady-state" means.
-    """
+    """``(mean, stddev, n)`` over the trailing ``window_s`` seconds."""
     window = RollingWindow(window_s)
     for timestamp, value in zip(timestamps, values):
         window.add(timestamp, value)
     return window.mean(), window.stddev(), window.count
+
+
+def _mean_stddev(values: Sequence[float]) -> tuple[float, float]:
+    """``(mean, sample stddev)``; stddev is 0 for fewer than two values."""
+    if not values:
+        return 0.0, 0.0
+    mean = statistics.fmean(values)
+    return mean, (statistics.stdev(values) if len(values) > 1 else 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -139,11 +154,7 @@ def steady_state_stats(
 
 
 class SampleProcessor:
-    """Turns raw voltages plus a temperature into a :class:`Reading`.
-
-    Holds the calibrated channels and the gas property provider; owns every
-    unit conversion between the hardware boundary and the CGS physics call.
-    """
+    """Turns raw voltages plus a temperature into a :class:`Reading`."""
 
     def __init__(self, config: GaspermConfig, gas_provider: GasPropertyProvider) -> None:
         self.config = config
@@ -151,21 +162,20 @@ class SampleProcessor:
 
         atmospheric_atm = config.run.atmospheric_pressure_atm
         self.atmospheric_pressure_atm = atmospheric_atm
+        calibration = config.hardware.pressure_calibration
         self.inlet = PressureChannel.from_config(
-            "inlet",
-            config.daq.inlet_pressure_channel,
-            config.pressure_calibration.inlet,
-            atmospheric_atm,
+            "inlet", config.hardware.daq.inlet_pressure_channel, calibration.inlet, atmospheric_atm
         )
         self.outlet = PressureChannel.from_config(
             "outlet",
-            config.daq.outlet_pressure_channel,
-            config.pressure_calibration.outlet,
+            config.hardware.daq.outlet_pressure_channel,
+            calibration.outlet,
             atmospheric_atm,
         )
-        self.flow = FlowChannel.from_config(config.flowmeter)
+        self.flow = FlowChannel.from_config(config.hardware.flowmeter)
 
         geometry = config.geometry()
+        self.geometry = geometry
         self.length_cm = geometry.length_cm
         self.area_cm2 = geometry.area_cm2
 
@@ -174,13 +184,7 @@ class SampleProcessor:
     # -- helpers ----------------------------------------------------------
 
     def resolve_downstream_pressure_atm(self, measured_outlet_atm: float) -> float:
-        """P2 for the Darcy equation, per ``run.outlet_pressure_reference``.
-
-        ``"measured"`` trusts the outlet transducer; ``"atmospheric"`` uses the
-        configured ambient (correct for a rig venting to atmosphere, where the
-        outlet transducer may be absent or reading noise around zero); a
-        number pins it to a fixed back-pressure.
-        """
+        """P2 for the Darcy equation, per ``run.outlet_pressure_reference``."""
         reference = self.config.run.outlet_pressure_reference
         if reference == "measured":
             return measured_outlet_atm
@@ -209,22 +213,25 @@ class SampleProcessor:
         voltages: dict[str, float],
         temperature: TemperatureSample,
         timestamp: datetime | None = None,
+        steady_state: bool = False,
+        steady_state_passes: int = 0,
     ) -> Reading:
         """Compute one :class:`Reading` from one set of raw voltages.
 
         Args:
             index: Zero-based sample number.
-            elapsed_s: Seconds since the run started -- also the rolling
-                window's time base.
-            voltages: ``{channel_name: volts}`` covering both pressure
-                channels and the active flow channel.
+            elapsed_s: Seconds since the run started.
+            voltages: ``{channel_name: volts}`` for both pressure channels and
+                the active flow channel.
             temperature: Latest probe state; may be missing or stale.
             timestamp: Wall-clock time for the log. Defaults to now (UTC).
+            steady_state: Whether the detector had confirmed steady state as of
+                this sample.
+            steady_state_passes: Consecutive passing windows at this sample.
 
         Returns:
             A fully-populated reading. ``permeability_darcy`` is ``None`` with
-            an explanatory ``note`` when the sample cannot be inverted (no
-            differential yet, transducer noise below zero, and so on) -- that
+            an explanatory ``note`` when the sample cannot be inverted, which
             is normal early in a run and must not abort it.
 
         Raises:
@@ -249,19 +256,26 @@ class SampleProcessor:
         temperature_c = temperature.temperature_c
         temperature_ok = temperature_c is not None
         if temperature_c is None:
-            temperature_c = self.config.temperature.fallback_temperature_c
+            temperature_c = self.config.hardware.temperature.fallback_temperature_c
 
         # Viscosity is evaluated per reading at the mean pore pressure and the
         # current temperature -- both drift during a run, especially before the
-        # rig settles. See gas_properties for why the mean pressure is the
-        # documented choice.
+        # rig settles.
         gas_state = self.gas_provider.state_at_cgs(temperature_c, max(mean_atm, 1e-9))
+
+        # The Darcy equation's Q_ref * P_ref pairing is exact for an ideal gas.
+        # Dividing the reference flow by Z restores the molar-flow invariant
+        # when the gas is not ideal (CO2, or several tens of atm).
+        reference_flow_cm3_s = flow_cm3_s
+        z_factor = gas_state.compressibility_z
+        if self.config.run.gas.real_gas_correction and z_factor:
+            reference_flow_cm3_s = flow_cm3_s / z_factor
 
         permeability: float | None = None
         note: str | None = None
         try:
             permeability = compute_gas_permeability(
-                flow_rate_cm3_s=flow_cm3_s,
+                flow_rate_cm3_s=reference_flow_cm3_s,
                 reference_pressure_atm=reference_pressure_atm,
                 viscosity_cp=gas_state.viscosity_cp,
                 length_cm=self.length_cm,
@@ -288,14 +302,17 @@ class SampleProcessor:
             downstream_pressure_atm=downstream_atm,
             mean_pressure_atm=mean_atm,
             flow_cm3_s=flow_cm3_s,
-            flow_reference_cm3_s=flow_cm3_s,
+            flow_reference_cm3_s=reference_flow_cm3_s,
             flow_reference_pressure_atm=reference_pressure_atm,
             temperature_c=temperature_c,
             temperature_ok=temperature_ok,
             temperature_stale=temperature.stale or not temperature_ok,
             viscosity_cp=gas_state.viscosity_cp,
+            compressibility_z=z_factor,
             permeability_darcy=permeability,
             permeability_darcy_avg=self._window.mean(),
+            steady_state=steady_state,
+            steady_state_passes=steady_state_passes,
             note=note,
         )
 
@@ -318,8 +335,10 @@ class SampleProcessor:
 class AcquisitionLoop:
     """Drives sampling at ``daq.sample_rate_hz`` until stopped.
 
-    Stops on Ctrl+C, on ``run.duration_s``, or on ``run.max_samples``,
-    whichever comes first, and always closes its sources.
+    Stops on Ctrl+C, on ``run.duration_s``, on ``run.max_samples``, on
+    ``run.stop_when_steady`` once steady state is confirmed, or on
+    ``steady_state.max_wait_s`` if it never is -- whichever comes first. Always
+    closes its sources.
     """
 
     def __init__(
@@ -333,17 +352,6 @@ class AcquisitionLoop:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        """Args:
-        config: Validated rig configuration.
-        processor: The pure per-sample computation.
-        analog_source: Anything satisfying ``AnalogInputSource``.
-        temperature_source: Anything satisfying ``TemperatureSource``.
-        on_reading: Called with each reading -- console output, CSV writer,
-            plot queue. Exceptions raised here are logged and swallowed so a
-            display problem cannot end a run.
-        clock: Monotonic time source. Injectable for deterministic tests.
-        sleep: Sleep function. Injectable for deterministic tests.
-        """
         self.config = config
         self.processor = processor
         self.analog_source = analog_source
@@ -354,30 +362,44 @@ class AcquisitionLoop:
 
         self.readings: list[Reading] = []
         self.warnings: list[str] = []
+        self.detector = SteadyStateDetector(config.run.steady_state)
+        self.status: SteadyStateStatus = self.detector.status
+        #: Bounds of the last confirmed steady stretch, preserved even if the
+        #: rig destabilises afterwards -- a late wobble should not erase a good
+        #: plateau, it should be reported alongside it.
+        self.steady_start_s: float | None = None
+        self.steady_end_s: float | None = None
+        self.ended_unsteady = False
+
         self._stop_requested = False
+        self._stop_reason = ""
         self.started_at: datetime | None = None
         self.ended_at: datetime | None = None
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str = "requested") -> None:
         """Ask the loop to finish after the current sample."""
         self._stop_requested = True
+        self._stop_reason = reason
+
+    @property
+    def stop_reason(self) -> str:
+        """Why the loop ended."""
+        return self._stop_reason
+
+    @property
+    def steady_state_reached(self) -> bool:
+        """Whether the run ever confirmed steady state."""
+        return self.steady_start_s is not None
 
     # -- main loop --------------------------------------------------------
 
     def run(self, *, install_signal_handler: bool = True) -> list[Reading]:
-        """Sample until a stop condition is met.
-
-        Args:
-            install_signal_handler: Install a SIGINT handler that requests a
-                clean stop instead of unwinding mid-write. Disabled in tests
-                and when not on the main thread.
-
-        Returns:
-            Every reading taken, in order.
-        """
-        interval_s = 1.0 / self.config.daq.sample_rate_hz
-        duration_s = self.config.run.duration_s
-        max_samples = self.config.run.max_samples
+        """Sample until a stop condition is met."""
+        interval_s = 1.0 / self.config.hardware.daq.sample_rate_hz
+        run_config = self.config.run
+        duration_s = run_config.duration_s
+        max_samples = run_config.max_samples
+        max_wait_s = run_config.steady_state.max_wait_s
 
         previous_handler = None
         if install_signal_handler:
@@ -389,16 +411,39 @@ class AcquisitionLoop:
         try:
             while not self._stop_requested:
                 if max_samples is not None and index >= max_samples:
+                    self._stop_reason = f"reached max_samples ({max_samples})"
                     break
                 target = start + index * interval_s
                 elapsed = self._clock() - start
                 if duration_s is not None and elapsed >= duration_s:
+                    self._stop_reason = f"reached duration_s ({duration_s} s)"
+                    break
+                if (
+                    max_wait_s is not None
+                    and not self.steady_state_reached
+                    and elapsed >= max_wait_s
+                ):
+                    self._record_warning(
+                        f"Gave up waiting for steady state after {max_wait_s} s "
+                        f"(steady_state.max_wait_s)."
+                    )
+                    self._stop_reason = "timed out waiting for steady state"
                     break
 
                 reading = self._sample_once(index, elapsed)
                 if reading is not None:
                     self.readings.append(reading)
                     self._emit(reading)
+                    if (
+                        run_config.stop_when_steady
+                        and self.detector.is_steady
+                        and self.steady_end_s is not None
+                        and self.steady_start_s is not None
+                        and (self.steady_end_s - self.steady_start_s)
+                        >= run_config.steady_state.window_s
+                    ):
+                        self._stop_reason = "steady state confirmed (stop_when_steady)"
+                        break
                 index += 1
 
                 # Sleep to the next slot rather than a fixed interval, so a
@@ -411,6 +456,14 @@ class AcquisitionLoop:
             if previous_handler is not None:
                 signal.signal(signal.SIGINT, previous_handler)
             self.close()
+
+        if self.steady_state_reached and not self.detector.is_steady:
+            self.ended_unsteady = True
+            self._record_warning(
+                "The rig left steady state before the run ended; the reported result "
+                f"comes from the plateau at {self.steady_start_s:.1f}-"
+                f"{self.steady_end_s:.1f} s."
+            )
         return self.readings
 
     def _sample_once(self, index: int, elapsed: float) -> Reading | None:
@@ -429,7 +482,8 @@ class AcquisitionLoop:
                 "temperature-missing",
                 "No temperature reading available; using "
                 f"temperature.fallback_temperature_c = "
-                f"{self.config.temperature.fallback_temperature_c} degC for viscosity.",
+                f"{self.config.hardware.temperature.fallback_temperature_c} degC for "
+                "viscosity.",
             )
         elif temperature.stale:
             self._record_warning_once(
@@ -438,11 +492,31 @@ class AcquisitionLoop:
                 f"({temperature.temperature_c:.2f} degC).",
             )
 
-        return self.processor.process(
+        # Compute the reading first, then let the detector see it, then stamp
+        # the resulting verdict onto the reading. One pass, no double work.
+        provisional = self.processor.process(
             index=index,
             elapsed_s=elapsed,
             voltages=voltages,
             temperature=temperature,
+        )
+        was_steady = self.detector.is_steady
+        self.status = self.detector.update(elapsed, signals_from_reading(provisional))
+
+        if self.detector.is_steady:
+            if not was_steady:
+                self._record_warning(
+                    f"Steady state confirmed at {elapsed:.1f} s "
+                    f"({self.status.progress} windows)."
+                )
+            self.steady_start_s = self.detector.steady_since_elapsed_s
+            self.steady_end_s = elapsed
+
+        return provisional.model_copy(
+            update={
+                "steady_state": self.detector.is_steady,
+                "steady_state_passes": self.status.consecutive_passes,
+            }
         )
 
     def _emit(self, reading: Reading) -> None:
@@ -456,7 +530,7 @@ class AcquisitionLoop:
     def _install_sigint(self):
         def handler(signum, frame):  # noqa: ANN001, ARG001
             logger.info("Stop requested; finishing the current sample.")
-            self.request_stop()
+            self.request_stop("interrupted")
 
         try:
             return signal.signal(signal.SIGINT, handler)
@@ -495,67 +569,184 @@ class AcquisitionLoop:
 
     # -- summary ----------------------------------------------------------
 
+    def steady_window(self) -> SteadyStateWindow | None:
+        """The confirmed steady stretch, as indices into :attr:`readings`."""
+        if self.steady_start_s is None or self.steady_end_s is None:
+            return None
+        indices = [
+            i
+            for i, reading in enumerate(self.readings)
+            if self.steady_start_s <= reading.elapsed_s <= self.steady_end_s
+            and reading.permeability_darcy is not None
+        ]
+        if not indices:
+            return None
+        return SteadyStateWindow(
+            start_elapsed_s=self.readings[indices[0]].elapsed_s,
+            end_elapsed_s=self.readings[indices[-1]].elapsed_s,
+            sample_count=len(indices),
+            start_index=indices[0],
+            end_index=indices[-1],
+        )
+
     def summarize(self, csv_path: str | None = None) -> RunSummary:
-        """Reduce the run to its steady-state result.
-
-        The trailing ``run.averaging_window_s`` is treated as steady state --
-        the same reduction ``klinkenberg`` applies to a stored run.
-
-        Raises:
-            ValueError: no reading produced a usable permeability.
-        """
-        usable = [r for r in self.readings if r.permeability_darcy is not None]
-        if not usable:
-            raise ValueError(
-                "No sample produced a usable permeability. Check that inlet pressure "
-                "exceeded outlet pressure and that gas was flowing."
-            )
-
-        timestamps = [r.elapsed_s for r in usable]
-        permeabilities = [r.permeability_darcy for r in usable]
-        mean_k, stddev_k, n = steady_state_stats(
-            timestamps, permeabilities, self.config.run.averaging_window_s
-        )
-        mean_p, _, _ = steady_state_stats(
-            timestamps, [r.mean_pressure_atm for r in usable],
-            self.config.run.averaging_window_s,
-        )
-        mean_t, _, _ = steady_state_stats(
-            timestamps, [r.temperature_c for r in usable],
-            self.config.run.averaging_window_s,
-        )
-        mean_q, _, _ = steady_state_stats(
-            timestamps, [r.flow_cm3_s for r in usable],
-            self.config.run.averaging_window_s,
-        )
-
-        started = self.started_at or usable[0].timestamp
-        ended = self.ended_at or usable[-1].timestamp
-        return RunSummary(
-            sample_id=self.config.sample.id,
-            gas_name=self.config.gas.name,
-            started_at=started,
-            ended_at=ended,
-            duration_s=usable[-1].elapsed_s,
-            sample_count=len(self.readings),
-            mean_pressure_atm=float(mean_p or 0.0),
-            permeability_darcy=float(mean_k or 0.0),
-            permeability_stddev_darcy=float(stddev_k or 0.0),
-            mean_temperature_c=float(mean_t or 0.0),
-            mean_flow_cm3_s=float(mean_q or 0.0),
-            averaged_samples=n,
+        """Reduce the run to its reported result. See :func:`summarize_run`."""
+        return summarize_run(
+            self.readings,
+            self.config,
+            steady_window=self.steady_window(),
+            gas_provider=self.processor.gas_provider,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
             csv_path=csv_path,
             warnings=list(self.warnings),
         )
 
 
-def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
-    """One console line for a reading, in the configured **display** units.
+# --------------------------------------------------------------------------
+# Reduction
+# --------------------------------------------------------------------------
 
-    Display units are decoupled from both the calibration units and the
-    internal CGS calculation, so changing ``display_pressure_unit`` never
-    touches a number that feeds the physics.
+
+def summarize_run(
+    readings: Sequence[Reading],
+    config: GaspermConfig,
+    *,
+    steady_window: SteadyStateWindow | None,
+    gas_provider: GasPropertyProvider | None = None,
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
+    csv_path: str | None = None,
+    warnings: Sequence[str] = (),
+) -> RunSummary:
+    """Reduce a finished run to its reported result.
+
+    The result is taken from ``steady_window`` when there is one. When there is
+    not, the run is summarised over its trailing ``averaging_window_s`` purely
+    so the operator can see what happened -- but ``steady_state_reached`` is
+    false and the summary must not be treated as a measurement of the sample.
+
+    Args:
+        readings: Every reading taken.
+        config: The run's configuration.
+        steady_window: The detected steady stretch, or ``None``.
+        gas_provider: Used for the viscosity/temperature sensitivity in the
+            uncertainty budget. ``None`` omits the temperature term.
+        started_at: Wall-clock start. Defaults to the first reading.
+        ended_at: Wall-clock end. Defaults to the last reading.
+        csv_path: Recorded in the summary for traceability.
+        warnings: Non-fatal problems seen during the run.
+
+    Returns:
+        The summary, with a GUM budget attached when uncertainty is enabled and
+        the run reached steady state.
+
+    Raises:
+        ValueError: no reading produced a usable permeability at all.
     """
+    usable = [r for r in readings if r.permeability_darcy is not None]
+    if not usable:
+        raise ValueError(
+            "No sample produced a usable permeability. Check that inlet pressure "
+            "exceeded outlet pressure and that gas was flowing."
+        )
+
+    collected_warnings = list(warnings)
+
+    if steady_window is not None:
+        window_readings = [
+            r
+            for r in usable
+            if steady_window.start_elapsed_s <= r.elapsed_s <= steady_window.end_elapsed_s
+        ]
+    else:
+        cutoff = usable[-1].elapsed_s - config.run.averaging_window_s
+        window_readings = [r for r in usable if r.elapsed_s >= cutoff]
+        collected_warnings.append(
+            "Steady state was never confirmed. The figures below describe the trailing "
+            f"{config.run.averaging_window_s:g} s of an unsettled run and are NOT a "
+            "representative permeability for this sample."
+        )
+    if not window_readings:
+        window_readings = usable[-1:]
+
+    permeabilities = [r.permeability_darcy for r in window_readings]
+    mean_k, stddev_k = _mean_stddev(permeabilities)
+    mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window_readings])
+    mean_t, _ = _mean_stddev([r.temperature_c for r in window_readings])
+    mean_q, _ = _mean_stddev([r.flow_cm3_s for r in window_readings])
+    mean_inlet, _ = _mean_stddev([r.inlet_pressure_atm for r in window_readings])
+    mean_downstream, _ = _mean_stddev(
+        [r.downstream_pressure_atm for r in window_readings]
+    )
+    mean_reference_p, _ = _mean_stddev(
+        [r.flow_reference_pressure_atm for r in window_readings]
+    )
+    mean_reference_q, _ = _mean_stddev([r.flow_reference_cm3_s for r in window_readings])
+    mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window_readings])
+
+    budget: UncertaintyBudget | None = None
+    if config.run.uncertainty.enabled and mean_k > 0.0:
+        count = len(permeabilities)
+        type_a_relative = (
+            stddev_k / math.sqrt(count) / mean_k if count > 1 and mean_k else None
+        )
+        exponent = 0.0
+        if gas_provider is not None:
+            exponent = gas_provider.viscosity_temperature_exponent(
+                units.celsius_to_kelvin(mean_t), mean_p * units.ATM_IN_PA
+            )
+        try:
+            budget = build_budget(
+                MeasurementPoint(
+                    permeability_darcy=mean_k,
+                    inlet_pressure_atm=mean_inlet,
+                    downstream_pressure_atm=mean_downstream,
+                    flow_cm3_s=mean_reference_q,
+                    reference_pressure_atm=mean_reference_p,
+                    viscosity_cp=mean_mu,
+                    temperature_c=mean_t,
+                ),
+                config.geometry(),
+                config.hardware,
+                config.run,
+                type_a_relative=type_a_relative,
+                type_a_dof=float(count - 1) if count > 1 else math.inf,
+                viscosity_temperature_exponent=exponent,
+            )
+        except ValueError as exc:
+            collected_warnings.append(f"Could not evaluate the uncertainty budget: {exc}")
+
+    first, last = usable[0], usable[-1]
+    return RunSummary(
+        sample_id=config.sample.id,
+        gas_name=config.run.gas.name,
+        started_at=started_at or first.timestamp,
+        ended_at=ended_at or last.timestamp,
+        duration_s=last.elapsed_s,
+        sample_count=len(readings),
+        steady_state_reached=steady_window is not None,
+        steady_state_window=steady_window,
+        mean_pressure_atm=mean_p,
+        permeability_darcy=mean_k,
+        permeability_stddev_darcy=stddev_k,
+        mean_temperature_c=mean_t,
+        mean_flow_cm3_s=mean_q,
+        averaged_samples=len(window_readings),
+        uncertainty=budget,
+        metadata=experiment_metadata(config),
+        csv_path=csv_path,
+        warnings=collected_warnings,
+    )
+
+
+# --------------------------------------------------------------------------
+# Console rendering
+# --------------------------------------------------------------------------
+
+
+def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
+    """One console line for a reading, in the configured **display** units."""
     run = config.run
     pressure_unit = run.display_pressure_unit
     permeability_unit = run.display_permeability_unit
@@ -572,13 +763,13 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
         k_text = f"{'--':>11} {permeability_unit}"
 
     temperature_flag = "" if reading.temperature_ok and not reading.temperature_stale else "*"
+    marker = "STEADY" if reading.steady_state else f"settling {reading.steady_state_passes}"
     line = (
         f"{reading.elapsed_s:7.1f}s  "
         f"P1 {p1:9.3f}  P2 {p2:9.3f} {pressure_unit}  "
         f"Q {flow:9.3f} {flow_unit}  "
         f"T {reading.temperature_c:6.2f}{temperature_flag:1}C  "
-        f"mu {reading.viscosity_cp:.5f} cP  "
-        f"k {k_text}"
+        f"k {k_text}  {marker:>11}"
     )
     if reading.note:
         line += f"   [{reading.note}]"
@@ -591,6 +782,6 @@ def console_header(config: GaspermConfig) -> str:
         f"{'time':>8}  {'inlet':>12} {'outlet':>12} "
         f"({config.run.display_pressure_unit})  "
         f"{'flow':>11} ({config.run.display_flow_unit})  "
-        f"{'temp':>8}  {'viscosity':>11}  "
-        f"{'permeability':>14} ({config.run.display_permeability_unit})"
+        f"{'temp':>8}  "
+        f"{'permeability':>14} ({config.run.display_permeability_unit})  {'state':>11}"
     )

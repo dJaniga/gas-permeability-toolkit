@@ -4,16 +4,19 @@ Layout of a run directory::
 
     runs/
       core-001_20260803T141530Z/
-        readings.csv       # one row per sample, streamed and periodically flushed
-        run.yaml           # config snapshot + summary, written at the end
-        run.log            # per-run log file
+        readings.csv        # one row per sample, streamed and flushed periodically
+        run_metadata.yaml   # config snapshot + experiment metadata + summary
+        run.log             # per-run log file
+
+The sidecar is ``run_metadata.yaml`` rather than ``run.yaml`` so it is never
+confused with the *run configuration* file of that name.
 
 CSV column names carry their unit as a suffix (``inlet_pressure_atm``,
 ``permeability_D``) and are always in **internal CGS-Darcy units**, never in
-display units. Display units are a console/plot concern only; a stored run must
-mean the same thing regardless of what the operator happened to be looking at.
-Raw voltages are stored alongside, so a run can be reprocessed against a
-corrected calibration without repeating the experiment.
+display units: a stored run must mean the same thing regardless of what the
+operator happened to be looking at. Raw voltages are stored alongside, so a run
+can be reprocessed against a corrected calibration without repeating the
+experiment.
 """
 
 from __future__ import annotations
@@ -27,9 +30,11 @@ from typing import Any, Sequence
 
 import yaml
 
-from gasperm.acquisition import steady_state_stats
-from gasperm.config import GaspermConfig, config_to_dict
+from gasperm import units
+from gasperm.config import GaspermConfig, config_to_dict, experiment_metadata
+from gasperm.config.run import SteadyStateConfig
 from gasperm.models import KlinkenbergPoint, Reading, RunSummary
+from gasperm.steady_state import detect_steady_window
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +44,14 @@ __all__ = [
     "read_readings_csv",
     "read_run_metadata",
     "run_directory_name",
+    "resolve_run_paths",
     "point_from_run",
     "collect_points",
     "write_klinkenberg_result",
 ]
 
 READINGS_FILENAME = "readings.csv"
-METADATA_FILENAME = "run.yaml"
+METADATA_FILENAME = "run_metadata.yaml"
 LOG_FILENAME = "run.log"
 
 #: CSV columns, in order. Unit suffixes are part of the contract -- the
@@ -62,13 +68,17 @@ READING_COLUMNS: tuple[str, ...] = (
     "downstream_pressure_atm",
     "mean_pressure_atm",
     "flow_cm3_s",
+    "flow_reference_cm3_s",
     "flow_reference_pressure_atm",
     "temperature_C",
     "temperature_ok",
     "temperature_stale",
     "viscosity_cP",
+    "compressibility_Z",
     "permeability_D",
     "permeability_avg_D",
+    "steady_state",
+    "steady_state_passes",
     "note",
     "temperature_raw",
 )
@@ -98,6 +108,10 @@ def _unique_directory(preferred: Path) -> Path:
     raise RuntimeError(f"Could not find a free run directory next to {preferred}.")
 
 
+def _optional(value: float | None, spec: str = ".8g") -> str:
+    return "" if value is None else format(value, spec)
+
+
 def _reading_row(reading: Reading) -> dict[str, Any]:
     return {
         "index": reading.index,
@@ -111,30 +125,24 @@ def _reading_row(reading: Reading) -> dict[str, Any]:
         "downstream_pressure_atm": f"{reading.downstream_pressure_atm:.8g}",
         "mean_pressure_atm": f"{reading.mean_pressure_atm:.8g}",
         "flow_cm3_s": f"{reading.flow_cm3_s:.8g}",
+        "flow_reference_cm3_s": f"{reading.flow_reference_cm3_s:.8g}",
         "flow_reference_pressure_atm": f"{reading.flow_reference_pressure_atm:.8g}",
         "temperature_C": f"{reading.temperature_c:.4f}",
         "temperature_ok": int(reading.temperature_ok),
         "temperature_stale": int(reading.temperature_stale),
         "viscosity_cP": f"{reading.viscosity_cp:.8g}",
-        "permeability_D": (
-            "" if reading.permeability_darcy is None else f"{reading.permeability_darcy:.8g}"
-        ),
-        "permeability_avg_D": (
-            ""
-            if reading.permeability_darcy_avg is None
-            else f"{reading.permeability_darcy_avg:.8g}"
-        ),
+        "compressibility_Z": _optional(reading.compressibility_z),
+        "permeability_D": _optional(reading.permeability_darcy),
+        "permeability_avg_D": _optional(reading.permeability_darcy_avg),
+        "steady_state": int(reading.steady_state),
+        "steady_state_passes": reading.steady_state_passes,
         "note": reading.note or "",
         "temperature_raw": reading.temperature_raw or "",
     }
 
 
 class RunWriter:
-    """Streams readings to CSV and writes the metadata sidecar at the end.
-
-    Flushes every ``run.flush_every_n`` samples so a crash costs at most that
-    many rows rather than the whole run.
-    """
+    """Streams readings to CSV and writes the metadata sidecar at the end."""
 
     def __init__(self, config: GaspermConfig, *, started_at: datetime | None = None) -> None:
         self.config = config
@@ -194,10 +202,10 @@ class RunWriter:
             handle.close()
 
     def write_metadata(self, summary: RunSummary | None = None) -> Path:
-        """Write ``run.yaml``: the config snapshot plus the run summary.
+        """Write the sidecar: config snapshot, experiment metadata, summary.
 
         The full config is snapshotted so a stored run is self-describing --
-        reprocessing it later never depends on the config file still existing
+        reprocessing it later never depends on the config files still existing
         or still saying the same thing.
         """
         payload: dict[str, Any] = {
@@ -206,6 +214,7 @@ class RunWriter:
                 "readings_csv": READINGS_FILENAME,
                 "rows": self.rows_written,
             },
+            "metadata": experiment_metadata(self.config).model_dump(mode="json"),
             "config": config_to_dict(self.config),
         }
         if summary is not None:
@@ -234,9 +243,10 @@ def _float_or_none(value: str | None) -> float | None:
 def read_readings_csv(path: str | Path) -> list[dict[str, Any]]:
     """Read a run's ``readings.csv`` into typed dicts.
 
-    Kept as dicts rather than :class:`Reading` models because a stored run may
-    come from an older column set; the consumers here only need the few columns
-    they name.
+    The returned rows carry both the stored column names and the signal keys
+    the steady-state detector expects (``permeability``, ``inlet_pressure``,
+    ``flow``, ``temperature`` in kelvin), so a stored run can be replayed
+    through exactly the same detector the live run used.
 
     Raises:
         ValueError: the file is missing the columns a run CSV must have.
@@ -255,20 +265,30 @@ def read_readings_csv(path: str | Path) -> list[dict[str, Any]]:
             )
         rows: list[dict[str, Any]] = []
         for row in reader:
-            rows.append(
-                {
-                    "elapsed_s": _float_or_none(row.get("elapsed_s")),
-                    "mean_pressure_atm": _float_or_none(row.get("mean_pressure_atm")),
-                    "permeability_D": _float_or_none(row.get("permeability_D")),
-                    "temperature_C": _float_or_none(row.get("temperature_C")),
-                    "flow_cm3_s": _float_or_none(row.get("flow_cm3_s")),
-                }
+            temperature_c = _float_or_none(row.get("temperature_C"))
+            parsed = {
+                "elapsed_s": _float_or_none(row.get("elapsed_s")),
+                "mean_pressure_atm": _float_or_none(row.get("mean_pressure_atm")),
+                "inlet_pressure_atm": _float_or_none(row.get("inlet_pressure_atm")),
+                "downstream_pressure_atm": _float_or_none(row.get("downstream_pressure_atm")),
+                "permeability_D": _float_or_none(row.get("permeability_D")),
+                "temperature_C": temperature_c,
+                "flow_cm3_s": _float_or_none(row.get("flow_cm3_s")),
+                "steady_state": _float_or_none(row.get("steady_state")),
+            }
+            # Detector signal aliases.
+            parsed["permeability"] = parsed["permeability_D"]
+            parsed["inlet_pressure"] = parsed["inlet_pressure_atm"]
+            parsed["flow"] = parsed["flow_cm3_s"]
+            parsed["temperature"] = (
+                units.celsius_to_kelvin(temperature_c) if temperature_c is not None else None
             )
+            rows.append(parsed)
     return rows
 
 
 def read_run_metadata(path: str | Path) -> dict[str, Any]:
-    """Read a run's ``run.yaml``, or return ``{}`` when absent."""
+    """Read a run's metadata sidecar, or return ``{}`` when absent."""
     metadata_path = Path(path)
     if not metadata_path.is_file():
         return {}
@@ -281,7 +301,7 @@ def read_run_metadata(path: str | Path) -> dict[str, Any]:
 
 
 def resolve_run_paths(target: str | Path) -> tuple[Path, Path | None]:
-    """Resolve a run directory or CSV path to ``(readings_csv, run_yaml)``.
+    """Resolve a run directory or CSV path to ``(readings_csv, metadata)``.
 
     Accepts either the run directory or the ``readings.csv`` inside it, since
     operators reasonably point at both.
@@ -305,32 +325,68 @@ def resolve_run_paths(target: str | Path) -> tuple[Path, Path | None]:
     raise FileNotFoundError(f"No such run directory or file: {candidate}")
 
 
+def _steady_config_from_metadata(
+    metadata: dict[str, Any], override_window_s: float | None
+) -> SteadyStateConfig:
+    """The steady-state criteria a stored run was recorded under."""
+    stored = ((metadata.get("config") or {}).get("run") or {}).get("steady_state")
+    config = SteadyStateConfig.model_validate(stored) if stored else SteadyStateConfig()
+    if override_window_s is not None:
+        config = config.model_copy(update={"window_s": override_window_s})
+    return config
+
+
 def point_from_run(
-    target: str | Path, *, averaging_window_s: float | None = None
+    target: str | Path,
+    *,
+    averaging_window_s: float | None = None,
+    allow_unsteady: bool = False,
 ) -> KlinkenbergPoint:
     """Reduce a stored ``collect`` run to one Klinkenberg point.
 
-    Uses the same trailing-window reduction as the live run summary
-    (:func:`gasperm.acquisition.steady_state_stats`) rather than reinventing
-    "steady state", so a point derived here matches what ``collect`` printed.
+    The reduction is the run's **steady-state window**, detected by replaying
+    the stored readings through the same detector the live run used -- so a
+    point derived here matches what ``collect`` reported. When the run's
+    metadata already carries a steady summary, that is used directly, which
+    also brings its uncertainty across for a weighted regression.
 
     Args:
         target: Run directory or ``readings.csv``.
-        averaging_window_s: Overrides the window stored in the run's metadata.
+        averaging_window_s: Override the stored detector window.
+        allow_unsteady: Accept a run that never reached steady state. Off by
+            default: such a run does not measure the sample.
 
     Raises:
-        ValueError: the run has no usable permeability samples.
+        ValueError: the run has no usable samples, or never reached steady
+            state and ``allow_unsteady`` is false.
     """
     readings_path, metadata_path = resolve_run_paths(target)
     metadata = read_run_metadata(metadata_path) if metadata_path else {}
     stored_config = metadata.get("config", {}) if isinstance(metadata, dict) else {}
     sample_id = (stored_config.get("sample") or {}).get("id")
+    label = Path(readings_path).parent.name
 
-    window_s = averaging_window_s
-    if window_s is None:
-        window_s = (stored_config.get("run") or {}).get("averaging_window_s")
-    if window_s is None:
-        window_s = 5.0
+    summary = metadata.get("summary") if isinstance(metadata, dict) else None
+    if (
+        summary
+        and averaging_window_s is None
+        and summary.get("steady_state_reached")
+        and summary.get("permeability_darcy")
+    ):
+        budget = summary.get("uncertainty") or {}
+        return KlinkenbergPoint(
+            mean_pressure_atm=float(summary["mean_pressure_atm"]),
+            apparent_permeability_darcy=float(summary["permeability_darcy"]),
+            standard_uncertainty_darcy=(
+                float(budget["combined_standard_uncertainty_darcy"])
+                if budget.get("combined_standard_uncertainty_darcy")
+                else None
+            ),
+            label=label,
+            source_path=str(readings_path),
+            sample_id=sample_id or summary.get("sample_id"),
+            steady_state=True,
+        )
 
     rows = read_readings_csv(readings_path)
     usable = [
@@ -346,55 +402,80 @@ def point_from_run(
             "cannot contribute a Klinkenberg point."
         )
 
-    timestamps = [row["elapsed_s"] for row in usable]
-    mean_k, _, _ = steady_state_stats(
-        timestamps, [row["permeability_D"] for row in usable], float(window_s)
-    )
-    mean_p, _, _ = steady_state_stats(
-        timestamps, [row["mean_pressure_atm"] for row in usable], float(window_s)
-    )
-    if mean_k is None or mean_p is None or mean_p <= 0.0:
+    steady_config = _steady_config_from_metadata(metadata, averaging_window_s)
+    window = detect_steady_window(usable, steady_config) if steady_config.enabled else None
+
+    if window is None:
+        if not allow_unsteady:
+            raise ValueError(
+                f"{readings_path} never reached steady state under its own criteria, so "
+                "it does not measure this sample's permeability. Re-run it to a "
+                "plateau, or pass --allow-unsteady to use it anyway and accept that the "
+                "result is not representative."
+            )
+        selected = usable
+    else:
+        selected = [
+            row
+            for row in usable
+            if window.start_elapsed_s <= row["elapsed_s"] <= window.end_elapsed_s
+        ]
+
+    permeabilities = [row["permeability_D"] for row in selected]
+    pressures = [row["mean_pressure_atm"] for row in selected]
+    mean_k = sum(permeabilities) / len(permeabilities)
+    mean_p = sum(pressures) / len(pressures)
+    if mean_p <= 0.0:
         raise ValueError(
-            f"{readings_path}: could not reduce the trailing {window_s} s to a usable "
-            "(mean pressure, permeability) pair."
+            f"{readings_path}: the steady window has a non-positive mean pressure."
         )
 
     return KlinkenbergPoint(
-        mean_pressure_atm=float(mean_p),
-        apparent_permeability_darcy=float(mean_k),
-        label=Path(readings_path).parent.name,
+        mean_pressure_atm=mean_p,
+        apparent_permeability_darcy=mean_k,
+        label=label,
         source_path=str(readings_path),
         sample_id=sample_id,
+        steady_state=window is not None,
     )
 
 
 def collect_points(
-    targets: Sequence[str | Path], *, averaging_window_s: float | None = None
+    targets: Sequence[str | Path],
+    *,
+    averaging_window_s: float | None = None,
+    allow_unsteady: bool = False,
 ) -> list[KlinkenbergPoint]:
     """Reduce several stored runs to Klinkenberg points, in order."""
     return [
-        point_from_run(target, averaging_window_s=averaging_window_s) for target in targets
+        point_from_run(
+            target, averaging_window_s=averaging_window_s, allow_unsteady=allow_unsteady
+        )
+        for target in targets
     ]
 
 
 def write_klinkenberg_result(result, path: str | Path) -> Path:
     """Write a Klinkenberg result to YAML, including the points it used."""
-    from gasperm import units
-
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "klinkenberg": {
             "liquid_permeability_D": result.liquid_permeability_darcy,
-            "liquid_permeability_mD": units.darcy_to(
-                result.liquid_permeability_darcy, "mD"
-            ),
+            "liquid_permeability_mD": units.darcy_to(result.liquid_permeability_darcy, "mD"),
+            "expanded_uncertainty_D": result.liquid_permeability_expanded_uncertainty_darcy,
+            "coverage_factor": result.coverage_factor,
+            "coverage_probability": result.coverage_probability,
             "slippage_factor_atm": result.slippage_factor_atm,
+            "slippage_factor_standard_uncertainty_atm": (
+                result.slippage_factor_standard_uncertainty_atm
+            ),
             "slope_D_atm": result.slope,
             "intercept_D": result.intercept,
             "r_squared": result.r_squared,
             "intercept_stderr_D": result.intercept_stderr,
             "slope_stderr": result.slope_stderr,
+            "weighted": result.weighted,
             "point_count": result.point_count,
             "warnings": result.warnings,
         },
@@ -402,12 +483,14 @@ def write_klinkenberg_result(result, path: str | Path) -> Path:
             {
                 "label": point.label,
                 "sample_id": point.sample_id,
+                "steady_state": point.steady_state,
                 "mean_pressure_atm": point.mean_pressure_atm,
                 "inverse_mean_pressure_per_atm": point.inverse_mean_pressure,
                 "apparent_permeability_D": point.apparent_permeability_darcy,
                 "apparent_permeability_mD": units.darcy_to(
                     point.apparent_permeability_darcy, "mD"
                 ),
+                "standard_uncertainty_D": point.standard_uncertainty_darcy,
                 "source_path": point.source_path,
             }
             for point in result.points
