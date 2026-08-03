@@ -233,7 +233,9 @@ def build_budget(
     )
 
     # -- flow rate --------------------------------------------------------
-    flow = hardware.flowmeter
+    # The meter this run selected: its own range and specification, not the
+    # rig's other meter's.
+    flow_name, flow = hardware.resolve_flowmeter(run.flowmeter)
     flow_in_unit = units.flow_from_cm3_s(point.flow_cm3_s, flow.unit)
     flow_full_scale = abs(flow.value_max - flow.value_min)
     u_flow = flow.uncertainty.standard_uncertainty(flow_in_unit, flow_full_scale)
@@ -250,7 +252,11 @@ def build_budget(
             relative_uncertainty=flow_relative,
             sensitivity=1.0,
             dof=flow.uncertainty.dof,
-            source=flow.uncertainty.source or "flowmeter specification",
+            source=(
+                f"{flow_name}: {flow.uncertainty.source}"
+                if flow.uncertainty.source
+                else f"{flow_name} specification"
+            ),
         )
     )
 

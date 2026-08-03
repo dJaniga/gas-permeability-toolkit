@@ -172,7 +172,9 @@ class SampleProcessor:
             calibration.outlet,
             atmospheric_atm,
         )
-        self.flow = FlowChannel.from_config(config.hardware.flowmeter)
+        # The one meter this run selected; the others are never read.
+        self.flowmeter_name = config.flowmeter_name
+        self.flow = FlowChannel.from_config(config.flowmeter)
 
         geometry = config.geometry()
         self.geometry = geometry

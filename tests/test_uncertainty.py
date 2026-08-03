@@ -351,7 +351,7 @@ class TestFlowReferenceHandling:
 
     def test_an_actual_basis_meter_adds_a_reference_pressure_term(self):
         config = config_with()
-        config.hardware.flowmeter.reading_basis = "actual"
+        config.flowmeter.reading_basis = "actual"
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         reference = next(c for c in budget.components if c.symbol == "P_ref")
         assert reference.relative_sensitivity == pytest.approx(1.0)

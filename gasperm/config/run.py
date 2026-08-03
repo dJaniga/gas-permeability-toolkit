@@ -141,6 +141,11 @@ class RunConfig(_Base):
 
     # -- test conditions --------------------------------------------------
     gas: GasConfig = Field(default_factory=GasConfig)
+    #: Which meter in ``hardware.flowmeters`` this run uses. ``null`` takes the
+    #: rig's ``default_flowmeter``. This lives here, not in hardware.yaml,
+    #: because swapping to the high-range meter for a high-flow pressure step
+    #: is an experiment decision -- the bench has not changed.
+    flowmeter: str | None = None
     #: Confining/overburden pressure the plug is held at. A run-level quantity:
     #: the same plug is routinely measured at several confining pressures.
     #: Typically MPa-scale while pore pressure is kPa-scale, hence its own unit.

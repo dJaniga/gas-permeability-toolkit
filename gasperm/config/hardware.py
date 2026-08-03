@@ -105,10 +105,12 @@ class PressureCalibrationConfig(_Base):
 
 
 class FlowmeterConfig(LinearCalibration):
-    """The single active flowmeter for this run.
+    """One flowmeter wired to the rig.
 
-    Only one of ``ai2``/``ai3`` is read; the other analog input is never added
-    to the DAQ task. Which one is a config-time decision, never autodetected.
+    Several may be defined -- a low-range and a high-range meter is the usual
+    arrangement -- but exactly **one** is active per run, chosen by name in
+    ``run.yaml``. The other meters' analog inputs are never added to the DAQ
+    task. Selection stays a config-time decision, never autodetected.
 
     ``reading_basis`` documents *what thermodynamic state the reported volume
     refers to*, which is the most common source of silent error on these rigs:
@@ -125,6 +127,8 @@ class FlowmeterConfig(LinearCalibration):
     """
 
     channel: str = "ai2"
+    #: Free-text note, e.g. serial number or "0-500 sccm thermal MFM".
+    description: str = ""
     volts_min: float = 0.0
     volts_max: float = 10.0
     #: Flow at ``volts_min`` / ``volts_max``, in :attr:`unit`.
@@ -184,6 +188,26 @@ class FlowmeterConfig(LinearCalibration):
         """The meter's standard reference pressure, atm."""
         return units.to_atm(self.standard_pressure, self.standard_pressure_unit)
 
+    @property
+    def summary(self) -> str:
+        """One-line description for the console and the run metadata."""
+        detail = f" -- {self.description}" if self.description else ""
+        return f"{self.channel}, {self.flow_min:g}-{self.flow_max:g} {self.unit}{detail}"
+
+
+def _default_flowmeters() -> dict[str, FlowmeterConfig]:
+    """The two meters the documented rig has wired, on ai2 and ai3.
+
+    Both are placeholders for full scale: replace them with your meters' actual
+    ranges. Defining both here and selecting one per run is what lets a
+    Klinkenberg series switch meters between pressure steps without touching
+    the rig description.
+    """
+    return {
+        "low_range": FlowmeterConfig(channel="ai2", value_max=500.0),
+        "high_range": FlowmeterConfig(channel="ai3", value_max=5000.0),
+    }
+
 
 class TemperatureConfig(_Base):
     """Arduino temperature probe on a USB serial port.
@@ -242,7 +266,13 @@ class HardwareConfig(_Base):
     pressure_calibration: PressureCalibrationConfig = Field(
         default_factory=PressureCalibrationConfig
     )
-    flowmeter: FlowmeterConfig = Field(default_factory=FlowmeterConfig)
+    #: Every flowmeter wired to the rig, by name. One is active per run,
+    #: selected in ``run.yaml`` -- which meter suits a given pressure step is
+    #: an experiment decision, not a change to the bench.
+    flowmeters: dict[str, FlowmeterConfig] = Field(default_factory=_default_flowmeters)
+    #: Meter used when ``run.flowmeter`` is unset. May be ``null`` when exactly
+    #: one meter is defined.
+    default_flowmeter: str | None = "low_range"
     temperature: TemperatureConfig = Field(default_factory=TemperatureConfig)
     uncertainty: InstrumentUncertaintyConfig = Field(
         default_factory=InstrumentUncertaintyConfig
@@ -253,17 +283,72 @@ class HardwareConfig(_Base):
 
     @model_validator(mode="after")
     def _channels_do_not_collide(self) -> HardwareConfig:
+        if not self.flowmeters:
+            raise ValueError(
+                "hardware.flowmeters is empty; define at least one meter, e.g.\n"
+                "  flowmeters:\n    low_range:\n      channel: ai2\n      flow_max: 500.0"
+            )
+
         pressure_channels = {
             self.daq.inlet_pressure_channel,
             self.daq.outlet_pressure_channel,
         }
-        if self.flowmeter.channel in pressure_channels:
+        seen: dict[str, str] = {}
+        for name, meter in self.flowmeters.items():
+            if not name.strip():
+                raise ValueError("flowmeter names must not be blank")
+            if meter.channel in pressure_channels:
+                raise ValueError(
+                    f"flowmeters.{name}.channel {meter.channel!r} is already assigned to "
+                    "a pressure transducer; each flowmeter needs its own analog input "
+                    "(typically ai2 or ai3)"
+                )
+            if meter.channel in seen:
+                raise ValueError(
+                    f"flowmeters.{name} and flowmeters.{seen[meter.channel]} are both on "
+                    f"{meter.channel!r}; two meters cannot share one analog input"
+                )
+            seen[meter.channel] = name
+
+        if self.default_flowmeter is not None:
+            if self.default_flowmeter not in self.flowmeters:
+                raise ValueError(
+                    f"default_flowmeter {self.default_flowmeter!r} is not a defined "
+                    f"meter. Available: {', '.join(sorted(self.flowmeters))}"
+                )
+        elif len(self.flowmeters) > 1:
             raise ValueError(
-                f"flowmeter.channel {self.flowmeter.channel!r} is already assigned to a "
-                "pressure transducer; the flowmeter needs its own analog input "
-                "(typically ai2 or ai3)"
+                "default_flowmeter is null but several meters are defined "
+                f"({', '.join(sorted(self.flowmeters))}); name the one to use when a run "
+                "does not choose"
             )
         return self
+
+    def resolve_flowmeter(self, name: str | None) -> tuple[str, FlowmeterConfig]:
+        """The named meter, or the rig default when ``name`` is ``None``.
+
+        Returns:
+            ``(name, meter)``.
+
+        Raises:
+            ValueError: the name is not a defined meter -- with the available
+                names, because a typo here silently changes the calibration
+                that every flow reading passes through.
+        """
+        if name is None:
+            if self.default_flowmeter is not None:
+                name = self.default_flowmeter
+            elif len(self.flowmeters) == 1:
+                name = next(iter(self.flowmeters))
+            else:  # pragma: no cover - the model validator rules this out
+                raise ValueError("no flowmeter selected and no default configured")
+        try:
+            return name, self.flowmeters[name]
+        except KeyError:
+            raise ValueError(
+                f"run.flowmeter {name!r} is not defined in hardware.yaml. Available "
+                f"meters: {', '.join(sorted(self.flowmeters))}"
+            ) from None
 
     def daq_channel_path(self, channel: str) -> str:
         """Fully-qualified NI channel name, e.g. ``Dev1/ai0``."""

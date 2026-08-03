@@ -343,6 +343,12 @@ class ExperimentMetadata(BaseModel):
     confining_pressure: float | None = None
     confining_pressure_unit: str = "MPa"
 
+    #: Which flowmeter was active. Runs on the same plug routinely differ only
+    #: in this, so it has to be on the record.
+    flowmeter: str = ""
+    flowmeter_channel: str = ""
+    flowmeter_range: str = ""
+
 
 class RunSummary(BaseModel):
     """Aggregate result of a completed ``collect`` run.

@@ -30,6 +30,18 @@ def synthetic_points(pressures_atm=(1.0, 2.0, 4.0, 8.0), *, k_l=TRUE_K_L, b=TRUE
     ]
 
 
+def _mixed_sample_points():
+    """Three points where the middle one came from a different core plug."""
+    points = list(synthetic_points((1.0, 2.0, 4.0)))
+    points[1] = KlinkenbergPoint(
+        mean_pressure_atm=points[1].mean_pressure_atm,
+        apparent_permeability_darcy=points[1].apparent_permeability_darcy,
+        label="run-b",
+        sample_id="core-002",
+    )
+    return points
+
+
 class TestExactRecovery:
     def test_recovers_k_l_and_b_from_noise_free_points(self):
         result = fit_klinkenberg(synthetic_points())
@@ -88,15 +100,19 @@ class TestWarnings:
         assert result.r_squared < POOR_FIT_R_SQUARED
         assert any("Poor linear fit" in w for w in result.warnings)
 
-    def test_mixed_samples_are_flagged(self):
-        points = synthetic_points((1.0, 2.0, 4.0))
-        mixed = list(points)
-        mixed[1] = KlinkenbergPoint(
-            mean_pressure_atm=mixed[1].mean_pressure_atm,
-            apparent_permeability_darcy=mixed[1].apparent_permeability_darcy,
-            sample_id="core-002",
-        )
-        result = fit_klinkenberg(mixed)
+    def test_mixed_samples_are_refused(self):
+        """On a rig running many plugs, mixing runs is an easy silent mistake."""
+        mixed = _mixed_sample_points()
+        with pytest.raises(ValueError, match="only valid within a single sample"):
+            fit_klinkenberg(mixed)
+
+    def test_the_refusal_names_the_offending_runs(self):
+        with pytest.raises(ValueError) as info:
+            fit_klinkenberg(_mixed_sample_points())
+        assert "core-001" in str(info.value) and "core-002" in str(info.value)
+
+    def test_mixing_can_be_forced_and_is_then_warned_about(self):
+        result = fit_klinkenberg(_mixed_sample_points(), allow_mixed_samples=True)
         assert any("more than one sample id" in w for w in result.warnings)
 
     def test_negative_intercept_is_flagged(self):
@@ -230,7 +246,26 @@ class TestWeighting:
         points = self._weighted_points([0.001, None, 0.001, 0.001])
         result = fit_klinkenberg(points)
         assert result.weighted is False
-        assert any("unweighted" in w for w in result.warnings)
+        assert any("Not every point carried" in w for w in result.warnings)
+
+    def test_the_warning_names_the_points_that_lacked_one(self):
+        points = self._weighted_points([0.001, None, 0.001, 0.001])
+        warning = next(w for w in fit_klinkenberg(points).warnings if "Not every" in w)
+        assert points[1].label in warning
+
+    def test_two_fully_specified_points_do_not_claim_a_missing_uncertainty(self):
+        """Two points cannot be weighted, but that is not the same as missing data."""
+        points = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy,
+                standard_uncertainty_darcy=0.001,
+            )
+            for p in synthetic_points((1.0, 4.0))
+        ]
+        result = fit_klinkenberg(points)
+        assert result.weighted is False
+        assert not any("Not every point carried" in w for w in result.warnings)
 
 
 class TestSteadyStateAwareness:

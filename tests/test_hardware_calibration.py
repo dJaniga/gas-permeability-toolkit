@@ -189,12 +189,33 @@ class TestDaqTask:
         open_analog_input(base_config).close()
         assert len(fake_nidaqmx.instances[-1].ai_channels.added) == 3
 
-    def test_the_unused_flow_channel_is_never_touched(self, fake_nidaqmx, base_config):
-        base_config.flowmeter.channel = "ai3"
+    def test_only_the_selected_meter_reaches_the_daq(self, fake_nidaqmx, base_config):
+        """Both meters are wired; the run selects one and the other is untouched."""
+        base_config.run.flowmeter = "high_range"
         open_analog_input(base_config).close()
         names = fake_nidaqmx.instances[-1].channel_names
-        assert "ai3" in names
-        assert "ai2" not in names
+        assert "ai3" in names  # high_range
+        assert "ai2" not in names  # low_range, wired but not selected
+
+    def test_the_default_meter_is_used_when_the_run_does_not_choose(
+        self, fake_nidaqmx, base_config
+    ):
+        assert base_config.run.flowmeter is None
+        open_analog_input(base_config).close()
+        names = fake_nidaqmx.instances[-1].channel_names
+        assert "ai2" in names and "ai3" not in names
+
+    def test_the_selected_meter_sets_the_channel_voltage_range(
+        self, fake_nidaqmx, base_config
+    ):
+        base_config.hardware.flowmeters["high_range"].volts_max = 5.0
+        base_config.run.flowmeter = "high_range"
+        open_analog_input(base_config).close()
+        added = {
+            entry["physical_channel"]: entry
+            for entry in fake_nidaqmx.instances[-1].ai_channels.added
+        }
+        assert (added["Dev1/ai3"]["min_val"], added["Dev1/ai3"]["max_val"]) == (0.0, 5.0)
 
     def test_device_name_prefixes_every_channel(self, fake_nidaqmx, base_config):
         base_config.daq.device_name = "cDAQ1Mod2"

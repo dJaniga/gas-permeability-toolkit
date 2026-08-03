@@ -192,7 +192,8 @@ class TestMetadata:
         data = yaml.safe_load(writer.metadata_path.read_text(encoding="utf-8"))
 
         assert data["config"]["sample"]["id"] == run_config.sample.id
-        assert data["config"]["hardware"]["flowmeter"]["channel"] == "ai2"
+        assert data["config"]["hardware"]["flowmeters"]["low_range"]["channel"] == "ai2"
+        assert data["metadata"]["flowmeter"] == "low_range"
         assert data["metadata"]["operator"] == "Damian"
         assert data["metadata"]["lithology"] == "sandstone"
         assert data["summary"]["permeability_darcy"] > 0.0

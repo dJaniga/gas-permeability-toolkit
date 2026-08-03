@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, model_validator
 
 from gasperm import units
 from gasperm.config._yamldoc import render as _render_yaml
@@ -108,6 +108,12 @@ class GaspermConfig(_Base):
     sample: SampleConfig = Field(default_factory=SampleConfig)
     run: RunConfig = Field(default_factory=RunConfig)
 
+    @model_validator(mode="after")
+    def _selected_flowmeter_exists(self) -> GaspermConfig:
+        """Catch a bad meter name at load, not three minutes into a run."""
+        self.hardware.resolve_flowmeter(self.run.flowmeter)
+        return self
+
     # -- convenience accessors used across the package --------------------
 
     def geometry(self) -> SampleGeometry:
@@ -121,8 +127,13 @@ class GaspermConfig(_Base):
 
     @property
     def flowmeter(self) -> FlowmeterConfig:
-        """Shorthand for ``config.hardware.flowmeter``."""
-        return self.hardware.flowmeter
+        """The meter active for this run, resolved from ``run.flowmeter``."""
+        return self.hardware.resolve_flowmeter(self.run.flowmeter)[1]
+
+    @property
+    def flowmeter_name(self) -> str:
+        """Name of the active meter, for the console and the run metadata."""
+        return self.hardware.resolve_flowmeter(self.run.flowmeter)[0]
 
     @property
     def pressure_calibration(self) -> PressureCalibrationConfig:
@@ -199,10 +210,13 @@ def _read_mapping(path: Path, what: str) -> dict[str, Any]:
 
 
 def _reject_legacy(raw: Mapping[str, Any], path: Path) -> None:
-    """Refuse a pre-split single-file config, pointing at the replacement."""
+    """Refuse an outdated hardware file, pointing at the replacement."""
     keys = set(raw)
     if "hardware" in keys:
         return
+
+    # Most serious first: a whole pre-split config is a bigger problem than a
+    # hardware file that only needs its flowmeter section renamed.
     overlap = _LEGACY_OTHER_KEYS & keys
     if _LEGACY_RIG_KEYS & keys and overlap:
         raise ConfigError(
@@ -212,6 +226,19 @@ def _reject_legacy(raw: Mapping[str, Any], path: Path) -> None:
             f"files -- {HARDWARE_FILENAME} (the rig), {SAMPLE_FILENAME} (the core plug) "
             f"and {RUN_FILENAME} (the experiment). Run 'gasperm init' to generate them, "
             "then copy your calibration numbers across."
+        )
+
+    if "flowmeter" in keys and "flowmeters" not in keys:
+        raise ConfigError(
+            f"{path} has a single 'flowmeter:' section. A rig can have more than one "
+            "meter wired, so they are now named under 'flowmeters:' and each run picks "
+            "one by name. Rename the section, e.g.\n"
+            "  flowmeters:\n"
+            "    low_range:\n"
+            "      channel: ai2\n"
+            "      ...\n"
+            "  default_flowmeter: low_range\n"
+            "then set 'flowmeter: <name>' in run.yaml (or leave it null for the default)."
         )
 
 
@@ -272,13 +299,20 @@ def load_config(
     sample_raw = _read_mapping(paths.sample, "Sample")
     run_raw = _read_mapping(paths.run, "Run")
 
-    return GaspermConfig(
-        hardware=_validate_section(
-            HardwareConfig, _unwrap(hardware_raw, "hardware"), paths.hardware
-        ),
-        sample=_validate_section(SampleConfig, _unwrap(sample_raw, "sample"), paths.sample),
-        run=_validate_section(RunConfig, _unwrap(run_raw, "run"), paths.run),
+    hardware = _validate_section(
+        HardwareConfig, _unwrap(hardware_raw, "hardware"), paths.hardware
     )
+    sample = _validate_section(SampleConfig, _unwrap(sample_raw, "sample"), paths.sample)
+    run = _validate_section(RunConfig, _unwrap(run_raw, "run"), paths.run)
+
+    try:
+        return GaspermConfig(hardware=hardware, sample=sample, run=run)
+    except ValidationError as exc:
+        # Cross-file checks -- a run naming a meter the rig does not define, for
+        # instance. Neither file is wrong on its own, so name both.
+        raise ConfigError(
+            _format_validation_error(exc, f"{paths.run} together with {paths.hardware}")
+        ) from exc
 
 
 def config_to_dict(config: GaspermConfig) -> dict[str, Any]:
@@ -290,7 +324,11 @@ def experiment_metadata(config: GaspermConfig) -> ExperimentMetadata:
     """Flatten the metadata every run should be traceable by."""
     sample = config.sample
     run = config.run
+    meter_name, meter = config.hardware.resolve_flowmeter(run.flowmeter)
     return ExperimentMetadata(
+        flowmeter=meter_name,
+        flowmeter_channel=meter.channel,
+        flowmeter_range=f"{meter.flow_min:g}-{meter.flow_max:g} {meter.unit}",
         operator=run.operator,
         institution=run.institution,
         project=run.project,
@@ -353,15 +391,11 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
             "P1 and P2 enter the Darcy equation with opposite signs, so a positive\n"
             "correlation REDUCES the combined uncertainty."
         ),
-        "flowmeter": (
-            "Exactly ONE flowmeter is active per run. The other analog input is\n"
-            "never added to the DAQ task."
-        ),
-        "flowmeter.reading_basis": (
-            "What state the reported volume refers to -- the single most common\n"
-            "source of a silently wrong permeability on this kind of rig.\n"
-            "  standard -> mass-based meter, referenced to the standard state below\n"
-            "  actual   -> volume at line conditions, paired with actual_pressure_source"
+        "flowmeters": (
+            "Every meter wired to the rig, by name. A run selects ONE by name in\n"
+            "run.yaml; the others' analog inputs are never added to the DAQ task.\n"
+            "Define them once here -- swapping meters between pressure steps is an\n"
+            "experiment decision, not a change to the bench."
         ),
         "temperature": (
             "Separate device from the DAQ; a dropout degrades the run, never aborts it."
@@ -384,11 +418,7 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         ),
         "pressure_calibration.outlet.unit": "independent of inlet: may be 'bar' here",
         "pressure_calibration.outlet.reading_type": "gauge adds run.atmospheric_pressure",
-        "flowmeter.channel": "ai2 or ai3",
-        "flowmeter.volts_max": "0-10 V, unlike the pressure channels",
-        "flowmeter.flow_max": "full-scale flow, for THIS meter's range",
-        "flowmeter.actual_pressure_source": "only used when reading_basis == actual",
-        "flowmeter.uncertainty.kind": "flowmeters are usually spec'd % of reading",
+        "default_flowmeter": "used when run.yaml leaves 'flowmeter' null",
         "temperature.parse_pattern": "'{value}' marks the number; null = first float",
         "temperature.units": "C | K | F",
         "temperature.required": "refuse to start collect if the port will not open",
@@ -396,6 +426,29 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         "uncertainty.daq_relative": "relative, dimensionless",
         "uncertainty.repeatability_relative": "bench repeatability not otherwise captured",
     }
+
+    # Per-meter comments, keyed by whatever the meters are actually called.
+    for name in config.hardware.flowmeters:
+        comments.update(
+            {
+                f"flowmeters.{name}.channel": "its own analog input (ai2, ai3, ...)",
+                f"flowmeters.{name}.volts_max": "0-10 V, unlike the pressure channels",
+                f"flowmeters.{name}.flow_max": "full-scale flow, for THIS meter",
+                f"flowmeters.{name}.reading_basis": "standard | actual -- see below",
+                f"flowmeters.{name}.actual_pressure_source": (
+                    "only used when reading_basis == actual"
+                ),
+                f"flowmeters.{name}.uncertainty.kind": (
+                    "flowmeters are usually spec'd % of reading"
+                ),
+            }
+        )
+        notes[f"flowmeters.{name}.reading_basis"] = (
+            "What state this meter's reported volume refers to -- the single most\n"
+            "common source of a silently wrong permeability on this kind of rig.\n"
+            "  standard -> mass-based meter, referenced to the standard state below\n"
+            "  actual   -> volume at line conditions, paired with actual_pressure_source"
+        )
     return _render_yaml(data, header=header, notes=notes, comments=comments)
 
 
@@ -441,9 +494,16 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "\n"
         f"Supported pressure units: {_SUPPORTED_PRESSURE}"
     )
+    available = ", ".join(sorted(config.hardware.flowmeters))
     notes = {
         "operator": "Who ran it. Copied into every run's metadata for traceability.",
         "gas": "Working gas and where its properties come from.",
+        "flowmeter": (
+            "Which meter from hardware.yaml this run uses. Defined meters:\n"
+            f"  {available}\n"
+            "null takes hardware.default_flowmeter. Only this meter's analog input\n"
+            "is read; the others are never added to the DAQ task."
+        ),
         "confining_pressure": (
             "Confining/overburden pressure for this run. Usually MPa-scale while\n"
             "pore pressure is kPa-scale, hence its own independent unit."
@@ -473,6 +533,7 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "duration_s": "Stop conditions.",
     }
     comments = {
+        "flowmeter": f"one of: {available} (null = rig default)",
         "gas.name": "any CoolProp fluid: Air, CarbonDioxide, Methane, ...",
         "gas.properties_source": "coolprop (recommended) | fixed",
         "gas.fixed_viscosity_cp": "only when properties_source == fixed",
@@ -589,6 +650,10 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
             "check pressure_calibration.inlet.unit."
         )
 
+    # The active meter, for the checks below. Which one is in use is reported
+    # prominently by ``collect`` itself, so it needs no warning here.
+    _, meter = config.hardware.resolve_flowmeter(config.run.flowmeter)
+
     # -- analysis settings ------------------------------------------------
     if not config.run.steady_state.enabled:
         warnings.append(
@@ -611,7 +676,7 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
         specs = [
             config.hardware.pressure_calibration.inlet.uncertainty,
             config.hardware.pressure_calibration.outlet.uncertainty,
-            config.hardware.flowmeter.uncertainty,
+            meter.uncertainty,
         ]
         if all(spec.kind == "none" or spec.value == 0.0 for spec in specs):
             warnings.append(

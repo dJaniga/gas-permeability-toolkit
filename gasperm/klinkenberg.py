@@ -108,6 +108,7 @@ def fit_klinkenberg(
     points: Sequence[KlinkenbergPoint],
     *,
     coverage_probability: float = 0.95,
+    allow_mixed_samples: bool = False,
 ) -> KlinkenbergResult:
     """Regress ``k_g`` against ``1 / P_mean`` and recover ``k_L`` and ``b``.
 
@@ -124,13 +125,18 @@ def fit_klinkenberg(
             for the **same** sample, at different mean pressures.
         coverage_probability: Level of confidence for the expanded uncertainty
             on ``k_L``.
+        allow_mixed_samples: Permit points from more than one sample id. Off by
+            default: the correction is only meaningful within a single plug, and
+            on a rig running many plugs, mixing runs is an easy and
+            silent-looking mistake.
 
     Returns:
         The fit, including R^2, uncertainties, and any warnings worth showing.
 
     Raises:
         ValueError: fewer than two points, duplicate mean pressures (no spread
-            to regress over), or non-finite values.
+            to regress over), non-finite values, or points from different
+            samples without ``allow_mixed_samples``.
     """
     if len(points) < MIN_POINTS:
         raise ValueError(
@@ -139,6 +145,17 @@ def fit_klinkenberg(
         )
 
     sample_ids = {p.sample_id for p in points if p.sample_id}
+    if len(sample_ids) > 1 and not allow_mixed_samples:
+        listing = ", ".join(
+            f"{p.label or 'unlabelled'} -> {p.sample_id}" for p in points if p.sample_id
+        )
+        raise ValueError(
+            "The Klinkenberg correction is only valid within a single sample, but these "
+            f"points come from {len(sample_ids)} different ones ({listing}). Select the "
+            "runs for one plug, or pass --allow-mixed-samples if you genuinely mean to "
+            "regress across them."
+        )
+
     inverse_pressure = np.array([p.inverse_mean_pressure for p in points], dtype=float)
     apparent_k = np.array([p.apparent_permeability_darcy for p in points], dtype=float)
 
@@ -154,7 +171,10 @@ def fit_klinkenberg(
         )
 
     uncertainties = [p.standard_uncertainty_darcy for p in points]
-    weighted = all(u is not None and u > 0.0 for u in uncertainties) and len(points) > 2
+    have_uncertainty = [u is not None and u > 0.0 for u in uncertainties]
+    # Two points leave no residual degrees of freedom, so weighting them buys
+    # nothing; the fit passes through both regardless.
+    weighted = all(have_uncertainty) and len(points) > 2
 
     warnings: list[str] = []
     covariance = 0.0
@@ -179,11 +199,18 @@ def fit_klinkenberg(
             s_xx = float(np.sum(np.square(inverse_pressure - mean_x)))
             # cov(a, b) = -mean_x * var(b) for an unweighted straight-line fit.
             covariance = -mean_x * u_slope**2 if s_xx > 0 else 0.0
-        if any(u is not None for u in uncertainties) and not weighted:
+        if any(have_uncertainty) and not all(have_uncertainty):
+            missing = [
+                p.label or "unlabelled"
+                for p, has in zip(points, have_uncertainty)
+                if not has
+            ]
             warnings.append(
-                "Not every point carried a standard uncertainty, so the fit is "
-                "unweighted. Runs at a small pressure differential therefore carry the "
-                "same influence on k_L as well-determined ones."
+                "Not every point carried a standard uncertainty ("
+                + ", ".join(missing)
+                + " did not), so the fit is unweighted. Runs at a small pressure "
+                "differential therefore carry the same influence on k_L as "
+                "well-determined ones."
             )
 
     unsteady = [p for p in points if not p.steady_state]
@@ -225,7 +252,8 @@ def fit_klinkenberg(
         warnings.append(
             "Points come from more than one sample id ("
             + ", ".join(sorted(sample_ids))
-            + "). The Klinkenberg correction is only valid within a single sample."
+            + "), which was explicitly allowed. The Klinkenberg correction is only "
+            "valid within a single sample, so k_L here is not a property of any one plug."
         )
 
     # b = slope / intercept. Guard the division rather than emitting inf.

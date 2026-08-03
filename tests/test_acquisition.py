@@ -242,7 +242,8 @@ class TestUnitInvariance:
                         "inlet": {"volts_max": 5.0, "value_max": 1000.0, "unit": "kPa"},
                         "outlet": {"volts_max": 5.0, "value_max": 1000.0, "unit": "kPa"},
                     },
-                    "flowmeter": {"flow_max": 500.0, "unit": "sccm"},
+                    "flowmeters": {"m": {"flow_max": 500.0, "unit": "sccm"}},
+                    "default_flowmeter": "m",
                 },
                 "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
                 "run": {
@@ -269,7 +270,8 @@ class TestUnitInvariance:
                             "unit": "psi",
                         },
                     },
-                    "flowmeter": {"flow_max": 0.5, "unit": "slpm"},
+                    "flowmeters": {"m": {"flow_max": 0.5, "unit": "slpm"}},
+                    "default_flowmeter": "m",
                 },
                 "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
                 "run": {

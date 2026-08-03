@@ -40,7 +40,8 @@ class TestDefaults:
         assert base_config.hardware.daq.device_name == "Dev1"
         assert base_config.hardware.daq.inlet_pressure_channel == "ai0"
         assert base_config.hardware.daq.outlet_pressure_channel == "ai1"
-        assert base_config.hardware.flowmeter.channel == "ai2"
+        assert base_config.hardware.flowmeters["low_range"].channel == "ai2"
+        assert base_config.hardware.flowmeters["high_range"].channel == "ai3"
         assert base_config.hardware.temperature.port == "COM4"
         assert base_config.run.gas.name == "Nitrogen"
 
@@ -50,7 +51,7 @@ class TestDefaults:
             assert (channel.volts_min, channel.volts_max) == (0.0, 5.0)
 
     def test_flow_channel_defaults_to_0_to_10_volts(self, base_config: GaspermConfig):
-        flow = base_config.hardware.flowmeter
+        flow = base_config.hardware.flowmeters["low_range"]
         assert (flow.volts_min, flow.volts_max) == (0.0, 10.0)
 
     def test_steady_state_and_uncertainty_are_on_by_default(self, base_config):
@@ -63,7 +64,7 @@ class TestSplitConcerns:
 
     def test_the_rig_lives_in_hardware(self):
         fields = set(HardwareConfig.model_fields)
-        assert {"daq", "pressure_calibration", "flowmeter", "temperature"} <= fields
+        assert {"daq", "pressure_calibration", "flowmeters", "temperature"} <= fields
         assert "gas" not in fields and "confining_pressure" not in fields
 
     def test_the_plug_lives_in_sample_without_test_conditions(self):
@@ -81,7 +82,9 @@ class TestSplitConcerns:
 
     def test_shorthand_accessors_reach_through(self, base_config):
         assert base_config.daq is base_config.hardware.daq
-        assert base_config.flowmeter is base_config.hardware.flowmeter
+        assert base_config.flowmeter is base_config.hardware.flowmeters[
+            base_config.hardware.default_flowmeter
+        ]
         assert base_config.gas is base_config.run.gas
         assert base_config.temperature is base_config.hardware.temperature
 
@@ -118,7 +121,10 @@ class TestValidation:
 
     def test_flowmeter_cannot_share_a_pressure_channel(self):
         with pytest.raises(ValueError, match="already assigned"):
-            HardwareConfig(flowmeter=FlowmeterConfig(channel="ai0"))
+            HardwareConfig(
+                flowmeters={"m": FlowmeterConfig(channel="ai0")},
+                default_flowmeter="m",
+            )
 
     def test_unknown_fields_are_rejected(self):
         with pytest.raises(ValueError):
@@ -139,6 +145,103 @@ class TestValidation:
     def test_fixed_gas_source_needs_a_viscosity(self):
         with pytest.raises(ValueError, match="fixed_viscosity_cp"):
             GasConfig(properties_source="fixed")
+
+
+class TestFlowmeterSelection:
+    """Several meters are wired once; each run picks one by name."""
+
+    def test_the_rig_ships_with_both_documented_meters(self, base_config):
+        assert set(base_config.hardware.flowmeters) == {"low_range", "high_range"}
+
+    def test_selecting_a_meter_is_a_run_decision_not_a_rig_change(self):
+        fields = set(RunConfig.model_fields)
+        assert "flowmeter" in fields
+        # The meter definitions stay in hardware.yaml; only the choice moves.
+        assert "flowmeters" not in fields
+
+    def test_the_run_selects_which_meter_is_active(self, base_config):
+        assert base_config.flowmeter_name == "low_range"
+        base_config.run.flowmeter = "high_range"
+        assert base_config.flowmeter_name == "high_range"
+        assert base_config.flowmeter.channel == "ai3"
+
+    def test_an_unset_selection_falls_back_to_the_rig_default(self, base_config):
+        base_config.hardware.default_flowmeter = "high_range"
+        assert base_config.run.flowmeter is None
+        assert base_config.flowmeter_name == "high_range"
+
+    def test_a_single_meter_needs_no_default(self):
+        config = GaspermConfig(
+            hardware={
+                "flowmeters": {"only": {"channel": "ai2"}},
+                "default_flowmeter": None,
+            }
+        )
+        assert config.flowmeter_name == "only"
+
+    def test_an_unknown_meter_name_is_rejected_with_the_available_ones(self):
+        with pytest.raises(ValueError, match="high_range, low_range"):
+            GaspermConfig(run={"flowmeter": "middle_range"})
+
+    def test_resolution_names_the_available_meters(self, base_config):
+        with pytest.raises(ValueError, match="high_range, low_range"):
+            base_config.hardware.resolve_flowmeter("middle_range")
+
+    def test_an_unknown_name_is_caught_at_load(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        data = base_config.run.model_dump(mode="json")
+        data["flowmeter"] = "nonexistent"
+        (tmp_path / RUN_FILENAME).write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(ConfigError, match="nonexistent"):
+            load_config(tmp_path)
+
+    def test_two_meters_cannot_share_an_analog_input(self):
+        with pytest.raises(ValueError, match="cannot share one analog input"):
+            HardwareConfig(
+                flowmeters={
+                    "a": FlowmeterConfig(channel="ai2"),
+                    "b": FlowmeterConfig(channel="ai2"),
+                },
+                default_flowmeter="a",
+            )
+
+    def test_an_empty_meter_set_is_rejected(self):
+        with pytest.raises(ValueError, match="define at least one meter"):
+            HardwareConfig(flowmeters={}, default_flowmeter=None)
+
+    def test_a_bad_default_is_rejected(self):
+        with pytest.raises(ValueError, match="not a defined meter"):
+            HardwareConfig(default_flowmeter="middle_range")
+
+    def test_several_meters_need_a_named_default(self):
+        with pytest.raises(ValueError, match="name the one to use"):
+            HardwareConfig(default_flowmeter=None)
+
+    def test_each_meter_keeps_its_own_range_and_specification(self, base_config):
+        base_config.hardware.flowmeters["low_range"].value_max = 100.0
+        base_config.hardware.flowmeters["high_range"].value_max = 5000.0
+        assert base_config.flowmeter.flow_max == 100.0
+        base_config.run.flowmeter = "high_range"
+        assert base_config.flowmeter.flow_max == 5000.0
+
+    def test_the_active_meter_is_recorded_in_the_metadata(self, base_config):
+        base_config.run.flowmeter = "high_range"
+        metadata = experiment_metadata(base_config)
+        assert metadata.flowmeter == "high_range"
+        assert metadata.flowmeter_channel == "ai3"
+        assert "sccm" in metadata.flowmeter_range
+
+    def test_a_legacy_singular_flowmeter_section_is_rejected(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        data = base_config.hardware.model_dump(mode="json", by_alias=True)
+        data["flowmeter"] = data.pop("flowmeters")["low_range"]
+        (tmp_path / HARDWARE_FILENAME).write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(ConfigError, match="single 'flowmeter:' section"):
+            load_config(tmp_path)
+
+    def test_the_run_template_lists_the_available_meters(self, base_config):
+        run_yaml = render_run_yaml(base_config)
+        assert "low_range" in run_yaml and "high_range" in run_yaml
 
 
 class TestSampleMetadata:
@@ -209,10 +312,13 @@ class TestIndependentUnits:
         config = GaspermConfig(
             hardware={
                 "pressure_calibration": {"inlet": {"unit": unit}, "outlet": {"unit": unit}},
-                "flowmeter": {
-                    "standard_pressure": units.from_atm(1.0, unit),
-                    "standard_pressure_unit": unit,
+                "flowmeters": {
+                    "m": {
+                        "standard_pressure": units.from_atm(1.0, unit),
+                        "standard_pressure_unit": unit,
+                    }
                 },
+                "default_flowmeter": "m",
             },
             run={
                 "confining_pressure": 1.0,
@@ -223,7 +329,7 @@ class TestIndependentUnits:
             },
         )
         assert config.run.atmospheric_pressure_atm == pytest.approx(1.0, rel=1e-12)
-        assert config.hardware.flowmeter.standard_pressure_atm == pytest.approx(1.0, rel=1e-12)
+        assert config.flowmeter.standard_pressure_atm == pytest.approx(1.0, rel=1e-12)
 
 
 class TestLinearCalibration:
@@ -293,7 +399,7 @@ class TestThreeFileIo:
     def test_templates_carry_explanatory_comments(self, base_config):
         hardware = render_hardware_yaml(base_config)
         assert "NI-DAQmx device name" in hardware
-        assert "ai2 or ai3" in hardware
+        assert "selects ONE by name" in hardware
         assert "CGS-Darcy" in hardware
         sample = render_sample_yaml(base_config)
         assert "counts double" in sample
@@ -365,7 +471,7 @@ class TestThreeFileIo:
         examples = Path(__file__).resolve().parents[1] / "examples"
         if not (examples / HARDWARE_FILENAME).is_file():  # pragma: no cover
             pytest.skip("examples/ not present")
-        assert load_config(examples).hardware.flowmeter.channel == "ai2"
+        assert load_config(examples).flowmeter.channel == "ai2"
 
     def test_config_paths_in_directory(self, tmp_path):
         paths = ConfigPaths.in_directory(tmp_path)
@@ -454,5 +560,5 @@ class TestValidateForCollect:
         none_spec = UncertaintySpec(kind="none")
         base_config.hardware.pressure_calibration.inlet.uncertainty = none_spec
         base_config.hardware.pressure_calibration.outlet.uncertainty = none_spec
-        base_config.hardware.flowmeter.uncertainty = none_spec
+        base_config.flowmeter.uncertainty = none_spec
         assert any("understate the real uncertainty" in w for w in validate_for_collect(base_config))

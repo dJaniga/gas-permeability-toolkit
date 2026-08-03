@@ -174,25 +174,54 @@ def _prompt_hardware(data: dict[str, Any], defaults: GaspermConfig) -> None:
         default=hardware["pressure_calibration"]["correlation"], type=float,
     )
 
-    typer.secho("  Flowmeter  (one meter per run: ai2 or ai3)", bold=True)
-    flow = hardware["flowmeter"]
-    flow["channel"] = typer.prompt("    Channel", default=flow["channel"])
-    flow["volts_min"] = typer.prompt("    Volts at zero flow", default=flow["volts_min"], type=float)
-    flow["volts_max"] = typer.prompt("    Volts at full scale", default=flow["volts_max"], type=float)
-    flow["unit"] = typer.prompt("    Flow unit", default=flow["unit"])
-    flow["flow_min"] = typer.prompt(
-        f"    Flow at {flow['volts_min']} V ({flow['unit']})", default=flow["flow_min"], type=float
-    )
-    flow["flow_max"] = typer.prompt(
-        f"    Full-scale flow at {flow['volts_max']} V ({flow['unit']})",
-        default=flow["flow_max"], type=float,
-    )
-    flow["reading_basis"] = typer.prompt(
-        "    Reading basis (standard = mass-based meter / actual = at line conditions)",
-        default=flow["reading_basis"],
-    )
-    flow["uncertainty"]["value"] = typer.prompt(
-        "    Accuracy (% of reading)", default=flow["uncertainty"]["value"], type=float
+    typer.secho("  Flowmeters  (define every meter wired; a run picks one)", bold=True)
+    meters: dict[str, Any] = {}
+    for name, flow in list(hardware["flowmeters"].items()):
+        if not typer.confirm(f"    Is a '{name}' meter wired?", default=True):
+            continue
+        new_name = typer.prompt("      Name", default=name).strip() or name
+        flow["channel"] = typer.prompt("      Channel", default=flow["channel"])
+        flow["description"] = typer.prompt(
+            "      Description (serial, make)", default="", show_default=False
+        )
+        flow["volts_min"] = typer.prompt(
+            "      Volts at zero flow", default=flow["volts_min"], type=float
+        )
+        flow["volts_max"] = typer.prompt(
+            "      Volts at full scale", default=flow["volts_max"], type=float
+        )
+        flow["unit"] = typer.prompt("      Flow unit", default=flow["unit"])
+        flow["flow_min"] = typer.prompt(
+            f"      Flow at {flow['volts_min']} V ({flow['unit']})",
+            default=flow["flow_min"], type=float,
+        )
+        flow["flow_max"] = typer.prompt(
+            f"      Full-scale flow at {flow['volts_max']} V ({flow['unit']})",
+            default=flow["flow_max"], type=float,
+        )
+        flow["reading_basis"] = typer.prompt(
+            "      Reading basis (standard = mass-based / actual = at line conditions)",
+            default=flow["reading_basis"],
+        )
+        flow["uncertainty"]["value"] = typer.prompt(
+            "      Accuracy (% of reading)", default=flow["uncertainty"]["value"], type=float
+        )
+        meters[new_name] = flow
+
+    if not meters:
+        typer.secho(
+            "    No meter defined; keeping the first default so the config stays valid.",
+            fg=typer.colors.YELLOW,
+        )
+        first = next(iter(hardware["flowmeters"]))
+        meters = {first: hardware["flowmeters"][first]}
+    hardware["flowmeters"] = meters
+    hardware["default_flowmeter"] = (
+        next(iter(meters))
+        if len(meters) == 1
+        else typer.prompt(
+            f"    Default meter ({', '.join(meters)})", default=next(iter(meters))
+        )
     )
 
     typer.secho("  Temperature probe (Arduino, USB serial)", bold=True)
@@ -261,6 +290,12 @@ def _prompt_sample(data: dict[str, Any]) -> None:
 def _prompt_run(data: dict[str, Any]) -> None:
     typer.secho("\n== run.yaml : the experiment ==", fg=typer.colors.CYAN, bold=True)
     run = data["run"]
+    meters = list(data["hardware"]["flowmeters"])
+    if len(meters) > 1:
+        run["flowmeter"] = typer.prompt(
+            f"  Flowmeter for this run ({', '.join(meters)})",
+            default=data["hardware"]["default_flowmeter"],
+        )
     run["operator"] = typer.prompt("  Operator", default="", show_default=False)
     run["institution"] = typer.prompt("  Institution", default="", show_default=False)
     run["project"] = typer.prompt("  Project", default="", show_default=False)
@@ -415,6 +450,95 @@ def init_command(
         typer.echo(f"\nNext: gasperm collect{location}")
 
 
+@app.command("new-sample")
+def new_sample_command(
+    sample_id: str = typer.Argument(..., help="Id of the new core plug, e.g. core-042."),
+    directory: Path = typer.Option(
+        Path("samples"), "--dir", "-d", help="Where to write the sample file."
+    ),
+    template: Optional[Path] = typer.Option(
+        None, "--from",
+        help="Copy defaults from an existing sample file (same core, new plug).",
+    ),
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", "-n", help="Skip the prompts. Combine with --set."
+    ),
+    set_values: list[str] = typer.Option(
+        [], "--set", metavar="FIELD=VALUE",
+        help="Override a sample field, e.g. --set length_cm=4.2. Repeatable.",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing file."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Add another core plug without touching the rig or run configuration.
+
+    Writes ``<dir>/<sample_id>.yaml``, which ``collect --sample`` then points
+    at. Measuring many plugs on one rig means one hardware.yaml, one run.yaml
+    and a file per plug -- not a full ``init`` each time.
+    """
+    import yaml as _yaml
+
+    from gasperm.config.sample import SampleConfig
+
+    _configure_logging(verbose)
+
+    if template is not None:
+        try:
+            raw = _yaml.safe_load(Path(template).read_text(encoding="utf-8"))
+        except (OSError, _yaml.YAMLError) as exc:
+            _fail(f"Could not read the template {template}: {exc}")
+            return
+        if isinstance(raw, dict) and set(raw) == {"sample"}:
+            raw = raw["sample"]
+        try:
+            sample = SampleConfig.model_validate(raw)
+        except Exception as exc:  # noqa: BLE001
+            _fail(f"{template} is not a valid sample file:\n  {exc}")
+            return
+        # The new plug is a different rock: keep the geometry and method as a
+        # starting point, but never inherit the identity.
+        sample = sample.model_copy(update={"id": sample_id, "notes": ""})
+    else:
+        sample = SampleConfig(id=sample_id)
+
+    data = sample.model_dump(mode="json")
+    if not non_interactive:
+        typer.secho(f"\n== new sample: {sample_id} ==", fg=typer.colors.CYAN, bold=True)
+        try:
+            _prompt_sample({"sample": data})
+        except (ValueError, TypeError) as exc:
+            _fail(f"Could not read that answer: {exc}")
+            return
+    data["id"] = sample_id
+
+    try:
+        for assignment in set_values:
+            if "=" not in assignment:
+                raise ConfigError(f"--set {assignment!r} is not in FIELD=VALUE form.")
+            key, value = assignment.split("=", 1)
+            _set_dotted(data, key.strip(), value.strip())
+        sample = SampleConfig.model_validate(data)
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        _fail(f"Those answers do not make a valid sample:\n  {exc}")
+        return
+
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in sample_id)
+    target = Path(directory) / f"{safe}.yaml"
+    if target.exists() and not force:
+        _fail(f"{target} already exists. Pass --force to overwrite.")
+        return
+
+    config = GaspermConfig(sample=sample)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_sample_yaml(config), encoding="utf-8")
+
+    typer.secho(f"Wrote {target}", fg=typer.colors.GREEN)
+    typer.echo(f"\nNext: gasperm collect --sample {target}")
+
+
 # --------------------------------------------------------------------------
 # collect
 # --------------------------------------------------------------------------
@@ -465,6 +589,10 @@ def collect_command(
     samples: Optional[int] = typer.Option(
         None, "--samples", "-n", help="Stop after this many samples."
     ),
+    flowmeter: Optional[str] = typer.Option(
+        None, "--flowmeter", "-F",
+        help="Flowmeter to use for this run, by name from hardware.yaml.",
+    ),
     stop_when_steady: bool = typer.Option(
         False, "--stop-when-steady", help="End the run once steady state is confirmed."
     ),
@@ -498,6 +626,14 @@ def collect_command(
         config.run.output_dir = str(output_dir)
     if stop_when_steady:
         config.run.stop_when_steady = True
+    if flowmeter is not None:
+        if flowmeter not in config.hardware.flowmeters:
+            _fail(
+                f"--flowmeter {flowmeter!r} is not defined in hardware.yaml. Available "
+                f"meters: {', '.join(sorted(config.hardware.flowmeters))}"
+            )
+            return
+        config.run.flowmeter = flowmeter
 
     # Fail loudly and specifically BEFORE opening the DAQ.
     try:
@@ -540,12 +676,14 @@ def collect_command(
         return
     _configure_logging(verbose, log_file=writer.log_path)
     logger.info(
-        "Sample %s, gas %s, %.3f cm x %.3f cm dia, %.4g Hz, operator %s",
+        "Sample %s, gas %s, %.3f cm x %.3f cm dia, %.4g Hz, flowmeter %s (%s), operator %s",
         config.sample.id,
         config.run.gas.name,
         config.sample.length_cm,
         config.sample.diameter_cm,
         config.hardware.daq.sample_rate_hz,
+        config.flowmeter_name,
+        config.flowmeter.summary,
         config.run.operator or "(unset)",
     )
 
@@ -573,6 +711,11 @@ def collect_command(
     )
 
     typer.secho(f"\nRecording to {writer.directory}   (Ctrl+C to stop)", fg=typer.colors.CYAN)
+    typer.secho(
+        f"Sample {config.sample.id}   gas {config.run.gas.name}   "
+        f"flowmeter {config.flowmeter_name} ({config.flowmeter.summary})",
+        fg=typer.colors.CYAN,
+    )
     if config.run.steady_state.enabled:
         criteria = config.run.steady_state
         typer.secho(
@@ -644,6 +787,11 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
 
     typer.secho("Run summary", bold=True)
     typer.echo(f"  sample              {summary.sample_id}  ({summary.gas_name})")
+    if summary.metadata and summary.metadata.flowmeter:
+        typer.echo(
+            f"  flowmeter           {summary.metadata.flowmeter} "
+            f"({summary.metadata.flowmeter_range})"
+        )
     if summary.metadata and summary.metadata.operator:
         typer.echo(f"  operator            {summary.metadata.operator}")
     if summary.metadata and summary.metadata.lithology:
@@ -759,6 +907,10 @@ def klinkenberg_command(
         False, "--allow-unsteady",
         help="Accept runs that never reached steady state. They do not measure the sample.",
     ),
+    allow_mixed_samples: bool = typer.Option(
+        False, "--allow-mixed-samples",
+        help="Permit runs from more than one core plug in a single regression.",
+    ),
     coverage: float = typer.Option(
         0.95, "--coverage", help="Level of confidence for the uncertainty on k_L."
     ),
@@ -820,7 +972,11 @@ def klinkenberg_command(
         return
 
     try:
-        result = fit_klinkenberg(points, coverage_probability=coverage)
+        result = fit_klinkenberg(
+            points,
+            coverage_probability=coverage,
+            allow_mixed_samples=allow_mixed_samples,
+        )
     except ValueError as exc:
         _fail(str(exc))
         return

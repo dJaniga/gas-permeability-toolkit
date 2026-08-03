@@ -9,6 +9,7 @@ Three commands:
 | command | what it does |
 |---|---|
 | `gasperm init` | write the three configuration files describing the rig, the plug and the experiment |
+| `gasperm new-sample` | add another core plug — one file per plug, rig config untouched |
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
 
@@ -26,11 +27,11 @@ runs on a machine that has never seen a DAQ.
 ## Configuration: three files, three concerns
 
 ```
-hardware.yaml   the bench   -- DAQ, transducer calibrations, flowmeter, probe,
-                               instrument uncertainties
+hardware.yaml   the bench   -- DAQ, transducer calibrations, every flowmeter
+                               wired, probe, instrument uncertainties
 sample.yaml     the rock    -- id, lithology, geometry, porosity, provenance
-run.yaml        the run     -- operator, gas, confining pressure, steady-state
-                               criteria, output settings
+run.yaml        the run     -- operator, gas, which flowmeter, confining
+                               pressure, steady-state criteria, output settings
 ```
 
 They are split because they change on completely different timescales: the rig
@@ -43,14 +44,52 @@ Every pressure-bearing field carries its **own** unit, drawn from
 thinks in bar, and a confining pressure naturally quoted in MPa can coexist
 without anyone converting anything by hand.
 
-## Measuring
+## Measuring many plugs on one rig
+
+The rig is configured **once**. After that, a new plug is one file and a run is
+one command:
 
 ```bash
-gasperm init                                  # interactive, or --non-interactive --set k=v
-gasperm collect --plot                        # one run per mean pressure
-gasperm collect --stop-when-steady            # unattended
-gasperm klinkenberg runs/core-001_* --plot    # regress across the runs
+gasperm init                                     # once per rig
+gasperm new-sample core-041                      # -> samples/core-041.yaml
+gasperm new-sample core-042 --from samples/core-041.yaml   # same core, new plug
+
+gasperm collect --sample samples/core-041.yaml --flowmeter low_range
+gasperm collect --sample samples/core-041.yaml --flowmeter high_range
+gasperm klinkenberg runs/core-041_* --plot
 ```
+
+`--from` copies the shared fields (lithology, formation, geometry as a starting
+point) but never the identity or the notes — those describe the previous plug.
+
+`klinkenberg` **refuses** runs from more than one plug unless you pass
+`--allow-mixed-samples`. With a directory full of runs from a dozen plugs, a
+careless glob is otherwise a silent way to regress across rocks.
+
+### Several flowmeters
+
+A rig usually has more than one meter wired — a low-range and a high-range —
+and which one suits a given pressure step is an *experiment* decision, not a
+change to the bench. So every meter is defined once in `hardware.yaml`:
+
+```yaml
+flowmeters:
+  low_range:
+    channel: ai2
+    flow_max: 500.0
+    unit: sccm
+  high_range:
+    channel: ai3
+    flow_max: 5000.0
+    unit: sccm
+default_flowmeter: low_range
+```
+
+and each run picks one, in `run.yaml` (`flowmeter: high_range`) or on the
+command line (`--flowmeter high_range`). Only the selected meter's analog input
+is added to the DAQ task; the others are never read. The meter used is recorded
+in every run's metadata, because two runs on the same plug routinely differ in
+nothing else.
 
 Each run lands in a timestamped directory containing `readings.csv` (every
 sample, raw voltages included, in internal CGS units), `run_metadata.yaml` (a
