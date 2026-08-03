@@ -56,6 +56,16 @@ Every pressure-bearing field carries its **own** unit, drawn from
 thinks in bar, and a confining pressure naturally quoted in MPa can coexist
 without anyone converting anything by hand.
 
+Plug dimensions work the same way. `sample.dimension_unit` defaults to `mm`,
+because that is what a caliper reads, and the shipped default plug is a 1.5 in
+core at 38.1 mm:
+
+```yaml
+dimension_unit: mm      # mm | cm | m | in | ft
+length: 50.0
+diameter: 38.1          # 1.5 in
+```
+
 ## Measuring many plugs on one rig
 
 The rig is configured **once**. After that, a new plug is one file and a run is

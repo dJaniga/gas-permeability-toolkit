@@ -69,7 +69,7 @@ class TestSplitConcerns:
 
     def test_the_plug_lives_in_sample_without_test_conditions(self):
         fields = set(SampleConfig.model_fields)
-        assert {"id", "lithology", "length_cm", "porosity_fraction"} <= fields
+        assert {"id", "lithology", "length", "diameter", "porosity_fraction"} <= fields
         # The same plug is measured at several confining pressures and gases,
         # so neither belongs to the sample.
         assert "confining_pressure" not in fields
@@ -244,6 +244,68 @@ class TestFlowmeterSelection:
         assert "low_range" in run_yaml and "high_range" in run_yaml
 
 
+class TestSampleDimensions:
+    """Plug geometry carries its own unit, like every pressure field does."""
+
+    def test_the_default_plug_is_one_and_a_half_inches_in_mm(self, base_config):
+        sample = base_config.sample
+        assert sample.dimension_unit == "mm"
+        assert sample.diameter == 38.1
+        assert sample.length == 50.0
+
+    def test_the_default_diameter_is_exactly_1_5_inches(self, base_config):
+        # 25.4 mm/in exactly, so 1.5 in is 38.1 mm with nothing left over.
+        assert base_config.sample.diameter_cm == pytest.approx(2.54 * 1.5)
+        assert units.length_from_cm(
+            base_config.sample.diameter_cm, "in"
+        ) == pytest.approx(1.5)
+
+    def test_dimensions_convert_to_cm_for_the_physics(self, base_config):
+        assert base_config.sample.length_cm == pytest.approx(5.0)
+        assert base_config.sample.diameter_cm == pytest.approx(3.81)
+        assert base_config.geometry().area_cm2 == pytest.approx(11.4009, abs=1e-4)
+
+    def test_uncertainties_convert_too(self, base_config):
+        base_config.sample.length_uncertainty = 0.1
+        base_config.sample.diameter_uncertainty = 0.2
+        geometry = base_config.geometry()
+        assert geometry.length_uncertainty_cm == pytest.approx(0.01)
+        assert geometry.diameter_uncertainty_cm == pytest.approx(0.02)
+
+    @pytest.mark.parametrize(
+        "unit,length,diameter",
+        [("mm", 50.0, 38.1), ("cm", 5.0, 3.81), ("in", 5.0 / 2.54, 1.5)],
+    )
+    def test_the_same_plug_in_any_unit_gives_the_same_physics(
+        self, unit: str, length: float, diameter: float
+    ):
+        sample = SampleConfig(dimension_unit=unit, length=length, diameter=diameter)
+        assert sample.length_cm == pytest.approx(5.0)
+        assert sample.diameter_cm == pytest.approx(3.81)
+        assert sample.geometry().area_cm2 == pytest.approx(11.4009, abs=1e-4)
+
+    def test_an_unknown_dimension_unit_is_rejected(self):
+        with pytest.raises(ValueError, match="furlong"):
+            SampleConfig(dimension_unit="furlong")
+
+    @pytest.mark.parametrize("unit", sorted(units.SUPPORTED_LENGTH_UNITS))
+    def test_every_supported_length_unit_is_accepted(self, unit: str):
+        assert SampleConfig(dimension_unit=unit).dimension_unit == unit
+
+    def test_the_unit_survives_the_yaml_round_trip(self, tmp_path, base_config):
+        base_config.sample.dimension_unit = "in"
+        base_config.sample.diameter = 1.5
+        save_config(base_config, tmp_path)
+        reloaded = load_config(tmp_path)
+        assert reloaded.sample.dimension_unit == "in"
+        assert reloaded.sample.diameter_cm == pytest.approx(3.81)
+
+    def test_the_template_names_the_unit_on_each_dimension(self, base_config):
+        rendered = render_sample_yaml(base_config)
+        assert "dimension_unit: mm" in rendered
+        assert "1.5 in" in rendered
+
+
 class TestSampleMetadata:
     def test_petrophysical_fields_round_trip(self):
         sample = SampleConfig(
@@ -275,8 +337,8 @@ class TestSampleMetadata:
 
     def test_geometry_carries_the_caliper_uncertainties(self):
         geometry = SampleConfig(
-            length_cm=5.0, diameter_cm=2.5,
-            length_uncertainty_cm=0.02, diameter_uncertainty_cm=0.01,
+            dimension_unit="cm", length=5.0, diameter=2.5,
+            length_uncertainty=0.02, diameter_uncertainty=0.01,
         ).geometry()
         assert geometry.relative_length_uncertainty == pytest.approx(0.004)
         assert geometry.relative_area_uncertainty == pytest.approx(2.0 * 0.01 / 2.5)
@@ -543,7 +605,7 @@ class TestValidateForCollect:
             validate_for_collect(base_config)
 
     def test_implausible_geometry_warns(self, base_config, fake_serial):
-        base_config.sample.length_cm = 500.0
+        base_config.sample.length = 5000.0
         assert any("unusually long" in w for w in validate_for_collect(base_config))
 
     def test_disabled_steady_state_warns_that_the_result_is_not_representative(

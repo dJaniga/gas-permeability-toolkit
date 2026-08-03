@@ -205,10 +205,10 @@ class TestNewSample:
     def test_overrides_set_the_geometry(self, tmp_path):
         target = add_sample(
             tmp_path, "core-042",
-            "length_cm=4.2", "diameter_cm=2.5", "lithology=shale",
+            "length=42.0", "diameter=25.0", "lithology=shale",
         )
         sample = read_sample(target)
-        assert (sample.length_cm, sample.diameter_cm) == (4.2, 2.5)
+        assert (sample.length, sample.diameter) == (42.0, 25.0)
         assert sample.lithology == "shale"
 
     def test_an_unsafe_id_produces_a_safe_filename(self, tmp_path):
@@ -238,10 +238,10 @@ class TestNewSample:
 
     def test_the_written_file_loads_as_a_sample_for_collect(self, tmp_path):
         init_config(tmp_path)
-        target = add_sample(tmp_path / "samples", "core-042", "length_cm=4.2")
+        target = add_sample(tmp_path / "samples", "core-042", "length=42.0")
         config = load_config(tmp_path, sample=target)
         assert config.sample.id == "core-042"
-        assert config.sample.length_cm == 4.2
+        assert config.sample.length_cm == pytest.approx(4.2)
         # The rig and the experiment came from the shared files.
         assert config.hardware.daq.device_name == "Dev1"
 
@@ -280,8 +280,8 @@ class TestTemplateInheritance:
             "grain_density_g_cm3=2.65",
             "porosity_method=helium pycnometry",
             "prepared_by=DJ",
-            "length_cm=5.02",
-            "diameter_cm=2.54",
+            "length=50.2",
+            "diameter=38.1",
             "porosity_fraction=0.18",
             "bulk_density_g_cm3=2.17",
             "notes=first plug",
@@ -319,9 +319,9 @@ class TestTemplateInheritance:
         """Every plug is cut and measured individually."""
         sample = self._derive(tmp_path)
         defaults = SampleConfig(id="x")
-        assert sample.length_cm == defaults.length_cm
-        assert sample.diameter_cm == defaults.diameter_cm
-        assert sample.length_cm != 5.02
+        assert sample.length == defaults.length
+        assert sample.diameter == defaults.diameter
+        assert sample.length != 50.2
 
     def test_per_plug_measurements_are_never_inherited(self, tmp_path):
         sample = self._derive(tmp_path)
@@ -329,8 +329,8 @@ class TestTemplateInheritance:
         assert sample.bulk_density_g_cm3 is None
 
     def test_the_new_plug_can_set_its_own_geometry(self, tmp_path):
-        sample = self._derive(tmp_path, length_cm=4.87, diameter_cm=2.53)
-        assert (sample.length_cm, sample.diameter_cm) == (4.87, 2.53)
+        sample = self._derive(tmp_path, length=48.7, diameter=38.0)
+        assert (sample.length, sample.diameter) == (48.7, 38.0)
         assert sample.lithology == "sandstone"
 
     def test_interactively_it_asks_for_the_geometry_and_reports_what_it_inherited(
@@ -341,15 +341,15 @@ class TestTemplateInheritance:
             app,
             ["new-sample", "core-042", "--dir", str(tmp_path), "--from", str(template)],
             # description, length, length uncertainty, diameter, ...
-            input="\n4.87\n\n2.53\n" + "\n" * 40,
+            input="\n\n48.7\n\n38.0\n" + "\n" * 40,
         )
         assert result.exit_code == 0, result.output
         assert "inherited from" in result.output
         assert "lithology" in result.output
-        assert "Length (cm)" in result.output
+        assert "Length (mm)" in result.output
         sample = read_sample(tmp_path / "core-042.yaml")
-        assert sample.length_cm == 4.87
-        assert sample.diameter_cm == 2.53
+        assert sample.length == 48.7
+        assert sample.diameter == 38.0
         assert sample.lithology == "sandstone"
 
     def test_the_core_level_questions_are_skipped_when_inherited(self, tmp_path):

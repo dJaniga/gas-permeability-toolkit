@@ -92,7 +92,7 @@ def _load_or_fail(
 def _set_dotted(data: dict[str, Any], dotted_key: str, raw_value: str) -> None:
     """Apply a ``section.field=value`` override to a plain config dict.
 
-    Paths are rooted at the three sections, e.g. ``sample.length_cm``,
+    Paths are rooted at the three sections, e.g. ``sample.length``,
     ``hardware.daq.device_name``, ``run.gas.name``. Values are parsed as YAML
     so numbers, booleans and ``null`` arrive as the right type.
     """
@@ -122,6 +122,7 @@ def _set_dotted(data: dict[str, Any], dotted_key: str, raw_value: str) -> None:
 PRESSURE_UNITS = ", ".join(sorted(units.SUPPORTED_PRESSURE_UNITS))
 FLOW_UNITS = ", ".join(sorted(units.SUPPORTED_FLOW_UNITS))
 PERMEABILITY_UNITS = ", ".join(sorted(units.SUPPORTED_PERMEABILITY_UNITS))
+LENGTH_UNITS = ", ".join(sorted(units.SUPPORTED_LENGTH_UNITS))
 
 #: How many times a unit prompt re-asks before giving up and keeping the default.
 _UNIT_PROMPT_ATTEMPTS = 5
@@ -357,18 +358,26 @@ def _prompt_sample(sample: dict[str, Any], *, inherited: bool = False) -> None:
     sample["description"] = typer.prompt("    Description", default="", show_default=False)
 
     typer.secho("  Geometry (measured per plug)", bold=True)
-    sample["length_cm"] = typer.prompt(
-        "    Length (cm)", default=sample["length_cm"], type=float
+    sample["dimension_unit"] = _prompt_unit(
+        "    Dimension unit",
+        sample["dimension_unit"],
+        LENGTH_UNITS,
+        lambda value: units.length_to_cm(1.0, value),
     )
-    sample["length_uncertainty_cm"] = typer.prompt(
-        "    Length uncertainty (cm)", default=sample["length_uncertainty_cm"], type=float
+    unit = sample["dimension_unit"]
+    sample["length"] = typer.prompt(
+        f"    Length ({unit})", default=sample["length"], type=float
     )
-    sample["diameter_cm"] = typer.prompt(
-        "    Diameter (cm)", default=sample["diameter_cm"], type=float
+    sample["length_uncertainty"] = typer.prompt(
+        f"    Length uncertainty ({unit})",
+        default=sample["length_uncertainty"], type=float,
     )
-    sample["diameter_uncertainty_cm"] = typer.prompt(
-        "    Diameter uncertainty (cm, counts double in the budget)",
-        default=sample["diameter_uncertainty_cm"], type=float,
+    sample["diameter"] = typer.prompt(
+        f"    Diameter ({unit})", default=sample["diameter"], type=float
+    )
+    sample["diameter_uncertainty"] = typer.prompt(
+        f"    Diameter uncertainty ({unit}, counts double in the budget)",
+        default=sample["diameter_uncertainty"], type=float,
     )
 
     typer.secho("  Petrophysics (optional, per plug)", bold=True)
@@ -505,7 +514,7 @@ def init_command(
     set_values: list[str] = typer.Option(
         [], "--set", metavar="SECTION.FIELD=VALUE",
         help=(
-            "Override a field, e.g. --set sample.length_cm=4.2 --set run.gas.name=Air "
+            "Override a field, e.g. --set sample.length=48.7 --set run.gas.name=Air "
             "--set hardware.daq.device_name=Dev2. Repeatable."
         ),
     ),
@@ -618,7 +627,7 @@ def new_sample_command(
     ),
     set_values: list[str] = typer.Option(
         [], "--set", metavar="FIELD=VALUE",
-        help="Override a sample field, e.g. --set length_cm=4.2. Repeatable.",
+        help="Override a sample field, e.g. --set length=48.7. Repeatable.",
     ),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing file."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),

@@ -118,6 +118,11 @@ class TestRollingWindow:
 
 class TestSampleProcessor:
     def test_matches_a_hand_calculation_through_every_conversion(self, base_config):
+        # Pin the geometry too, in cm, so the whole line below stays a genuine
+        # hand calculation rather than tracking the shipped plug defaults.
+        base_config.sample.dimension_unit = "cm"
+        base_config.sample.length = 5.0
+        base_config.sample.diameter = 2.54
         processor = make_processor(in_kpa(base_config), viscosity_cp=0.0178)
         reading = processor.process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
@@ -264,7 +269,11 @@ class TestUnitInvariance:
                     "flowmeters": {"m": {"flow_max": 500.0, "unit": "sccm"}},
                     "default_flowmeter": "m",
                 },
-                "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
+                "sample": {
+                    "dimension_unit": "cm",
+                    "length": 5.0,
+                    "diameter": 2.54,
+                },
                 "run": {
                     "atmospheric_pressure": 101.325,
                     "atmospheric_pressure_unit": "kPa",
@@ -292,7 +301,11 @@ class TestUnitInvariance:
                     "flowmeters": {"m": {"flow_max": 0.5, "unit": "slpm"}},
                     "default_flowmeter": "m",
                 },
-                "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
+                "sample": {
+                    "dimension_unit": "cm",
+                    "length": 5.0,
+                    "diameter": 2.54,
+                },
                 "run": {
                     "atmospheric_pressure": 101_325.0,
                     "atmospheric_pressure_unit": "Pa",

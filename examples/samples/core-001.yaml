@@ -15,12 +15,15 @@ well: ''
 depth: null
 depth_unit: m                                 # m | ft
 
-# Geometry. Area goes as diameter^2, so the diameter uncertainty enters
-# the uncertainty budget doubled -- it is usually the largest single term.
-length_cm: 5.0
-diameter_cm: 2.54
-length_uncertainty_cm: 0.01                   # standard uncertainty, cm (caliper)
-diameter_uncertainty_cm: 0.01                 # standard uncertainty, cm -- counts double
+# Geometry -- the only part of this file the physics uses. Every dimension
+# below is in dimension_unit; the calculation converts to cm internally.
+# Area goes as diameter^2, so the diameter uncertainty enters the budget
+# doubled -- it is usually the largest single term.
+dimension_unit: mm                            # cm, ft, in, m, mm
+length: 50.0                                  # mm
+diameter: 38.1                                # mm (38.1 mm = 1.5 in)
+length_uncertainty: 0.1                       # standard uncertainty, mm (caliper)
+diameter_uncertainty: 0.1                     # standard uncertainty, mm -- counts double
 
 # Petrophysics. Informational; not used by the Darcy calc.
 porosity_fraction: null

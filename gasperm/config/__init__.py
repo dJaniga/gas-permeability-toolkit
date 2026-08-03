@@ -480,18 +480,25 @@ def render_sample_yaml(config: GaspermConfig) -> str:
         "Only length_cm and diameter_cm enter the Darcy calculation. Everything else\n"
         "is provenance, carried into every run so a number stays traceable to a rock."
     )
+    supported_length = ", ".join(sorted(units.SUPPORTED_LENGTH_UNITS))
+    unit = config.sample.dimension_unit
     notes = {
-        "length_cm": (
-            "Geometry. Area goes as diameter^2, so the diameter uncertainty enters\n"
-            "the uncertainty budget doubled -- it is usually the largest single term."
+        "dimension_unit": (
+            "Geometry -- the only part of this file the physics uses. Every dimension\n"
+            "below is in dimension_unit; the calculation converts to cm internally.\n"
+            "Area goes as diameter^2, so the diameter uncertainty enters the budget\n"
+            "doubled -- it is usually the largest single term."
         ),
         "porosity_fraction": "Petrophysics. Informational; not used by the Darcy calc.",
         "prepared_by": "Provenance.",
     }
     comments = {
         "depth_unit": "m | ft",
-        "length_uncertainty_cm": "standard uncertainty, cm (caliper)",
-        "diameter_uncertainty_cm": "standard uncertainty, cm -- counts double",
+        "dimension_unit": supported_length,
+        "length": unit,
+        "diameter": f"{unit} (38.1 mm = 1.5 in)",
+        "length_uncertainty": f"standard uncertainty, {unit} (caliper)",
+        "diameter_uncertainty": f"standard uncertainty, {unit} -- counts double",
         "porosity_method": "helium pycnometry, MICP, image analysis, ...",
         "prepared_on": "YYYY-MM-DD",
     }
@@ -676,15 +683,18 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
             )
 
     # -- geometry sanity --------------------------------------------------
-    if config.sample.length_cm > 100.0:
+    sample = config.sample
+    if sample.length_cm > 100.0:
         warnings.append(
-            f"sample.length_cm = {config.sample.length_cm} is unusually long for a core "
-            "plug; check the unit."
+            f"sample.length = {sample.length} {sample.dimension_unit} "
+            f"({sample.length_cm:.1f} cm) is unusually long for a core plug; check "
+            "sample.dimension_unit."
         )
-    if config.sample.diameter_cm > 30.0:
+    if sample.diameter_cm > 30.0:
         warnings.append(
-            f"sample.diameter_cm = {config.sample.diameter_cm} is unusually wide for a "
-            "core plug; check the unit."
+            f"sample.diameter = {sample.diameter} {sample.dimension_unit} "
+            f"({sample.diameter_cm:.1f} cm) is unusually wide for a core plug; check "
+            "sample.dimension_unit."
         )
 
     # -- pressure plausibility -------------------------------------------
