@@ -1,0 +1,208 @@
+"""Klinkenberg regression against synthetic data from a known k_L and b."""
+
+from __future__ import annotations
+
+
+import pytest
+
+from gasperm.klinkenberg import (
+    POOR_FIT_R_SQUARED,
+    fit_klinkenberg,
+    load_points_from_csv,
+)
+from gasperm.models import KlinkenbergPoint
+
+#: Ground truth for the synthetic points below.
+TRUE_K_L = 0.5  # darcy
+TRUE_B = 0.2  # atm
+
+
+def synthetic_points(pressures_atm=(1.0, 2.0, 4.0, 8.0), *, k_l=TRUE_K_L, b=TRUE_B):
+    """Exact ``k_g = k_L * (1 + b / P_mean)`` points -- no noise."""
+    return [
+        KlinkenbergPoint(
+            mean_pressure_atm=p,
+            apparent_permeability_darcy=k_l * (1.0 + b / p),
+            label=f"P={p}",
+            sample_id="core-001",
+        )
+        for p in pressures_atm
+    ]
+
+
+class TestExactRecovery:
+    def test_recovers_k_l_and_b_from_noise_free_points(self):
+        result = fit_klinkenberg(synthetic_points())
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-9)
+        assert result.slippage_factor_atm == pytest.approx(TRUE_B, rel=1e-9)
+        assert result.r_squared == pytest.approx(1.0, abs=1e-12)
+        assert result.warnings == []
+
+    def test_slope_is_k_l_times_b(self):
+        result = fit_klinkenberg(synthetic_points())
+        assert result.slope == pytest.approx(TRUE_K_L * TRUE_B, rel=1e-9)
+        assert result.intercept == pytest.approx(result.liquid_permeability_darcy)
+
+    def test_prediction_reproduces_the_inputs(self):
+        result = fit_klinkenberg(synthetic_points())
+        for point in result.points:
+            assert result.predict_darcy(point.mean_pressure_atm) == pytest.approx(
+                point.apparent_permeability_darcy, rel=1e-9
+            )
+
+    @pytest.mark.parametrize(
+        "k_l,b", [(0.001, 0.5), (1.5, 0.05), (0.02, 1.2), (250.0, 0.3)]
+    )
+    def test_recovery_across_magnitudes(self, k_l: float, b: float):
+        result = fit_klinkenberg(
+            synthetic_points((0.5, 1.0, 2.0, 5.0, 10.0), k_l=k_l, b=b)
+        )
+        assert result.liquid_permeability_darcy == pytest.approx(k_l, rel=1e-8)
+        assert result.slippage_factor_atm == pytest.approx(b, rel=1e-8)
+
+    def test_two_points_fit_exactly(self):
+        result = fit_klinkenberg(synthetic_points((1.0, 4.0)))
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-9)
+        assert result.slippage_factor_atm == pytest.approx(TRUE_B, rel=1e-9)
+
+
+class TestWarnings:
+    def test_two_points_warn_that_r_squared_is_meaningless(self):
+        result = fit_klinkenberg(synthetic_points((1.0, 4.0)))
+        assert any("Two points fit an exact line" in w for w in result.warnings)
+
+    def test_three_clean_points_do_not_warn(self):
+        result = fit_klinkenberg(synthetic_points((1.0, 2.0, 4.0)))
+        assert result.warnings == []
+
+    def test_poor_fit_is_flagged(self):
+        points = synthetic_points((1.0, 2.0, 4.0, 8.0))
+        scattered = list(points)
+        # Push one run badly off the line, as a non-steady-state run would be.
+        scattered[2] = KlinkenbergPoint(
+            mean_pressure_atm=scattered[2].mean_pressure_atm,
+            apparent_permeability_darcy=scattered[2].apparent_permeability_darcy * 3.0,
+            sample_id="core-001",
+        )
+        result = fit_klinkenberg(scattered)
+        assert result.r_squared < POOR_FIT_R_SQUARED
+        assert any("Poor linear fit" in w for w in result.warnings)
+
+    def test_mixed_samples_are_flagged(self):
+        points = synthetic_points((1.0, 2.0, 4.0))
+        mixed = list(points)
+        mixed[1] = KlinkenbergPoint(
+            mean_pressure_atm=mixed[1].mean_pressure_atm,
+            apparent_permeability_darcy=mixed[1].apparent_permeability_darcy,
+            sample_id="core-002",
+        )
+        result = fit_klinkenberg(mixed)
+        assert any("more than one sample id" in w for w in result.warnings)
+
+    def test_negative_intercept_is_flagged(self):
+        # An implausibly steep slippage trend extrapolates to a negative
+        # intercept, which is non-physical -- usually too narrow a pressure
+        # range, or one outlying run.
+        points = [
+            KlinkenbergPoint(mean_pressure_atm=1.0, apparent_permeability_darcy=1.0),
+            KlinkenbergPoint(mean_pressure_atm=2.0, apparent_permeability_darcy=0.3),
+            KlinkenbergPoint(mean_pressure_atm=4.0, apparent_permeability_darcy=0.1),
+        ]
+        result = fit_klinkenberg(points)
+        assert result.liquid_permeability_darcy < 0.0
+        assert any("not positive" in w for w in result.warnings)
+
+    def test_a_negative_slope_is_flagged(self):
+        """Apparent permeability must fall, not rise, with mean pressure."""
+        points = [
+            KlinkenbergPoint(mean_pressure_atm=1.0, apparent_permeability_darcy=0.1),
+            KlinkenbergPoint(mean_pressure_atm=2.0, apparent_permeability_darcy=0.5),
+            KlinkenbergPoint(mean_pressure_atm=4.0, apparent_permeability_darcy=0.9),
+        ]
+        result = fit_klinkenberg(points)
+        assert result.slope < 0.0
+        assert any("slope is negative" in w for w in result.warnings)
+
+
+class TestRejectedInputs:
+    def test_single_point_is_rejected(self):
+        with pytest.raises(ValueError, match="at least 2 points"):
+            fit_klinkenberg(synthetic_points((1.0,)))
+
+    def test_identical_pressures_are_rejected(self):
+        points = [
+            KlinkenbergPoint(mean_pressure_atm=2.0, apparent_permeability_darcy=0.6),
+            KlinkenbergPoint(mean_pressure_atm=2.0, apparent_permeability_darcy=0.7),
+        ]
+        with pytest.raises(ValueError, match="same mean pressure"):
+            fit_klinkenberg(points)
+
+    def test_non_positive_pressure_is_rejected_by_the_model(self):
+        with pytest.raises(ValueError):
+            KlinkenbergPoint(mean_pressure_atm=0.0, apparent_permeability_darcy=0.5)
+
+
+class TestCsvInput:
+    def test_reads_atm_and_millidarcy_by_default(self, tmp_path):
+        path = tmp_path / "points.csv"
+        path.write_text(
+            "mean_pressure,apparent_permeability\n"
+            "1.0,600\n"
+            "2.0,550\n"
+            "4.0,525\n",
+            encoding="utf-8",
+        )
+        points = load_points_from_csv(path)
+        assert len(points) == 3
+        assert points[0].mean_pressure_atm == pytest.approx(1.0)
+        # 600 mD == 0.6 darcy
+        assert points[0].apparent_permeability_darcy == pytest.approx(0.6)
+        result = fit_klinkenberg(points)
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-9)
+
+    def test_infers_units_from_column_name_suffixes(self, tmp_path):
+        path = tmp_path / "points.csv"
+        # Same physical points as above, expressed in kPa and darcy.
+        path.write_text(
+            "p_mean_kPa,k_g_D\n"
+            "101.325,0.6\n"
+            "202.650,0.55\n"
+            "405.300,0.525\n",
+            encoding="utf-8",
+        )
+        points = load_points_from_csv(path)
+        assert points[0].mean_pressure_atm == pytest.approx(1.0, rel=1e-9)
+        assert points[0].apparent_permeability_darcy == pytest.approx(0.6)
+        result = fit_klinkenberg(points)
+        assert result.liquid_permeability_darcy == pytest.approx(TRUE_K_L, rel=1e-6)
+
+    def test_explicit_units_override_the_header(self, tmp_path):
+        path = tmp_path / "points.csv"
+        path.write_text("mean_pressure,k_g\n1.01325,600\n", encoding="utf-8")
+        points = load_points_from_csv(path, pressure_unit="bar", permeability_unit="mD")
+        assert points[0].mean_pressure_atm == pytest.approx(1.0, rel=1e-6)
+
+    def test_missing_columns_name_what_was_expected(self, tmp_path):
+        path = tmp_path / "wrong.csv"
+        path.write_text("pressure_bar,flow\n1,2\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="mean-pressure column"):
+            load_points_from_csv(path)
+
+    def test_unparseable_row_names_the_line(self, tmp_path):
+        path = tmp_path / "bad.csv"
+        path.write_text("mean_pressure,k_g\n1.0,600\n2.0,oops\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="line 3"):
+            load_points_from_csv(path)
+
+    def test_blank_rows_are_tolerated(self, tmp_path):
+        path = tmp_path / "gaps.csv"
+        path.write_text(
+            "mean_pressure,k_g\n1.0,600\n,\n2.0,550\n4.0,525\n", encoding="utf-8"
+        )
+        assert len(load_points_from_csv(path)) == 3
+
+    def test_empty_file_is_rejected(self, tmp_path):
+        path = tmp_path / "empty.csv"
+        path.write_text("mean_pressure,k_g\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="no data rows"):
+            load_points_from_csv(path)

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gas-permeability-toolkit"
+version = "0.1.0"
+description = "Gas permeability measurement for core samples on an NI USB-6421 rig"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Damian" }]
+keywords = ["permeability", "core-analysis", "klinkenberg", "petrophysics", "nidaqmx"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Topic :: Scientific/Engineering",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "typer>=0.9",
+    "CoolProp>=6.4",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+# nidaqmx also needs NI-DAQmx itself, a system-level driver from National
+# Instruments. It is optional here so the physics test suite installs and runs
+# on a machine that has never seen a DAQ.
+daq = ["nidaqmx>=0.8"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+
+[project.scripts]
+gasperm = "gasperm.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/dj-anigadis/gas-permeability-toolkit"
+
+[tool.setuptools.packages.find]
+include = ["gasperm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:gasperm.*"]
