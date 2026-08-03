@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 from pydantic import Field, ValidationError, model_validator
@@ -80,6 +80,7 @@ __all__ = [
     "HARDWARE_FILENAME",
     "SAMPLE_FILENAME",
     "RUN_FILENAME",
+    "SECTION_NAMES",
     "load_config",
     "save_config",
     "config_to_dict",
@@ -93,6 +94,21 @@ __all__ = [
 HARDWARE_FILENAME = "hardware.yaml"
 SAMPLE_FILENAME = "sample.yaml"
 RUN_FILENAME = "run.yaml"
+
+#: The three sections, in file order.
+SECTION_NAMES: tuple[str, ...] = ("hardware", "sample", "run")
+
+#: What to tell an operator when a section's file is missing. The sample file
+#: is not written by ``init`` -- it belongs to a core plug, not to the rig --
+#: so it points somewhere different from the other two.
+_MISSING_FILE_HINT: dict[str, str] = {
+    "hardware": "Run 'gasperm init' to create it.",
+    "run": "Run 'gasperm init' to create it.",
+    "sample": (
+        "A sample file describes one core plug, so it is not created by 'init'. "
+        "Make one with 'gasperm new-sample <id>' and point at it with --sample."
+    ),
+}
 
 #: A pre-split single-file config carried the rig sections *and* the sample or
 #: experiment sections in one document. The new hardware.yaml legitimately has
@@ -188,12 +204,11 @@ class ConfigPaths:
 # --------------------------------------------------------------------------
 
 
-def _read_mapping(path: Path, what: str) -> dict[str, Any]:
+def _read_mapping(path: Path, section: str) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigError(
-            f"{what} config file not found: {path}. Run 'gasperm init' to create the "
-            f"three config files ({HARDWARE_FILENAME}, {SAMPLE_FILENAME}, "
-            f"{RUN_FILENAME})."
+            f"{section.capitalize()} config file not found: {path}. "
+            + _MISSING_FILE_HINT[section]
         )
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -294,10 +309,10 @@ def load_config(
         run=Path(run) if run is not None else defaults.run,
     )
 
-    hardware_raw = _read_mapping(paths.hardware, "Hardware")
+    hardware_raw = _read_mapping(paths.hardware, "hardware")
     _reject_legacy(hardware_raw, paths.hardware)
-    sample_raw = _read_mapping(paths.sample, "Sample")
-    run_raw = _read_mapping(paths.run, "Run")
+    sample_raw = _read_mapping(paths.sample, "sample")
+    run_raw = _read_mapping(paths.run, "run")
 
     hardware = _validate_section(
         HardwareConfig, _unwrap(hardware_raw, "hardware"), paths.hardware
@@ -556,25 +571,55 @@ def render_run_yaml(config: GaspermConfig) -> str:
 
 
 def save_config(
-    config: GaspermConfig, directory: str | Path = ".", *, overwrite: bool = False
+    config: GaspermConfig,
+    directory: str | Path = ".",
+    *,
+    overwrite: bool = False,
+    sections: Sequence[str] = SECTION_NAMES,
 ) -> ConfigPaths:
-    """Write the three config files into ``directory``.
+    """Write config files into ``directory``.
+
+    Args:
+        config: The configuration to render.
+        directory: Where the files go.
+        overwrite: Replace files that already exist.
+        sections: Which of ``hardware``/``sample``/``run`` to write. ``init``
+            writes only the rig and the experiment: a sample file describes one
+            core plug and is created per plug by ``new-sample``.
+
+    Returns:
+        The locations of all three files, whether or not each was written.
 
     Raises:
-        ConfigError: any target exists and ``overwrite`` is False.
+        ConfigError: a target being written exists and ``overwrite`` is False,
+            or an unknown section name was given.
     """
+    unknown = set(sections) - set(SECTION_NAMES)
+    if unknown:
+        raise ConfigError(
+            f"Unknown config section(s): {', '.join(sorted(unknown))}. "
+            f"Valid sections: {', '.join(SECTION_NAMES)}"
+        )
+
     paths = ConfigPaths.in_directory(directory)
-    existing = [p for p in paths.as_tuple() if p.exists()]
+    renderers = {
+        "hardware": (paths.hardware, render_hardware_yaml),
+        "sample": (paths.sample, render_sample_yaml),
+        "run": (paths.run, render_run_yaml),
+    }
+    selected = [renderers[name] for name in SECTION_NAMES if name in sections]
+
+    existing = [path for path, _ in selected if path.exists()]
     if existing and not overwrite:
         raise ConfigError(
             "Refusing to overwrite: "
             + ", ".join(str(p) for p in existing)
             + ". Pass --force to replace them."
         )
+
     paths.hardware.parent.mkdir(parents=True, exist_ok=True)
-    paths.hardware.write_text(render_hardware_yaml(config), encoding="utf-8")
-    paths.sample.write_text(render_sample_yaml(config), encoding="utf-8")
-    paths.run.write_text(render_run_yaml(config), encoding="utf-8")
+    for path, render in selected:
+        path.write_text(render(config), encoding="utf-8")
     return paths
 
 

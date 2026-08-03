@@ -466,12 +466,17 @@ class TestThreeFileIo:
             load_config(tmp_path)
 
     def test_shipped_example_configs_load(self):
+        """examples/ mirrors the real layout: rig + run, and a plug in samples/."""
         from pathlib import Path
 
         examples = Path(__file__).resolve().parents[1] / "examples"
         if not (examples / HARDWARE_FILENAME).is_file():  # pragma: no cover
             pytest.skip("examples/ not present")
-        assert load_config(examples).flowmeter.channel == "ai2"
+        # init writes no sample file, so the example set must not have one here.
+        assert not (examples / SAMPLE_FILENAME).exists()
+        config = load_config(examples, sample=examples / "samples" / "core-001.yaml")
+        assert config.flowmeter.channel == "ai2"
+        assert config.sample.id == "core-001"
 
     def test_config_paths_in_directory(self, tmp_path):
         paths = ConfigPaths.in_directory(tmp_path)

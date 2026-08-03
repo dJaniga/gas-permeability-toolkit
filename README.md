@@ -8,8 +8,8 @@ Three commands:
 
 | command | what it does |
 |---|---|
-| `gasperm init` | write the three configuration files describing the rig, the plug and the experiment |
-| `gasperm new-sample` | add another core plug — one file per plug, rig config untouched |
+| `gasperm init` | write the rig and experiment configuration — once per bench |
+| `gasperm new-sample` | add a core plug — one file per plug, rig config untouched |
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
 
@@ -26,18 +26,30 @@ runs on a machine that has never seen a DAQ.
 
 ## Configuration: three files, three concerns
 
+`gasperm init <folder>` creates a folder per rig, and everything that bench
+produces lives inside it:
+
 ```
-hardware.yaml   the bench   -- DAQ, transducer calibrations, every flowmeter
-                               wired, probe, instrument uncertainties
-sample.yaml     the rock    -- id, lithology, geometry, porosity, provenance
-run.yaml        the run     -- operator, gas, which flowmeter, confining
-                               pressure, steady-state criteria, output settings
+tight-gas-rig/
+  hardware.yaml       the bench  -- DAQ, transducer calibrations, every
+                                    flowmeter wired, probe, uncertainties
+  run.yaml            the run    -- operator, gas, which flowmeter, confining
+                                    pressure, steady-state criteria, output
+  samples/
+    core-041.yaml     the rock   -- one file per core plug: id, lithology,
+    core-042.yaml                   geometry, porosity, provenance
+  runs/
+    core-041_20260803T142530Z/    readings.csv, run_metadata.yaml, run.log
 ```
 
 They are split because they change on completely different timescales: the rig
-on recalibration, the plug when one is loaded, the run on every pressure step.
-`gasperm init` writes all three, fully commented; `examples/` holds a generated
-set.
+on recalibration, the run on every pressure step, the plug whenever a new one is
+loaded.
+
+`gasperm init` writes **only** `hardware.yaml` and `run.yaml` — a sample
+describes one plug and a rig measures many, so plugs come from
+`gasperm new-sample` instead. `examples/` holds a generated set in exactly this
+layout.
 
 Every pressure-bearing field carries its **own** unit, drawn from
 `Pa, kPa, MPa, bar, psi, atm`. A rig whose transducers read kPa, an operator who
@@ -50,17 +62,26 @@ The rig is configured **once**. After that, a new plug is one file and a run is
 one command:
 
 ```bash
-gasperm init                                     # once per rig
-gasperm new-sample core-041                      # -> samples/core-041.yaml
-gasperm new-sample core-042 --from samples/core-041.yaml   # same core, new plug
+gasperm init tight-gas-rig                       # once per bench; creates the folder
+cd tight-gas-rig
+
+gasperm new-sample core-041 --dir samples        # -> samples/core-041.yaml
+gasperm new-sample --dir samples --from samples/core-041.yaml   # asks id, then this plug
 
 gasperm collect --sample samples/core-041.yaml --flowmeter low_range
 gasperm collect --sample samples/core-041.yaml --flowmeter high_range
 gasperm klinkenberg runs/core-041_* --plot
 ```
 
-`--from` copies the shared fields (lithology, formation, geometry as a starting
-point) but never the identity or the notes — those describe the previous plug.
+`init` prints the exact `new-sample` and `collect` lines for the folder you
+named, so the paths are never guesswork.
+
+`--from` carries over what describes the **core** — lithology, formation, well,
+depth, grain density, porosity method, who prepared it. It never carries the
+id, the geometry, or the per-plug porosity and bulk density: every plug is cut
+and measured individually, and inheriting another plug's length or diameter
+would put a wrong number straight into the Darcy equation. Those are always
+asked for.
 
 `klinkenberg` **refuses** runs from more than one plug unless you pass
 `--allow-mixed-samples`. With a directory full of runs from a dozen plugs, a

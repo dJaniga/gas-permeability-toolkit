@@ -48,7 +48,21 @@ def point(**overrides) -> MeasurementPoint:
 
 
 def config_with(**run_overrides) -> GaspermConfig:
+    """A config whose transducers match the ~1-3 atm ``point()`` below.
+
+    The pressure channels are pinned to 0-1000 kPa rather than inherited from
+    the shipped default: a percent-of-full-scale specification is meaningless
+    against a full scale the test's pressures never approach, and the component
+    rankings asserted here would then depend on the rig's default unit.
+    """
     config = GaspermConfig()
+    for channel in (
+        config.hardware.pressure_calibration.inlet,
+        config.hardware.pressure_calibration.outlet,
+    ):
+        channel.unit = "kPa"
+        channel.value_min = 0.0
+        channel.value_max = 1000.0
     for key, value in run_overrides.items():
         setattr(config.run, key, value)
     return config

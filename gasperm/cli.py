@@ -14,7 +14,6 @@ from gasperm import __version__, units
 from gasperm.config import (
     HARDWARE_FILENAME,
     RUN_FILENAME,
-    SAMPLE_FILENAME,
     ConfigError,
     GaspermConfig,
     config_to_dict,
@@ -28,14 +27,19 @@ from gasperm.config import (
 
 logger = logging.getLogger("gasperm")
 
+#: ``init`` describes the bench and the experiment. The sample file belongs to
+#: a core plug, so it is created per plug by ``new-sample``.
+INIT_SECTIONS: tuple[str, ...] = ("hardware", "run")
+
 app = typer.Typer(
     add_completion=False,
     help=(
         "Measure gas permeability of core samples on an NI USB-6421 rig.\n\n"
-        "Configuration is three files: hardware.yaml (the bench), sample.yaml (the "
-        "core plug) and run.yaml (the experiment).\n\n"
-        "Typical order: init once per rig, collect once per mean pressure, then "
-        "klinkenberg across those runs."
+        "Configuration is three files: hardware.yaml (the bench) and run.yaml (the "
+        "experiment), both from 'init'; plus one sample file per core plug, from "
+        "'new-sample'.\n\n"
+        "Typical order: init once per rig, new-sample per plug, collect once per "
+        "mean pressure, then klinkenberg across those runs."
     ),
 )
 
@@ -113,6 +117,50 @@ def _set_dotted(data: dict[str, Any], dotted_key: str, raw_value: str) -> None:
         raise ConfigError(f"--set {dotted_key}: could not parse {raw_value!r}: {exc}") from exc
 
 
+# Unit menus, taken from the canonical sets in units.py so a prompt can never
+# offer something the config would then reject.
+PRESSURE_UNITS = ", ".join(sorted(units.SUPPORTED_PRESSURE_UNITS))
+FLOW_UNITS = ", ".join(sorted(units.SUPPORTED_FLOW_UNITS))
+PERMEABILITY_UNITS = ", ".join(sorted(units.SUPPORTED_PERMEABILITY_UNITS))
+
+#: How many times a unit prompt re-asks before giving up and keeping the default.
+_UNIT_PROMPT_ATTEMPTS = 5
+
+
+def _prompt_unit(label: str, default: str, options: str, check) -> str:
+    """Prompt for a unit, listing the allowed values and re-asking on a typo.
+
+    Validating here rather than at the end of the interview matters: ``init``
+    asks a few dozen questions, and letting a mistyped unit surface only at
+    final validation would throw away every answer.
+    """
+    for _ in range(_UNIT_PROMPT_ATTEMPTS):
+        value = typer.prompt(f"{label} ({options})", default=default).strip()
+        try:
+            check(value)
+        except ValueError as exc:
+            typer.secho(f"      {exc}", fg=typer.colors.YELLOW)
+            continue
+        return value
+    typer.secho(
+        f"      Keeping the default {default!r}; edit the file afterwards if needed.",
+        fg=typer.colors.YELLOW,
+    )
+    return default
+
+
+def _prompt_pressure_unit(label: str, default: str) -> str:
+    """Prompt for one of the supported pressure units."""
+    return _prompt_unit(label, default, PRESSURE_UNITS, units.normalize_pressure_unit)
+
+
+def _prompt_flow_unit(label: str, default: str) -> str:
+    """Prompt for one of the supported volumetric flow units."""
+    return _prompt_unit(
+        label, default, FLOW_UNITS, lambda value: units.flow_to_cm3_s(1.0, value)
+    )
+
+
 def _apply_overrides(config: GaspermConfig, assignments: list[str]) -> GaspermConfig:
     data = config_to_dict(config)
     for assignment in assignments:
@@ -137,23 +185,22 @@ def _prompt_hardware(data: dict[str, Any], defaults: GaspermConfig) -> None:
     daq = hardware["daq"]
     daq["device_name"] = typer.prompt("    Device name (from NI MAX)", default=daq["device_name"])
     daq["inlet_pressure_channel"] = typer.prompt(
-        "    Inlet pressure channel (0-5 V)", default=daq["inlet_pressure_channel"]
+        "    Inlet pressure channel", default=daq["inlet_pressure_channel"]
     )
     daq["outlet_pressure_channel"] = typer.prompt(
-        "    Outlet pressure channel (0-5 V)", default=daq["outlet_pressure_channel"]
+        "    Outlet pressure channel", default=daq["outlet_pressure_channel"]
     )
     daq["sample_rate_hz"] = typer.prompt(
         "    Sample rate (Hz)", default=daq["sample_rate_hz"], type=float
     )
 
-    supported = ", ".join(sorted(units.SUPPORTED_PRESSURE_UNITS))
-    typer.secho(f"  Pressure transducers  (units: {supported})", bold=True)
+    typer.secho(f"  Pressure transducers  (units: {PRESSURE_UNITS})", bold=True)
     for side in ("inlet", "outlet"):
         section = hardware["pressure_calibration"][side]
         typer.secho(f"    {side}:", bold=True)
         section["volts_min"] = typer.prompt("      Volts at zero", default=section["volts_min"], type=float)
         section["volts_max"] = typer.prompt("      Volts at full scale", default=section["volts_max"], type=float)
-        section["unit"] = typer.prompt("      Pressure unit", default=section["unit"])
+        section["unit"] = _prompt_pressure_unit("      Pressure unit", section["unit"])
         section["value_min"] = typer.prompt(
             f"      Pressure at {section['volts_min']} V ({section['unit']})",
             default=section["value_min"], type=float,
@@ -174,7 +221,11 @@ def _prompt_hardware(data: dict[str, Any], defaults: GaspermConfig) -> None:
         default=hardware["pressure_calibration"]["correlation"], type=float,
     )
 
-    typer.secho("  Flowmeters  (define every meter wired; a run picks one)", bold=True)
+    typer.secho(
+        f"  Flowmeters  (define every meter wired; a run picks one)\n"
+        f"              (units: {FLOW_UNITS})",
+        bold=True,
+    )
     meters: dict[str, Any] = {}
     for name, flow in list(hardware["flowmeters"].items()):
         if not typer.confirm(f"    Is a '{name}' meter wired?", default=True):
@@ -190,7 +241,7 @@ def _prompt_hardware(data: dict[str, Any], defaults: GaspermConfig) -> None:
         flow["volts_max"] = typer.prompt(
             "      Volts at full scale", default=flow["volts_max"], type=float
         )
-        flow["unit"] = typer.prompt("      Flow unit", default=flow["unit"])
+        flow["unit"] = _prompt_flow_unit("      Flow unit", flow["unit"])
         flow["flow_min"] = typer.prompt(
             f"      Flow at {flow['volts_min']} V ({flow['unit']})",
             default=flow["flow_min"], type=float,
@@ -247,44 +298,96 @@ def _prompt_hardware(data: dict[str, Any], defaults: GaspermConfig) -> None:
     )
 
 
-def _prompt_sample(data: dict[str, Any]) -> None:
-    typer.secho("\n== sample.yaml : the core plug ==", fg=typer.colors.CYAN, bold=True)
-    sample = data["sample"]
-    sample["id"] = typer.prompt("  Sample id", default=sample["id"])
-    sample["description"] = typer.prompt("  Description", default="", show_default=False)
-    sample["lithology"] = typer.prompt("  Lithology", default="", show_default=False)
-    sample["formation"] = typer.prompt("  Formation", default="", show_default=False)
-    sample["well"] = typer.prompt("  Well", default="", show_default=False)
-    depth = typer.prompt("  Depth (blank to skip)", default="", show_default=False)
-    if depth.strip():
-        sample["depth"] = float(depth)
-        sample["depth_unit"] = typer.prompt("  Depth unit", default=sample["depth_unit"])
+#: Fields that describe the *core*, not the individual plug, so they are the
+#: ones ``--from`` may sensibly carry over to a sibling plug.
+SHARED_SAMPLE_FIELDS: tuple[str, ...] = (
+    "lithology",
+    "formation",
+    "well",
+    "depth",
+    "depth_unit",
+    "porosity_method",
+    "grain_density_g_cm3",
+    "prepared_by",
+)
 
-    typer.secho("  Geometry", bold=True)
-    sample["length_cm"] = typer.prompt("    Length (cm)", default=sample["length_cm"], type=float)
+
+def _optional_float(label: str) -> float | None:
+    """Prompt for a number that may be left blank, re-asking on a bad one.
+
+    ``typer.prompt(type=float)`` re-asks by itself, but it cannot express
+    "blank means unset". Doing it by hand means doing the retry by hand too --
+    otherwise one mistyped optional field aborts the whole interview.
+    """
+    for _ in range(_UNIT_PROMPT_ATTEMPTS):
+        answer = typer.prompt(label, default="", show_default=False).strip()
+        if not answer:
+            return None
+        try:
+            return float(answer)
+        except ValueError:
+            typer.secho(f"      {answer!r} is not a number.", fg=typer.colors.YELLOW)
+    typer.secho("      Leaving it unset.", fg=typer.colors.YELLOW)
+    return None
+
+
+def _prompt_sample(sample: dict[str, Any], *, inherited: bool = False) -> None:
+    """Ask for one core plug's details, in place.
+
+    ``inherited`` means the shared, core-level fields already came from a
+    template, so only the per-plug measurements are asked for. Geometry is
+    always asked: every plug is cut and measured individually, and silently
+    reusing another plug's length or diameter would put a wrong number straight
+    into the Darcy equation.
+    """
+    if not inherited:
+        typer.secho("  Core", bold=True)
+        sample["lithology"] = typer.prompt("    Lithology", default="", show_default=False)
+        sample["formation"] = typer.prompt("    Formation", default="", show_default=False)
+        sample["well"] = typer.prompt("    Well", default="", show_default=False)
+        depth = _optional_float("    Depth (blank to skip)")
+        if depth is not None:
+            sample["depth"] = depth
+            sample["depth_unit"] = typer.prompt(
+                "    Depth unit (m, ft)", default=sample["depth_unit"]
+            )
+        sample["prepared_by"] = typer.prompt("    Prepared by", default="", show_default=False)
+
+    typer.secho("  This plug", bold=True)
+    sample["description"] = typer.prompt("    Description", default="", show_default=False)
+
+    typer.secho("  Geometry (measured per plug)", bold=True)
+    sample["length_cm"] = typer.prompt(
+        "    Length (cm)", default=sample["length_cm"], type=float
+    )
     sample["length_uncertainty_cm"] = typer.prompt(
         "    Length uncertainty (cm)", default=sample["length_uncertainty_cm"], type=float
     )
-    sample["diameter_cm"] = typer.prompt("    Diameter (cm)", default=sample["diameter_cm"], type=float)
+    sample["diameter_cm"] = typer.prompt(
+        "    Diameter (cm)", default=sample["diameter_cm"], type=float
+    )
     sample["diameter_uncertainty_cm"] = typer.prompt(
         "    Diameter uncertainty (cm, counts double in the budget)",
         default=sample["diameter_uncertainty_cm"], type=float,
     )
 
-    typer.secho("  Petrophysics (optional)", bold=True)
-    porosity = typer.prompt("    Porosity fraction (blank to skip)", default="", show_default=False)
-    if porosity.strip():
-        sample["porosity_fraction"] = float(porosity)
-        sample["porosity_method"] = typer.prompt(
-            "    Porosity method", default="", show_default=False
-        )
-    grain = typer.prompt("    Grain density (g/cm3, blank to skip)", default="", show_default=False)
-    if grain.strip():
-        sample["grain_density_g_cm3"] = float(grain)
-    bulk = typer.prompt("    Bulk density (g/cm3, blank to skip)", default="", show_default=False)
-    if bulk.strip():
-        sample["bulk_density_g_cm3"] = float(bulk)
-    sample["prepared_by"] = typer.prompt("  Prepared by", default="", show_default=False)
+    typer.secho("  Petrophysics (optional, per plug)", bold=True)
+    porosity = _optional_float("    Porosity fraction (blank to skip)")
+    if porosity is not None:
+        sample["porosity_fraction"] = porosity
+        if not inherited or not sample.get("porosity_method"):
+            sample["porosity_method"] = typer.prompt(
+                "    Porosity method", default=sample.get("porosity_method") or "",
+                show_default=False,
+            )
+    if not inherited:
+        grain = _optional_float("    Grain density (g/cm3, blank to skip)")
+        if grain is not None:
+            sample["grain_density_g_cm3"] = grain
+    bulk = _optional_float("    Bulk density (g/cm3, blank to skip)")
+    if bulk is not None:
+        sample["bulk_density_g_cm3"] = bulk
+    sample["notes"] = typer.prompt("    Notes", default="", show_default=False)
 
 
 def _prompt_run(data: dict[str, Any]) -> None:
@@ -311,9 +414,9 @@ def _prompt_run(data: dict[str, Any]) -> None:
         default=run["gas"]["viscosity_relative_uncertainty"], type=float,
     )
 
-    typer.secho("  Conditions", bold=True)
-    run["confining_pressure_unit"] = typer.prompt(
-        "    Confining pressure unit", default=run["confining_pressure_unit"]
+    typer.secho(f"  Conditions  (pressure units: {PRESSURE_UNITS})", bold=True)
+    run["confining_pressure_unit"] = _prompt_pressure_unit(
+        "    Confining pressure unit", run["confining_pressure_unit"]
     )
     confining = typer.prompt(
         f"    Confining pressure ({run['confining_pressure_unit']}, blank to skip)",
@@ -323,8 +426,8 @@ def _prompt_run(data: dict[str, Any]) -> None:
         run["confining_pressure"] = float(confining)
     # P1 and P2 both come from the DAQ; the ambient value is only the
     # gauge-to-absolute reference (and the flowmeter's, when it sits at ambient).
-    run["atmospheric_pressure_unit"] = typer.prompt(
-        "    Ambient pressure unit", default=run["atmospheric_pressure_unit"]
+    run["atmospheric_pressure_unit"] = _prompt_pressure_unit(
+        "    Ambient pressure unit", run["atmospheric_pressure_unit"]
     )
     run["atmospheric_pressure"] = typer.prompt(
         f"    Ambient pressure, for gauge->absolute "
@@ -351,14 +454,19 @@ def _prompt_run(data: dict[str, Any]) -> None:
         default=steady["settling_time_s"], type=float,
     )
 
-    typer.secho("  Output", bold=True)
+    typer.secho("  Output  (display only -- never affects the calculation)", bold=True)
     run["output_dir"] = typer.prompt("    Output directory", default=run["output_dir"])
-    run["display_pressure_unit"] = typer.prompt(
-        "    Display pressure unit", default=run["display_pressure_unit"]
+    run["display_pressure_unit"] = _prompt_pressure_unit(
+        "    Display pressure unit", run["display_pressure_unit"]
     )
-    run["display_permeability_unit"] = typer.prompt(
-        "    Display permeability unit (mD/D/uD/um2/m2)",
-        default=run["display_permeability_unit"],
+    run["display_flow_unit"] = _prompt_flow_unit(
+        "    Display flow unit", run["display_flow_unit"]
+    )
+    run["display_permeability_unit"] = _prompt_unit(
+        "    Display permeability unit",
+        run["display_permeability_unit"],
+        PERMEABILITY_UNITS,
+        lambda value: units.darcy_to(1.0, value),
     )
     run["uncertainty"]["coverage_probability"] = typer.prompt(
         "    Uncertainty coverage probability",
@@ -366,10 +474,29 @@ def _prompt_run(data: dict[str, Any]) -> None:
     )
 
 
+def _default_output_dir(directory: Path) -> str:
+    """Where runs should go for a rig configured in ``directory``.
+
+    Inside the rig's own folder, so a bench's configuration, its plugs and its
+    measurements stay together instead of scattering into whatever directory
+    ``collect`` happened to be invoked from.
+    """
+    output = directory / "runs"
+    text = output.as_posix()
+    # Only mark a relative path as relative. A Windows absolute path starts
+    # with a drive letter, not a slash, so testing the string would turn
+    # "C:/rig/runs" into "./C:/rig/runs".
+    if output.is_absolute() or text.startswith("."):
+        return text
+    return f"./{text}"
+
+
 @app.command("init")
 def init_command(
     directory: Path = typer.Argument(
-        Path("."), help="Directory to write the three config files into."
+        ...,
+        metavar="FOLDER",
+        help="Folder to create for this rig. The config files are written inside it.",
     ),
     non_interactive: bool = typer.Option(
         False, "--non-interactive", "-n",
@@ -388,7 +515,12 @@ def init_command(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Create hardware.yaml, sample.yaml and run.yaml.
+    """Create a folder for one rig, holding hardware.yaml and run.yaml.
+
+    FOLDER is created if it does not exist, along with a ``samples/``
+    subdirectory for the core plugs. Deliberately writes no sample file: that
+    describes one plug, and a rig measures many. Add plugs with
+    ``gasperm new-sample``.
 
     Interactive by default, prompting with the shipped NI USB-6421 defaults.
     ``--non-interactive`` plus ``--set`` covers scripted setup.
@@ -397,10 +529,12 @@ def init_command(
 
     defaults = GaspermConfig()
     data = config_to_dict(defaults)
+    # Offer the rig's own runs/ as the default output, so the prompt shows it
+    # and --set can still override it.
+    data["run"]["output_dir"] = _default_output_dir(directory)
     if not non_interactive:
         try:
             _prompt_hardware(data, defaults)
-            _prompt_sample(data)
             _prompt_run(data)
         except (ValueError, TypeError) as exc:
             _fail(f"Could not read that answer: {exc}")
@@ -420,7 +554,6 @@ def init_command(
     if print_only:
         for name, text in (
             (HARDWARE_FILENAME, render_hardware_yaml(config)),
-            (SAMPLE_FILENAME, render_sample_yaml(config)),
             (RUN_FILENAME, render_run_yaml(config)),
         ):
             typer.secho(f"\n# ===== {name} =====", fg=typer.colors.CYAN, bold=True)
@@ -428,37 +561,57 @@ def init_command(
         return
 
     try:
-        paths = save_config(config, directory, overwrite=force)
+        paths = save_config(config, directory, overwrite=force, sections=INIT_SECTIONS)
     except ConfigError as exc:
         _fail(str(exc))
         return
 
-    typer.secho("Wrote:", fg=typer.colors.GREEN)
-    for path in paths.as_tuple():
-        typer.secho(f"  {path}", fg=typer.colors.GREEN)
+    # A home for the plugs, created up front so the intended layout is visible
+    # rather than implied by the documentation.
+    samples_dir = directory / "samples"
+    try:
+        samples_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.secho(f"warning: could not create {samples_dir}: {exc}", fg=typer.colors.YELLOW)
+
+    typer.secho(f"Created {directory}/", fg=typer.colors.GREEN)
+    for path in (paths.hardware, paths.run):
+        typer.secho(f"  {path.name}", fg=typer.colors.GREEN)
+    typer.secho("  samples/        (core plugs go here)", fg=typer.colors.GREEN)
+    typer.secho(f"  runs go to {config.run.output_dir}", fg=typer.colors.BRIGHT_BLACK)
 
     # Environment checks are advisory at init time: a rig is often configured
-    # before it is fully wired up.
+    # before it is fully wired up. Either way the next steps still apply, so
+    # they are printed regardless -- an unwired rig is exactly when knowing
+    # what comes next is most useful.
     try:
-        warnings = validate_for_collect(config)
+        for warning in validate_for_collect(config):
+            typer.secho(f"note: {warning}", fg=typer.colors.YELLOW)
     except ConfigError as exc:
         typer.secho("\nNot ready for a collect run yet:\n" + str(exc), fg=typer.colors.YELLOW)
-    else:
-        for warning in warnings:
-            typer.secho(f"note: {warning}", fg=typer.colors.YELLOW)
-        location = "" if directory == Path(".") else f" --config-dir {directory}"
-        typer.echo(f"\nNext: gasperm collect{location}")
+
+    samples = samples_dir.as_posix()
+    location = "" if directory == Path(".") else f" --config-dir {directory}"
+    typer.echo("\nNext, add a core plug and measure it:")
+    typer.echo(f"  gasperm new-sample <id> --dir {samples}")
+    typer.echo(f"  gasperm collect{location} --sample {samples}/<id>.yaml")
 
 
 @app.command("new-sample")
 def new_sample_command(
-    sample_id: str = typer.Argument(..., help="Id of the new core plug, e.g. core-042."),
+    sample_id: Optional[str] = typer.Argument(
+        None, help="Id of the new core plug, e.g. core-042. Asked for if omitted."
+    ),
     directory: Path = typer.Option(
         Path("samples"), "--dir", "-d", help="Where to write the sample file."
     ),
     template: Optional[Path] = typer.Option(
         None, "--from",
-        help="Copy defaults from an existing sample file (same core, new plug).",
+        help=(
+            "Carry the core-level fields over from an existing sample file "
+            "(lithology, formation, well, depth, grain density). Geometry and the "
+            "per-plug measurements are always asked for."
+        ),
     ),
     non_interactive: bool = typer.Option(
         False, "--non-interactive", "-n", help="Skip the prompts. Combine with --set."
@@ -482,6 +635,17 @@ def new_sample_command(
 
     _configure_logging(verbose)
 
+    if sample_id is None:
+        if non_interactive:
+            _fail("No sample id given. Pass one as an argument, e.g. 'gasperm new-sample core-042'.")
+            return
+        sample_id = typer.prompt("Sample id").strip()
+    sample_id = sample_id.strip()
+    if not sample_id:
+        _fail("The sample id must not be blank.")
+        return
+
+    inherited: tuple[str, ...] = ()
     if template is not None:
         try:
             raw = _yaml.safe_load(Path(template).read_text(encoding="utf-8"))
@@ -491,21 +655,33 @@ def new_sample_command(
         if isinstance(raw, dict) and set(raw) == {"sample"}:
             raw = raw["sample"]
         try:
-            sample = SampleConfig.model_validate(raw)
+            source = SampleConfig.model_validate(raw)
         except Exception as exc:  # noqa: BLE001
             _fail(f"{template} is not a valid sample file:\n  {exc}")
             return
-        # The new plug is a different rock: keep the geometry and method as a
-        # starting point, but never inherit the identity.
-        sample = sample.model_copy(update={"id": sample_id, "notes": ""})
+
+        # Carry over what describes the *core*. Everything else -- the id, the
+        # geometry, the per-plug densities and porosity -- is measured on this
+        # plug, and inheriting it would put another plug's numbers straight into
+        # the Darcy equation.
+        carried = source.model_dump(mode="json", include=set(SHARED_SAMPLE_FIELDS))
+        sample = SampleConfig(id=sample_id, **carried)
+        inherited = tuple(
+            name for name in SHARED_SAMPLE_FIELDS if carried.get(name) not in (None, "")
+        )
     else:
         sample = SampleConfig(id=sample_id)
 
     data = sample.model_dump(mode="json")
     if not non_interactive:
         typer.secho(f"\n== new sample: {sample_id} ==", fg=typer.colors.CYAN, bold=True)
+        if inherited:
+            typer.secho(
+                f"  inherited from {Path(template).name}: {', '.join(inherited)}",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
         try:
-            _prompt_sample({"sample": data})
+            _prompt_sample(data, inherited=bool(template))
         except (ValueError, TypeError) as exc:
             _fail(f"Could not read that answer: {exc}")
             return

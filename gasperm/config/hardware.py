@@ -70,9 +70,27 @@ class DaqConfig(_Base):
 
 
 class PressureChannelConfig(LinearCalibration):
-    """Calibration for one pressure transducer, with its own independent unit."""
+    """Calibration for one pressure transducer, with its own independent unit.
 
-    unit: PressureUnit = "kPa"
+    The shipped default is the rig's transducer: 0-5 V spanning 0-68.95 MPa,
+    i.e. a nominal 10 000 psi unit. (10 000 psi is 68.9476 MPa exactly; the
+    rounded figure is the nameplate range, so replace it with the calibration
+    certificate's actual span before it matters.)
+
+    Note what that range implies for the uncertainty budget. A
+    percent-of-full-scale specification does not shrink with the reading: at
+    0.25 % FS the limit is 0.172 MPa, so the standard uncertainty is
+    0.172/sqrt(3) = 0.0995 MPa, or 0.98 atm, *whatever pressure is applied*.
+    That is fine at MPa-scale pore pressure and hopeless near ambient --
+    around 5 MPa inlet it contributes ~4 % to the permeability, and at 0.3 MPa
+    it swamps everything else. ``collect`` ranks the budget by contribution, so
+    this shows up explicitly rather than hiding in a confident-looking number.
+    """
+
+    #: Pressure at ``volts_min`` / ``volts_max``, in :attr:`unit`.
+    value_min: float = 0.0
+    value_max: float = 68.95
+    unit: PressureUnit = "MPa"
     #: Whether the transducer reads absolute or gauge pressure. The Darcy
     #: equation needs **absolute** P1/P2, so gauge readings get the configured
     #: atmospheric pressure added -- explicitly, at the calibration boundary.

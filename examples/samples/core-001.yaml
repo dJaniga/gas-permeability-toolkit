@@ -1,0 +1,34 @@
+# gasperm -- SAMPLE configuration (the core plug)
+#
+# Change this file when a new plug is loaded. Confining pressure and working
+# gas are NOT here: the same plug is routinely measured at several of each,
+# so they belong to run.yaml.
+#
+# Only length_cm and diameter_cm enter the Darcy calculation. Everything else
+# is provenance, carried into every run so a number stays traceable to a rock.
+
+id: core-001
+description: ''
+lithology: ''
+formation: ''
+well: ''
+depth: null
+depth_unit: m                                 # m | ft
+
+# Geometry. Area goes as diameter^2, so the diameter uncertainty enters
+# the uncertainty budget doubled -- it is usually the largest single term.
+length_cm: 5.0
+diameter_cm: 2.54
+length_uncertainty_cm: 0.01                   # standard uncertainty, cm (caliper)
+diameter_uncertainty_cm: 0.01                 # standard uncertainty, cm -- counts double
+
+# Petrophysics. Informational; not used by the Darcy calc.
+porosity_fraction: null
+porosity_method: ''                           # helium pycnometry, MICP, image analysis, ...
+grain_density_g_cm3: null
+bulk_density_g_cm3: null
+
+# Provenance.
+prepared_by: ''
+prepared_on: null                             # YYYY-MM-DD
+notes: ''

@@ -1,0 +1,138 @@
+# gasperm -- HARDWARE configuration (the bench)
+#
+# NI USB-6421 DAQ for pressures and flow, plus an Arduino temperature probe
+# on USB serial. Change this file when the rig is rewired or recalibrated.
+# The core plug lives in sample.yaml; the experiment lives in run.yaml.
+#
+# Supported pressure units: MPa, Pa, atm, bar, kPa, psi
+# Each pressure-bearing field carries its OWN unit. All internal physics
+# runs in CGS-Darcy (atm, cm, cP, cm3/s) regardless of what you set here.
+
+rig_name: gas-permeameter
+description: ''
+daq:
+  device_name: Dev1                           # NI-DAQmx device name, from NI MAX
+  inlet_pressure_channel: ai0                 # 0-5 V transducer
+  outlet_pressure_channel: ai1                # 0-5 V transducer
+  sample_rate_hz: 10.0
+  terminal_config: DIFF                       # DEFAULT | RSE | NRSE | DIFF | PSEUDO_DIFF
+
+# Each channel is added to the DAQ task with its own min_val/max_val, so
+# the 0-5 V transducers and the 0-10 V flowmeter never share a range.
+pressure_calibration:
+  inlet:
+    volts_min: 0.0
+    volts_max: 5.0
+    value_min: 0.0                            # pressure at volts_min
+    value_max: 68.95                          # pressure at volts_max
+    unit: MPa
+    reading_type: absolute                    # absolute | gauge
+    # Type B uncertainty (GUM 4.3). 'a' is the specification limit; the
+    # standard uncertainty is a/sqrt(3) for a rectangular distribution.
+    uncertainty:
+      kind: percent_full_scale                # percent_full_scale | percent_reading | absolute | none
+      value: 0.25
+      distribution: rectangular               # rectangular | triangular | normal
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: transducer datasheet
+  outlet:
+    volts_min: 0.0
+    volts_max: 5.0
+    value_min: 0.0
+    value_max: 68.95
+    unit: MPa                                 # independent of inlet: may be 'bar' here
+    reading_type: absolute                    # gauge adds run.atmospheric_pressure
+    uncertainty:
+      kind: percent_full_scale
+      value: 0.25
+      distribution: rectangular
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: transducer datasheet
+  # Covariance between the two pressure channels. Same transducer model
+  # calibrated against the same reference => correlated systematic error.
+  # P1 and P2 enter the Darcy equation with opposite signs, so a positive
+  # correlation REDUCES the combined uncertainty.
+  correlation: 0.0
+
+# Every meter wired to the rig, by name. A run selects ONE by name in
+# run.yaml; the others' analog inputs are never added to the DAQ task.
+# Define them once here -- swapping meters between pressure steps is an
+# experiment decision, not a change to the bench.
+flowmeters:
+  low_range:
+    volts_min: 0.0
+    volts_max: 10.0                           # 0-10 V, unlike the pressure channels
+    flow_min: 0.0
+    flow_max: 500.0                           # full-scale flow, for THIS meter
+    channel: ai2                              # its own analog input (ai2, ai3, ...)
+    description: ''
+    unit: sccm
+    # What state this meter's reported volume refers to -- the single most
+    # common source of a silently wrong permeability on this kind of rig.
+    #   standard -> mass-based meter, referenced to the standard state below
+    #   actual   -> volume at line conditions, paired with actual_pressure_source
+    reading_basis: standard                   # standard | actual -- see below
+    standard_temperature_c: 0.0
+    standard_pressure: 101.325
+    standard_pressure_unit: kPa
+    actual_pressure_source: outlet            # only used when reading_basis == actual
+    uncertainty:
+      kind: percent_reading                   # flowmeters are usually spec'd % of reading
+      value: 1.0
+      distribution: rectangular
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: mass flowmeter datasheet
+  high_range:
+    volts_min: 0.0
+    volts_max: 10.0                           # 0-10 V, unlike the pressure channels
+    flow_min: 0.0
+    flow_max: 5000.0                          # full-scale flow, for THIS meter
+    channel: ai3                              # its own analog input (ai2, ai3, ...)
+    description: ''
+    unit: sccm
+    # What state this meter's reported volume refers to -- the single most
+    # common source of a silently wrong permeability on this kind of rig.
+    #   standard -> mass-based meter, referenced to the standard state below
+    #   actual   -> volume at line conditions, paired with actual_pressure_source
+    reading_basis: standard                   # standard | actual -- see below
+    standard_temperature_c: 0.0
+    standard_pressure: 101.325
+    standard_pressure_unit: kPa
+    actual_pressure_source: outlet            # only used when reading_basis == actual
+    uncertainty:
+      kind: percent_reading                   # flowmeters are usually spec'd % of reading
+      value: 1.0
+      distribution: rectangular
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: mass flowmeter datasheet
+default_flowmeter: low_range                  # used when run.yaml leaves 'flowmeter' null
+
+# Separate device from the DAQ; a dropout degrades the run, never aborts it.
+temperature:
+  port: COM4
+  baud_rate: 9600
+  parse_pattern: T:{value}                    # '{value}' marks the number; null = first float
+  timeout_s: 2.0
+  units: C                                    # C | K | F
+  required: true                              # refuse to start collect if the port will not open
+  fallback_temperature_c: 20.0
+  stale_after_s: 10.0
+  uncertainty:
+    kind: absolute
+    value: 0.5                                # degC
+    distribution: rectangular
+    coverage_factor: 2.0
+    degrees_of_freedom: null
+    source: probe datasheet, degC
+
+# Rig-level terms that belong to no single channel.
+uncertainty:
+  daq_relative: 0.0002                        # relative, dimensionless
+  repeatability_relative: 0.0                 # bench repeatability not otherwise captured
+  notes: ''
+calibrated_by: ''
+calibrated_on: ''

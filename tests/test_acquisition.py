@@ -39,6 +39,22 @@ def sample(temperature_c: float | None = 22.0, *, stale: bool = False) -> Temper
     return TemperatureSample(temperature_c, 0.0, None, stale)
 
 
+def in_kpa(config: GaspermConfig) -> GaspermConfig:
+    """Pin both transducers to 0-1000 kPa.
+
+    The hand calculations below are worked in kPa, so they must not depend on
+    whichever unit the rig happens to ship as its default.
+    """
+    for channel in (
+        config.hardware.pressure_calibration.inlet,
+        config.hardware.pressure_calibration.outlet,
+    ):
+        channel.unit = "kPa"
+        channel.value_min = 0.0
+        channel.value_max = 1000.0
+    return config
+
+
 class FakeClock:
     """Monotonic clock advancing a fixed step per call."""
 
@@ -102,7 +118,7 @@ class TestRollingWindow:
 
 class TestSampleProcessor:
     def test_matches_a_hand_calculation_through_every_conversion(self, base_config):
-        processor = make_processor(base_config, viscosity_cp=0.0178)
+        processor = make_processor(in_kpa(base_config), viscosity_cp=0.0178)
         reading = processor.process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
@@ -126,6 +142,7 @@ class TestSampleProcessor:
 
     def test_p2_always_comes_from_the_outlet_transducer(self, base_config):
         """P2 is measured on ai1; configuration never substitutes for it."""
+        base_config = in_kpa(base_config)
         reading = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
@@ -218,7 +235,9 @@ class TestRealGasCorrection:
         from gasperm.gas_properties import CoolPropProvider
 
         base_config.run.gas.real_gas_correction = True
-        processor = SampleProcessor(base_config, CoolPropProvider("CarbonDioxide"))
+        # Pin to kPa so the mean pore pressure stays near ambient, where CO2's
+        # departure from ideality is the few tenths of a percent asserted below.
+        processor = SampleProcessor(in_kpa(base_config), CoolPropProvider("CarbonDioxide"))
         reading = processor.process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )

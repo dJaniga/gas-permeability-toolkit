@@ -1,0 +1,89 @@
+# gasperm -- RUN configuration (the experiment)
+#
+# The file that changes most often: a new pressure step, a different gas, a
+# different operator. The rig is in hardware.yaml; the plug is in sample.yaml.
+#
+# Supported pressure units: MPa, Pa, atm, bar, kPa, psi
+
+# Who ran it. Copied into every run's metadata for traceability.
+operator: ''
+institution: ''
+project: ''
+experiment_id: ''
+notes: ''
+
+# Working gas and where its properties come from.
+gas:
+  name: Nitrogen                              # any CoolProp fluid: Air, CarbonDioxide, Methane, ...
+  properties_source: coolprop                 # coolprop (recommended) | fixed
+  fixed_viscosity_cp: null                    # only when properties_source == fixed
+  fixed_reason: ''
+  viscosity_relative_uncertainty: 0.01        # relative, for the GUM budget
+  real_gas_correction: false                  # divide reference flow by Z
+
+# Which meter from hardware.yaml this run uses. Defined meters:
+#   high_range, low_range
+# null takes hardware.default_flowmeter. Only this meter's analog input
+# is read; the others are never added to the DAQ task.
+flowmeter: null                               # one of: high_range, low_range (null = rig default)
+
+# Confining/overburden pressure for this run. Usually MPa-scale while
+# pore pressure is kPa-scale, hence its own independent unit.
+confining_pressure: null
+confining_pressure_unit: MPa
+
+# Ambient reference. P1 and P2 are both measured on the DAQ, so this is
+# not a substitute for either -- it converts GAUGE transducer readings to
+# the absolute pressures the Darcy equation needs, and serves as the
+# flowmeter reference when actual_pressure_source is 'atmospheric'.
+atmospheric_pressure: 101.325
+atmospheric_pressure_unit: kPa
+atmospheric_pressure_uncertainty:
+  kind: absolute
+  value: 0.1
+  distribution: rectangular
+  coverage_factor: 2.0
+  degrees_of_freedom: null
+  source: local barometric reading
+
+# Permeability is only representative once the rig has equilibrated, so
+# the reported result is taken from the detected steady-state window.
+# Two criteria must hold on every listed signal, over consecutive windows:
+#   scatter -- coefficient of variation <= relative_stddev_tolerance
+#   drift   -- fractional change of an OLS line across the window
+#              <= relative_drift_tolerance
+# The drift test is the important one: a slow ramp has small scatter in
+# any short window and would pass a scatter-only test forever.
+steady_state:
+  enabled: true
+  window_s: 30.0                              # trailing window each test runs over
+  required_windows: 3                         # consecutive passes before declaring steady
+  min_samples: 10
+  settling_time_s: 0.0                        # ignore this much of the run start outright
+  relative_stddev_tolerance: 0.02
+  relative_drift_tolerance: 0.01
+  slope_significance: null                    # null = use the drift bound alone
+  signals: [permeability, inlet_pressure, flow]
+  max_wait_s: null                            # null = wait indefinitely
+
+# ISO/IEC Guide 98-3 (GUM) evaluation. Type A comes from the scatter of
+# the steady-state window; Type B from the specs in hardware.yaml and
+# the caliper figures in sample.yaml.
+uncertainty:
+  enabled: true
+  coverage_probability: 0.95                  # 0.95 -> k ~ 2 for large dof
+  include_type_a: true
+  fixed_coverage_factor: null                 # null = derive from Student-t
+averaging_window_s: 5.0                       # live display only; the result uses the steady window
+
+# Output.
+output_dir: ./runs
+display_pressure_unit: kPa                    # console/plot only
+display_permeability_unit: mD                 # mD | D | uD | um2 | m2
+display_flow_unit: sccm
+
+# Stop conditions.
+duration_s: null                              # null = run until Ctrl+C
+max_samples: null
+stop_when_steady: false                       # end the run once steady state is confirmed
+flush_every_n: 20
