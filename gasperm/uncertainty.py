@@ -70,7 +70,7 @@ class MeasurementPoint:
 
     permeability_darcy: float
     inlet_pressure_atm: float
-    downstream_pressure_atm: float
+    outlet_pressure_atm: float
     flow_cm3_s: float
     reference_pressure_atm: float
     viscosity_cp: float
@@ -78,7 +78,7 @@ class MeasurementPoint:
 
 
 def pressure_sensitivities(
-    inlet_pressure_atm: float, downstream_pressure_atm: float
+    inlet_pressure_atm: float, outlet_pressure_atm: float
 ) -> tuple[float, float]:
     """Relative sensitivity coefficients of ``k`` to P1 and P2.
 
@@ -89,15 +89,15 @@ def pressure_sensitivities(
     Raises:
         ValueError: the pressures are equal, so ``k`` is not defined.
     """
-    denominator = inlet_pressure_atm**2 - downstream_pressure_atm**2
+    denominator = inlet_pressure_atm**2 - outlet_pressure_atm**2
     if denominator == 0.0:
         raise ValueError(
-            "inlet and downstream pressures are equal, so the sensitivity "
-            "coefficients are undefined"
+            "inlet and outlet pressures are equal, so the sensitivity coefficients "
+            "are undefined"
         )
     return (
         -2.0 * inlet_pressure_atm**2 / denominator,
-        2.0 * downstream_pressure_atm**2 / denominator,
+        2.0 * outlet_pressure_atm**2 / denominator,
     )
 
 
@@ -125,25 +125,37 @@ def coverage_factor(effective_dof: float, coverage_probability: float) -> float:
 def _pressure_relative_uncertainty(
     channel: PressureChannelConfig,
     absolute_pressure_atm: float,
-    atmospheric_pressure_atm: float,
+    run: RunConfig,
     daq_relative: float,
 ) -> tuple[float, float]:
     """``(u_rel, dof)`` for one pressure channel at the given absolute pressure.
 
     The specification applies to what the *transducer* reads. For a gauge
-    channel that is the gauge value, so the uncertainty of the absolute
-    pressure equals the uncertainty of the gauge reading -- but the relative
-    uncertainty is taken against the absolute pressure, which is what enters
-    the equation.
+    channel that is the gauge value, and the absolute pressure the equation
+    needs is that reading plus the ambient reference -- so the ambient value's
+    own uncertainty joins in quadrature. (If both channels are gauge they share
+    that ambient error; express the resulting correlation through
+    ``pressure_calibration.correlation``.) The relative uncertainty is taken
+    against the absolute pressure, which is what enters the equation.
     """
     reading_atm = absolute_pressure_atm
     if channel.reading_type == "gauge":
-        reading_atm = absolute_pressure_atm - atmospheric_pressure_atm
+        reading_atm = absolute_pressure_atm - run.atmospheric_pressure_atm
     reading_in_unit = units.from_atm(reading_atm, channel.unit)
 
     u_in_unit = channel.uncertainty.standard_uncertainty(reading_in_unit, channel.full_scale)
     # Pressure units are pure scalings, so a difference converts like a value.
     u_atm = units.to_atm(u_in_unit, channel.unit)
+
+    if channel.reading_type == "gauge":
+        ambient_spec = run.atmospheric_pressure_uncertainty
+        u_ambient_atm = units.to_atm(
+            ambient_spec.standard_uncertainty(
+                run.atmospheric_pressure, abs(run.atmospheric_pressure)
+            ),
+            run.atmospheric_pressure_unit,
+        )
+        u_atm = math.hypot(u_atm, u_ambient_atm)
 
     if absolute_pressure_atm == 0.0:
         return math.inf, channel.uncertainty.dof
@@ -213,12 +225,11 @@ def build_budget(
     notes: list[str] = []
     components: list[UncertaintyComponent] = []
 
-    atmospheric_atm = run.atmospheric_pressure_atm
     daq_relative = hardware.uncertainty.daq_relative
     calibration = hardware.pressure_calibration
 
     c_p1, c_p2 = pressure_sensitivities(
-        point.inlet_pressure_atm, point.downstream_pressure_atm
+        point.inlet_pressure_atm, point.outlet_pressure_atm
     )
 
     # -- flow rate --------------------------------------------------------
@@ -245,7 +256,7 @@ def build_budget(
 
     # -- inlet pressure ---------------------------------------------------
     u_p1_rel, p1_dof = _pressure_relative_uncertainty(
-        calibration.inlet, point.inlet_pressure_atm, atmospheric_atm, daq_relative
+        calibration.inlet, point.inlet_pressure_atm, run, daq_relative
     )
     components.append(
         _component(
@@ -261,39 +272,21 @@ def build_budget(
         )
     )
 
-    # -- downstream pressure ----------------------------------------------
-    if run.outlet_pressure_reference == "measured":
-        u_p2_rel, p2_dof = _pressure_relative_uncertainty(
-            calibration.outlet, point.downstream_pressure_atm, atmospheric_atm, daq_relative
-        )
-        p2_source = calibration.outlet.uncertainty.source or "outlet transducer"
-        p2_correlated = True
-    else:
-        spec = run.atmospheric_pressure_uncertainty
-        u_in_unit = spec.standard_uncertainty(
-            run.atmospheric_pressure, abs(run.atmospheric_pressure)
-        )
-        u_atm = units.to_atm(u_in_unit, run.atmospheric_pressure_unit)
-        u_p2_rel = u_atm / abs(point.downstream_pressure_atm)
-        p2_dof = spec.dof
-        p2_source = spec.source or "configured downstream reference"
-        p2_correlated = False
-        notes.append(
-            "P2 came from the configured downstream reference rather than the outlet "
-            "transducer, so its uncertainty is that of the reference value and it is "
-            "treated as independent of P1."
-        )
+    # -- outlet pressure --------------------------------------------------
+    u_p2_rel, p2_dof = _pressure_relative_uncertainty(
+        calibration.outlet, point.outlet_pressure_atm, run, daq_relative
+    )
     components.append(
         _component(
-            name="downstream pressure",
+            name="outlet pressure",
             symbol="P2",
             evaluation_type="B",
-            value=point.downstream_pressure_atm,
+            value=point.outlet_pressure_atm,
             unit="atm",
             relative_uncertainty=u_p2_rel,
             sensitivity=c_p2,
             dof=p2_dof,
-            source=p2_source,
+            source=calibration.outlet.uncertainty.source or "outlet transducer",
         )
     )
 
@@ -311,7 +304,7 @@ def build_budget(
             else calibration.outlet
         )
         u_ref_rel, ref_dof = _pressure_relative_uncertainty(
-            source_channel, point.reference_pressure_atm, atmospheric_atm, daq_relative
+            source_channel, point.reference_pressure_atm, run, daq_relative
         )
         components.append(
             _component(
@@ -431,7 +424,7 @@ def build_budget(
     variance = sum(component.variance_share for component in components)
 
     correlation_variance = 0.0
-    if p2_correlated and calibration.correlation != 0.0:
+    if calibration.correlation != 0.0:
         correlation_variance = (
             2.0 * c_p1 * c_p2 * calibration.correlation * u_p1_rel * u_p2_rel
         )

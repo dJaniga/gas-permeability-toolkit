@@ -37,7 +37,7 @@ def point(**overrides) -> MeasurementPoint:
     base = dict(
         permeability_darcy=0.005,
         inlet_pressure_atm=3.0,
-        downstream_pressure_atm=1.0,
+        outlet_pressure_atm=1.0,
         flow_cm3_s=1.6667,
         reference_pressure_atm=1.0,
         viscosity_cp=0.0178,
@@ -141,7 +141,7 @@ class TestCoverageFactor:
 
 class TestBudget:
     def test_relative_sensitivities_are_the_exponents(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         by_symbol = {c.symbol: c for c in budget.components}
         assert by_symbol["Q"].relative_sensitivity == pytest.approx(1.0)
@@ -152,7 +152,7 @@ class TestBudget:
         assert by_symbol["P2"].relative_sensitivity == pytest.approx(0.25)
 
     def test_combined_is_the_quadrature_sum_of_contributions(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         expected = math.sqrt(sum(c.variance_share for c in budget.components))
         assert budget.relative_combined_standard_uncertainty == pytest.approx(expected)
@@ -179,7 +179,7 @@ class TestBudget:
 
     def test_a_narrow_differential_inflates_the_budget(self):
         """The quantitative version of 'do not measure at a small dP'."""
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         wide = build_budget(
             point(inlet_pressure_atm=5.0), geometry(), config.hardware, config.run
         )
@@ -257,7 +257,7 @@ class TestBudget:
         )
 
     def test_gauge_transducers_use_the_gauge_reading_for_percent_of_reading(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         config.hardware.pressure_calibration.inlet.reading_type = "gauge"
         config.hardware.pressure_calibration.inlet.uncertainty = UncertaintySpec(
             kind="percent_reading", value=1.0
@@ -266,13 +266,33 @@ class TestBudget:
         inlet = next(c for c in budget.components if c.symbol == "P1")
         # The spec applies to what the transducer reads, i.e. the gauge value
         # 3 - 1 = 2 atm. 1% of that is a half-width of 0.02 atm; rectangular so
-        # u = 0.02/sqrt(3); relative to the 3 atm ABSOLUTE pressure that enters
-        # the equation; then the DAQ term in quadrature.
-        expected = math.hypot((0.02 / math.sqrt(3.0)) / 3.0, 0.0002)
-        assert inlet.relative_standard_uncertainty == pytest.approx(expected, rel=1e-6)
+        # u = 0.02/sqrt(3). Making it absolute adds the ambient reference, so
+        # that value's own uncertainty joins in quadrature. Then relative to the
+        # 3 atm ABSOLUTE pressure, plus the DAQ term.
+        u_transducer = 0.02 / math.sqrt(3.0)
+        u_ambient = (0.1 / math.sqrt(3.0)) / 101.325  # 0.1 kPa rectangular, in atm
+        expected = math.hypot(math.hypot(u_transducer, u_ambient) / 3.0, 0.0002)
+        assert inlet.relative_standard_uncertainty == pytest.approx(expected, rel=1e-9)
+
+    def test_an_absolute_transducer_does_not_pick_up_the_ambient_uncertainty(self):
+        """Nothing is added to an absolute reading, so nothing propagates in."""
+        config = config_with()
+        config.hardware.pressure_calibration.inlet.uncertainty = UncertaintySpec(
+            kind="percent_reading", value=1.0
+        )
+        strict = build_budget(point(), geometry(), config.hardware, config.run)
+        config.run.atmospheric_pressure_uncertainty = UncertaintySpec(
+            kind="absolute", value=50.0  # absurdly bad barometer
+        )
+        loose = build_budget(point(), geometry(), config.hardware, config.run)
+        inlet_strict = next(c for c in strict.components if c.symbol == "P1")
+        inlet_loose = next(c for c in loose.components if c.symbol == "P1")
+        assert inlet_loose.relative_standard_uncertainty == pytest.approx(
+            inlet_strict.relative_standard_uncertainty
+        )
 
     def test_an_absolute_transducer_uses_the_absolute_reading(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         config.hardware.pressure_calibration.inlet.uncertainty = UncertaintySpec(
             kind="percent_reading", value=1.0
         )
@@ -291,8 +311,8 @@ class TestBudget:
 class TestCorrelation:
     def test_positive_correlation_reduces_the_combined_uncertainty(self):
         """P1 and P2 enter with opposite signs, so shared error partly cancels."""
-        independent = config_with(outlet_pressure_reference="measured")
-        correlated = config_with(outlet_pressure_reference="measured")
+        independent = config_with()
+        correlated = config_with()
         correlated.hardware.pressure_calibration.correlation = 0.9
 
         a = build_budget(point(), geometry(), independent.hardware, independent.run)
@@ -304,17 +324,17 @@ class TestCorrelation:
         )
 
     def test_zero_correlation_adds_no_term(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         assert budget.correlation_relative_variance == 0.0
 
-    def test_correlation_is_not_applied_to_a_configured_reference(self):
-        """P2 from the barometric reference is not the outlet transducer."""
-        config = config_with(outlet_pressure_reference="atmospheric")
-        config.hardware.pressure_calibration.correlation = 0.9
+    def test_correlation_always_applies_because_p2_is_always_a_transducer(self):
+        """Both pressures come from the DAQ, so the covariance term is never skipped."""
+        config = config_with()
+        config.hardware.pressure_calibration.correlation = 0.5
         budget = build_budget(point(), geometry(), config.hardware, config.run)
-        assert budget.correlation_relative_variance == 0.0
-        assert any("configured downstream reference" in n for n in budget.notes)
+        assert budget.correlation_relative_variance != 0.0
+        assert any("covariance term" in n for n in budget.notes)
 
     def test_out_of_range_correlation_is_rejected_by_the_config(self):
         config = GaspermConfig()
@@ -330,7 +350,7 @@ class TestFlowReferenceHandling:
         assert any("defined standard state" in n for n in budget.notes)
 
     def test_an_actual_basis_meter_adds_a_reference_pressure_term(self):
-        config = config_with(outlet_pressure_reference="measured")
+        config = config_with()
         config.hardware.flowmeter.reading_basis = "actual"
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         reference = next(c for c in budget.components if c.symbol == "P_ref")

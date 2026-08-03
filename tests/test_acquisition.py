@@ -102,7 +102,6 @@ class TestRollingWindow:
 
 class TestSampleProcessor:
     def test_matches_a_hand_calculation_through_every_conversion(self, base_config):
-        base_config.run.outlet_pressure_reference = "measured"
         processor = make_processor(base_config, viscosity_cp=0.0178)
         reading = processor.process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
@@ -125,23 +124,42 @@ class TestSampleProcessor:
         )
         assert reading.permeability_darcy == pytest.approx(expected, rel=1e-12)
 
-    def test_atmospheric_reference_overrides_the_outlet_transducer(self, base_config):
+    def test_p2_always_comes_from_the_outlet_transducer(self, base_config):
+        """P2 is measured on ai1; configuration never substitutes for it."""
         reading = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
-        assert reading.downstream_pressure_atm == pytest.approx(1.0, rel=1e-12)
+        # ai1 = 0.5 V of 0-5 V -> 100 kPa, which is NOT the 101.325 kPa ambient.
         assert reading.outlet_pressure_atm == pytest.approx(units.kpa_to_atm(100.0))
+        assert reading.outlet_pressure_atm != pytest.approx(
+            base_config.run.atmospheric_pressure_atm
+        )
 
-    def test_a_fixed_back_pressure_is_honoured(self, base_config):
-        base_config.run.outlet_pressure_reference = 2.0
-        base_config.run.outlet_pressure_reference_unit = "bar"
-        reading = make_processor(base_config).process(
+    def test_the_outlet_voltage_moves_p2(self, base_config):
+        processor = make_processor(base_config)
+        low = processor.process(
+            index=0, elapsed_s=0.0, voltages={**VOLTAGES, "ai1": 0.5}, temperature=sample()
+        )
+        high = processor.process(
+            index=1, elapsed_s=0.1, voltages={**VOLTAGES, "ai1": 1.5}, temperature=sample()
+        )
+        assert high.outlet_pressure_atm > low.outlet_pressure_atm
+        # A higher back-pressure narrows the differential, so k rises.
+        assert high.permeability_darcy > low.permeability_darcy
+
+    def test_the_ambient_value_is_unused_with_absolute_transducers(self, base_config):
+        """It is the gauge-to-absolute reference, not a stand-in for P2."""
+        baseline = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
-        assert reading.downstream_pressure_atm == pytest.approx(units.bar_to_atm(2.0))
+        base_config.run.atmospheric_pressure = 95.0
+        shifted = make_processor(base_config).process(
+            index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
+        )
+        assert shifted.outlet_pressure_atm == pytest.approx(baseline.outlet_pressure_atm)
+        assert shifted.permeability_darcy == pytest.approx(baseline.permeability_darcy)
 
     def test_no_differential_yields_no_permeability_but_still_a_reading(self, base_config):
-        base_config.run.outlet_pressure_reference = "measured"
         flat = {"ai0": 1.0, "ai1": 1.0, "ai2": 4.0}
         reading = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=flat, temperature=sample()
@@ -165,7 +183,6 @@ class TestSampleProcessor:
         assert reading.temperature_stale is True
 
     def test_gauge_transducers_shift_both_pressures(self, base_config):
-        base_config.run.outlet_pressure_reference = "measured"
         absolute_reading = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
@@ -200,7 +217,6 @@ class TestRealGasCorrection:
         pytest.importorskip("CoolProp")
         from gasperm.gas_properties import CoolPropProvider
 
-        base_config.run.outlet_pressure_reference = "measured"
         base_config.run.gas.real_gas_correction = True
         processor = SampleProcessor(base_config, CoolPropProvider("CarbonDioxide"))
         reading = processor.process(
@@ -230,7 +246,6 @@ class TestUnitInvariance:
                 },
                 "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
                 "run": {
-                    "outlet_pressure_reference": "measured",
                     "atmospheric_pressure": 101.325,
                     "atmospheric_pressure_unit": "kPa",
                     "confining_pressure": 20.0,
@@ -258,7 +273,6 @@ class TestUnitInvariance:
                 },
                 "sample": {"length_cm": 5.0, "diameter_cm": 2.54},
                 "run": {
-                    "outlet_pressure_reference": "measured",
                     "atmospheric_pressure": 101_325.0,
                     "atmospheric_pressure_unit": "Pa",
                     "confining_pressure": 2900.75,

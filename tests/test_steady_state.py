@@ -224,7 +224,6 @@ class TestSignalExtraction:
         from gasperm.acquisition import SampleProcessor
         from gasperm.hardware.temperature import TemperatureSample
 
-        base_config.run.outlet_pressure_reference = "measured"
         processor = SampleProcessor(base_config, fixed_gas_provider)
         reading = processor.process(
             index=0,

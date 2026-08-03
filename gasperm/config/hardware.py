@@ -45,7 +45,7 @@ class DaqConfig(_Base):
     outlet_pressure_channel: str = "ai1"
     sample_rate_hz: float = Field(default=10.0, gt=0.0, le=1000.0)
     #: NI terminal configuration; RSE is typical for single-ended transducers.
-    terminal_config: Literal["DEFAULT", "RSE", "NRSE", "DIFF", "PSEUDO_DIFF"] = "DEFAULT"
+    terminal_config: Literal["DEFAULT", "RSE", "NRSE", "DIFF", "PSEUDO_DIFF"] = "DIFF"
 
     @field_validator("inlet_pressure_channel", "outlet_pressure_channel")
     @classmethod

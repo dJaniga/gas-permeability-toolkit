@@ -183,17 +183,6 @@ class SampleProcessor:
 
     # -- helpers ----------------------------------------------------------
 
-    def resolve_downstream_pressure_atm(self, measured_outlet_atm: float) -> float:
-        """P2 for the Darcy equation, per ``run.outlet_pressure_reference``."""
-        reference = self.config.run.outlet_pressure_reference
-        if reference == "measured":
-            return measured_outlet_atm
-        if reference == "atmospheric":
-            return self.atmospheric_pressure_atm
-        fixed = self.config.run.fixed_outlet_pressure_atm
-        assert fixed is not None  # guaranteed by the config model
-        return fixed
-
     def reset_window(self) -> None:
         """Clear the rolling average, e.g. between runs."""
         self._window.clear()
@@ -241,15 +230,16 @@ class SampleProcessor:
         outlet_volts = self._require(voltages, self.outlet.channel, "outlet pressure")
         flow_volts = self._require(voltages, self.flow.channel, "flow")
 
+        # Both pressures come from the DAQ. P2 is the outlet transducer, full
+        # stop -- there is no configured substitute for a measured quantity.
         inlet_atm = self.inlet.volts_to_absolute_atm(inlet_volts)
-        measured_outlet_atm = self.outlet.volts_to_absolute_atm(outlet_volts)
-        downstream_atm = self.resolve_downstream_pressure_atm(measured_outlet_atm)
-        mean_atm = mean_pressure(inlet_atm, downstream_atm)
+        outlet_atm = self.outlet.volts_to_absolute_atm(outlet_volts)
+        mean_atm = mean_pressure(inlet_atm, outlet_atm)
 
         flow_cm3_s = self.flow.volts_to_cm3_s(flow_volts)
         reference_pressure_atm = self.flow.reference_pressure_atm(
             inlet_pressure_atm=inlet_atm,
-            outlet_pressure_atm=measured_outlet_atm,
+            outlet_pressure_atm=outlet_atm,
             atmospheric_atm=self.atmospheric_pressure_atm,
         )
 
@@ -281,7 +271,7 @@ class SampleProcessor:
                 length_cm=self.length_cm,
                 area_cm2=self.area_cm2,
                 inlet_pressure_atm=inlet_atm,
-                outlet_pressure_atm=downstream_atm,
+                outlet_pressure_atm=outlet_atm,
             )
         except PermeabilityInputError as exc:
             note = str(exc).split(".")[0]
@@ -298,8 +288,7 @@ class SampleProcessor:
             flow_voltage=flow_volts,
             temperature_raw=temperature.raw_line,
             inlet_pressure_atm=inlet_atm,
-            outlet_pressure_atm=measured_outlet_atm,
-            downstream_pressure_atm=downstream_atm,
+            outlet_pressure_atm=outlet_atm,
             mean_pressure_atm=mean_atm,
             flow_cm3_s=flow_cm3_s,
             flow_reference_cm3_s=reference_flow_cm3_s,
@@ -676,9 +665,7 @@ def summarize_run(
     mean_t, _ = _mean_stddev([r.temperature_c for r in window_readings])
     mean_q, _ = _mean_stddev([r.flow_cm3_s for r in window_readings])
     mean_inlet, _ = _mean_stddev([r.inlet_pressure_atm for r in window_readings])
-    mean_downstream, _ = _mean_stddev(
-        [r.downstream_pressure_atm for r in window_readings]
-    )
+    mean_outlet, _ = _mean_stddev([r.outlet_pressure_atm for r in window_readings])
     mean_reference_p, _ = _mean_stddev(
         [r.flow_reference_pressure_atm for r in window_readings]
     )
@@ -701,7 +688,7 @@ def summarize_run(
                 MeasurementPoint(
                     permeability_darcy=mean_k,
                     inlet_pressure_atm=mean_inlet,
-                    downstream_pressure_atm=mean_downstream,
+                    outlet_pressure_atm=mean_outlet,
                     flow_cm3_s=mean_reference_q,
                     reference_pressure_atm=mean_reference_p,
                     viscosity_cp=mean_mu,
@@ -753,7 +740,7 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
     flow_unit = run.display_flow_unit
 
     p1 = units.from_atm(reading.inlet_pressure_atm, pressure_unit)
-    p2 = units.from_atm(reading.downstream_pressure_atm, pressure_unit)
+    p2 = units.from_atm(reading.outlet_pressure_atm, pressure_unit)
     flow = units.flow_from_cm3_s(reading.flow_cm3_s, flow_unit)
 
     if reading.permeability_darcy_avg is not None:

@@ -145,7 +145,7 @@ class LivePlot:
         self._times.append(reading.elapsed_s)
         self._inlet.append(units.from_atm(reading.inlet_pressure_atm, run.display_pressure_unit))
         self._outlet.append(
-            units.from_atm(reading.downstream_pressure_atm, run.display_pressure_unit)
+            units.from_atm(reading.outlet_pressure_atm, run.display_pressure_unit)
         )
         self._flow.append(units.flow_from_cm3_s(reading.flow_cm3_s, run.display_flow_unit))
         value = reading.permeability_darcy_avg

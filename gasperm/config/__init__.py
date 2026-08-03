@@ -448,8 +448,11 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "Confining/overburden pressure for this run. Usually MPa-scale while\n"
             "pore pressure is kPa-scale, hence its own independent unit."
         ),
-        "outlet_pressure_reference": (
-            "How P2 in the Darcy equation is determined."
+        "atmospheric_pressure": (
+            "Ambient reference. P1 and P2 are both measured on the DAQ, so this is\n"
+            "not a substitute for either -- it converts GAUGE transducer readings to\n"
+            "the absolute pressures the Darcy equation needs, and serves as the\n"
+            "flowmeter reference when actual_pressure_source is 'atmospheric'."
         ),
         "steady_state": (
             "Permeability is only representative once the rig has equilibrated, so\n"
@@ -475,8 +478,6 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "gas.fixed_viscosity_cp": "only when properties_source == fixed",
         "gas.viscosity_relative_uncertainty": "relative, for the GUM budget",
         "gas.real_gas_correction": "divide reference flow by Z",
-        "outlet_pressure_reference": "atmospheric | measured | a number",
-        "outlet_pressure_reference_unit": "used only if the above is a number",
         "steady_state.window_s": "trailing window each test runs over",
         "steady_state.required_windows": "consecutive passes before declaring steady",
         "steady_state.settling_time_s": "ignore this much of the run start outright",

@@ -265,11 +265,11 @@ class Reading(BaseModel):
     temperature_raw: str | None = None
 
     # --- calibrated, absolute, internal CGS ---
+    #: P1 in the Darcy equation, from the inlet transducer.
     inlet_pressure_atm: float
+    #: P2 in the Darcy equation, from the outlet transducer. Both pressures are
+    #: measured on the DAQ; neither is ever substituted from configuration.
     outlet_pressure_atm: float
-    #: P2 actually used in the Darcy equation (may be the configured
-    #: atmospheric reference rather than the measured outlet transducer).
-    downstream_pressure_atm: float
     #: Mean pore pressure, (P1 + P2) / 2, absolute.
     mean_pressure_atm: float
     #: Flow rate as measured, converted to cm^3/s but still at the meter's
@@ -304,7 +304,7 @@ class Reading(BaseModel):
     @property
     def delta_pressure_atm(self) -> float:
         """P1 - P2 (absolute), atm."""
-        return self.inlet_pressure_atm - self.downstream_pressure_atm
+        return self.inlet_pressure_atm - self.outlet_pressure_atm
 
 
 class ExperimentMetadata(BaseModel):

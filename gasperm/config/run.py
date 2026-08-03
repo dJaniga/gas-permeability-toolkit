@@ -147,18 +147,17 @@ class RunConfig(_Base):
     confining_pressure: float | None = None
     confining_pressure_unit: PressureUnit = "MPa"
 
-    # -- how P2 is determined --------------------------------------------
-    #: ``"atmospheric"`` -- the configured atmospheric reference;
-    #: ``"measured"``    -- the outlet transducer reading;
-    #: a number         -- a fixed value in ``outlet_pressure_reference_unit``.
-    outlet_pressure_reference: float | Literal["atmospheric", "measured"] = "atmospheric"
-    outlet_pressure_reference_unit: PressureUnit = "kPa"
+    # -- ambient reference ------------------------------------------------
+    #: Local atmospheric pressure. P1 and P2 both come from their transducers
+    #: on the DAQ, so this is *not* a stand-in for either: it is used only to
+    #: convert **gauge** transducer readings to the absolute pressures the
+    #: Darcy equation needs, and as the flowmeter's reference pressure when
+    #: ``flowmeter.actual_pressure_source`` is ``atmospheric``. With absolute
+    #: transducers on both ports and a standard-basis meter it is unused.
     atmospheric_pressure: float = Field(default=101.325, gt=0.0)
     atmospheric_pressure_unit: PressureUnit = "kPa"
-    #: Uncertainty of the atmospheric/back-pressure reference, in
-    #: ``atmospheric_pressure_unit``. Only contributes when P2 comes from this
-    #: reference rather than from the outlet transducer -- but then it is the
-    #: whole of P2's uncertainty, so a guessed barometric value should say so.
+    #: Uncertainty of that ambient value, in ``atmospheric_pressure_unit``.
+    #: Contributes only through the gauge-to-absolute conversion above.
     atmospheric_pressure_uncertainty: UncertaintySpec = Field(
         default_factory=lambda: UncertaintySpec(
             kind="absolute", value=0.1, source="local barometric reading"
@@ -195,7 +194,6 @@ class RunConfig(_Base):
     @field_validator(
         "atmospheric_pressure_unit",
         "display_pressure_unit",
-        "outlet_pressure_reference_unit",
         "confining_pressure_unit",
     )
     @classmethod
@@ -227,15 +225,6 @@ class RunConfig(_Base):
     def atmospheric_pressure_atm(self) -> float:
         """Configured atmospheric pressure, atm."""
         return units.to_atm(self.atmospheric_pressure, self.atmospheric_pressure_unit)
-
-    @property
-    def fixed_outlet_pressure_atm(self) -> float | None:
-        """P2 when ``outlet_pressure_reference`` is a fixed number, else None."""
-        if isinstance(self.outlet_pressure_reference, str):
-            return None
-        return units.to_atm(
-            self.outlet_pressure_reference, self.outlet_pressure_reference_unit
-        )
 
     @property
     def confining_pressure_atm(self) -> float | None:

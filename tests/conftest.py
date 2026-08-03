@@ -38,7 +38,6 @@ def quick_steady_config(base_config: GaspermConfig) -> GaspermConfig:
     too slow for a test, so the windows are shrunk rather than the criteria
     weakened -- the same tests still exercise the real detector.
     """
-    base_config.run.outlet_pressure_reference = "measured"
     base_config.run.steady_state.window_s = 0.2
     base_config.run.steady_state.required_windows = 2
     base_config.run.steady_state.min_samples = 3

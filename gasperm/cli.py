@@ -286,25 +286,14 @@ def _prompt_run(data: dict[str, Any]) -> None:
     )
     if confining.strip():
         run["confining_pressure"] = float(confining)
-    run["outlet_pressure_reference"] = typer.prompt(
-        "    Downstream pressure P2 (atmospheric / measured / a number)",
-        default=run["outlet_pressure_reference"],
-    )
-    if run["outlet_pressure_reference"] not in {"atmospheric", "measured"}:
-        try:
-            run["outlet_pressure_reference"] = float(run["outlet_pressure_reference"])
-        except ValueError:
-            typer.secho("    Not a number; using 'atmospheric'.", fg=typer.colors.YELLOW)
-            run["outlet_pressure_reference"] = "atmospheric"
-        else:
-            run["outlet_pressure_reference_unit"] = typer.prompt(
-                "    ... in which unit", default=run["outlet_pressure_reference_unit"]
-            )
+    # P1 and P2 both come from the DAQ; the ambient value is only the
+    # gauge-to-absolute reference (and the flowmeter's, when it sits at ambient).
     run["atmospheric_pressure_unit"] = typer.prompt(
-        "    Atmospheric pressure unit", default=run["atmospheric_pressure_unit"]
+        "    Ambient pressure unit", default=run["atmospheric_pressure_unit"]
     )
     run["atmospheric_pressure"] = typer.prompt(
-        f"    Atmospheric pressure ({run['atmospheric_pressure_unit']})",
+        f"    Ambient pressure, for gauge->absolute "
+        f"({run['atmospheric_pressure_unit']})",
         default=run["atmospheric_pressure"], type=float,
     )
 
