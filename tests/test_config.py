@@ -418,21 +418,57 @@ class TestLinearCalibration:
         assert LinearCalibration(value_min=1000.0, value_max=0.0).full_scale == 1000.0
 
 
-class TestNoConfiguredOutletPressure:
-    """P2 is measured on the DAQ, so the run config must not offer it."""
+class TestDownstreamPressure:
+    """P2 is the transducer by default, or a value the operator supplies."""
 
-    def test_the_run_config_has_no_outlet_pressure_field(self):
-        fields = set(RunConfig.model_fields)
-        assert "outlet_pressure_reference" not in fields
-        assert "outlet_pressure_reference_unit" not in fields
+    def test_measured_is_the_default(self):
+        run = RunConfig()
+        assert run.downstream_pressure == "measured"
+        assert run.downstream_is_measured
+        assert run.fixed_downstream_pressure_atm is None
 
-    def test_setting_one_is_rejected_rather_than_silently_ignored(self):
+    def test_a_supplied_value_converts_from_its_own_unit(self):
+        run = RunConfig(downstream_pressure=1.0, downstream_pressure_unit="bar")
+        assert run.fixed_downstream_pressure_atm == pytest.approx(units.bar_to_atm(1.0))
+        assert not run.downstream_is_measured
+
+    def test_a_nonsense_keyword_is_rejected(self):
         with pytest.raises(ValueError):
-            RunConfig(outlet_pressure_reference="measured")
+            RunConfig(downstream_pressure="ambient")
 
-    def test_the_ambient_value_remains_for_gauge_conversion(self):
+    @pytest.mark.parametrize("bad", [0.0, -101.325])
+    def test_a_non_positive_value_is_rejected_at_load(self, bad: float):
+        """A mistyped zero would otherwise make every reading unusable."""
+        with pytest.raises(ValueError, match="positive absolute pressure"):
+            RunConfig(downstream_pressure=bad)
+
+    def test_the_unit_is_validated(self):
+        with pytest.raises(ValueError, match="torr"):
+            RunConfig(downstream_pressure_unit="torr")
+
+    @pytest.mark.parametrize("value", ["measured", 101.325])
+    def test_both_forms_round_trip(self, tmp_path, base_config, value):
+        base_config.run.downstream_pressure = value
+        save_config(base_config, tmp_path)
+        assert load_config(tmp_path).run.downstream_pressure == value
+
+    def test_the_ambient_value_is_separate_from_p2(self):
+        """Ambient still exists, for gauge-to-absolute conversion."""
         run = RunConfig(atmospheric_pressure=1.0, atmospheric_pressure_unit="bar")
         assert run.atmospheric_pressure_atm == pytest.approx(units.bar_to_atm(1.0))
+        assert run.downstream_is_measured
+
+    def test_the_uncertainty_spec_is_its_own(self, base_config):
+        """Widening it must not widen P1 through the ambient reference."""
+        assert (
+            base_config.run.downstream_pressure_uncertainty
+            is not base_config.run.atmospheric_pressure_uncertainty
+        )
+
+    def test_the_template_explains_it(self, base_config):
+        rendered = render_run_yaml(base_config)
+        assert "downstream_pressure: measured" in rendered
+        assert "measured | a number" in rendered
 
 
 class TestThreeFileIo:

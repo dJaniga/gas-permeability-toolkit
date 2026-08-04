@@ -267,10 +267,15 @@ class Reading(BaseModel):
     # --- calibrated, absolute, internal CGS ---
     #: P1 in the Darcy equation, from the inlet transducer.
     inlet_pressure_atm: float
-    #: P2 in the Darcy equation, from the outlet transducer. Both pressures are
-    #: measured on the DAQ; neither is ever substituted from configuration.
+    #: What the outlet transducer read. Always recorded, even when a supplied
+    #: value is used as P2 -- it is then the cross-check that the declared
+    #: downstream pressure is really what the rig is doing.
     outlet_pressure_atm: float
-    #: Mean pore pressure, (P1 + P2) / 2, absolute.
+    #: P2 as actually used in the Darcy equation: the outlet transducer, or the
+    #: value supplied via ``run.downstream_pressure``. Equal to
+    #: :attr:`outlet_pressure_atm` under the default.
+    downstream_pressure_atm: float
+    #: Mean pore pressure, (P1 + P2) / 2, absolute -- computed from P2 as used.
     mean_pressure_atm: float
     #: Flow rate as measured, converted to cm^3/s but still at the meter's
     #: own reference state.
@@ -303,8 +308,8 @@ class Reading(BaseModel):
 
     @property
     def delta_pressure_atm(self) -> float:
-        """P1 - P2 (absolute), atm."""
-        return self.inlet_pressure_atm - self.outlet_pressure_atm
+        """P1 - P2 (absolute), atm, using P2 as it entered the equation."""
+        return self.inlet_pressure_atm - self.downstream_pressure_atm
 
 
 class ExperimentMetadata(BaseModel):
@@ -419,6 +424,11 @@ class KlinkenbergPoint(BaseModel):
     standard_uncertainty_darcy: float | None = None
     #: False when the source run never reached steady state.
     steady_state: bool = True
+    #: Canonical key for how P2 was obtained (``"measured"`` or
+    #: ``"fixed:<atm>"``). ``None`` when the source run did not record it.
+    #: Regressing runs that disagree mixes two different x-axes, since mean
+    #: pressure is computed from P2.
+    downstream_convention: str | None = None
 
     @property
     def inverse_mean_pressure(self) -> float:

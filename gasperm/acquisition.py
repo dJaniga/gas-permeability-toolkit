@@ -52,6 +52,11 @@ from gasperm.uncertainty import MeasurementPoint, build_budget
 
 logger = logging.getLogger(__name__)
 
+#: How far a supplied downstream pressure may sit from the outlet transducer
+#: before the run summary says so. Loose enough to tolerate a transducer that is
+#: uncalibrated near ambient, tight enough to catch a closed valve.
+DOWNSTREAM_MISMATCH_TOLERANCE = 0.05
+
 __all__ = [
     "RollingWindow",
     "SampleProcessor",
@@ -185,6 +190,16 @@ class SampleProcessor:
 
     # -- helpers ----------------------------------------------------------
 
+    def resolve_downstream_pressure_atm(self, measured_outlet_atm: float) -> float:
+        """P2 for the Darcy equation: the transducer, or the supplied value.
+
+        ``run.downstream_pressure`` is ``"measured"`` by default, which is what
+        a normally-plumbed rig wants. A supplied number is for an outlet that
+        vents to atmosphere, where the transducer reads noise around zero.
+        """
+        fixed = self.config.run.fixed_downstream_pressure_atm
+        return measured_outlet_atm if fixed is None else fixed
+
     def reset_window(self) -> None:
         """Clear the rolling average, e.g. between runs."""
         self._window.clear()
@@ -232,16 +247,22 @@ class SampleProcessor:
         outlet_volts = self._require(voltages, self.outlet.channel, "outlet pressure")
         flow_volts = self._require(voltages, self.flow.channel, "flow")
 
-        # Both pressures come from the DAQ. P2 is the outlet transducer, full
-        # stop -- there is no configured substitute for a measured quantity.
         inlet_atm = self.inlet.volts_to_absolute_atm(inlet_volts)
         outlet_atm = self.outlet.volts_to_absolute_atm(outlet_volts)
-        mean_atm = mean_pressure(inlet_atm, outlet_atm)
+        # P2 is the transducer unless the run supplies a value. Both are kept:
+        # the measured one is the only evidence that a declared downstream
+        # pressure matches what the rig is actually doing.
+        downstream_atm = self.resolve_downstream_pressure_atm(outlet_atm)
+        mean_atm = mean_pressure(inlet_atm, downstream_atm)
 
         flow_cm3_s = self.flow.volts_to_cm3_s(flow_volts)
+        # The meter is given the resolved pressure too: declaring the outlet
+        # line to be at a value and then telling a meter sitting on that line
+        # something different would be two beliefs about one pressure.
+        # A meter genuinely elsewhere has actual_pressure_source for that.
         reference_pressure_atm = self.flow.reference_pressure_atm(
             inlet_pressure_atm=inlet_atm,
-            outlet_pressure_atm=outlet_atm,
+            outlet_pressure_atm=downstream_atm,
             atmospheric_atm=self.atmospheric_pressure_atm,
         )
 
@@ -273,7 +294,7 @@ class SampleProcessor:
                 length_cm=self.length_cm,
                 area_cm2=self.area_cm2,
                 inlet_pressure_atm=inlet_atm,
-                outlet_pressure_atm=outlet_atm,
+                outlet_pressure_atm=downstream_atm,
             )
         except PermeabilityInputError as exc:
             note = str(exc).split(".")[0]
@@ -291,6 +312,7 @@ class SampleProcessor:
             temperature_raw=temperature.raw_line,
             inlet_pressure_atm=inlet_atm,
             outlet_pressure_atm=outlet_atm,
+            downstream_pressure_atm=downstream_atm,
             mean_pressure_atm=mean_atm,
             flow_cm3_s=flow_cm3_s,
             flow_reference_cm3_s=reference_flow_cm3_s,
@@ -668,11 +690,32 @@ def summarize_run(
     mean_q, _ = _mean_stddev([r.flow_cm3_s for r in window_readings])
     mean_inlet, _ = _mean_stddev([r.inlet_pressure_atm for r in window_readings])
     mean_outlet, _ = _mean_stddev([r.outlet_pressure_atm for r in window_readings])
+    mean_downstream, _ = _mean_stddev(
+        [r.downstream_pressure_atm for r in window_readings]
+    )
     mean_reference_p, _ = _mean_stddev(
         [r.flow_reference_pressure_atm for r in window_readings]
     )
     mean_reference_q, _ = _mean_stddev([r.flow_reference_cm3_s for r in window_readings])
     mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window_readings])
+
+    # A declared downstream pressure is an assertion about the rig. The outlet
+    # transducer is still being read, so check it: a shut valve would otherwise
+    # scale every reported permeability with nothing to show for it.
+    supplied = config.run.fixed_downstream_pressure_atm
+    if supplied is not None and mean_outlet > 0.0:
+        disagreement = abs(mean_outlet - supplied) / supplied
+        if disagreement > DOWNSTREAM_MISMATCH_TOLERANCE:
+            collected_warnings.append(
+                f"The supplied downstream pressure "
+                f"({units.from_atm(supplied, config.run.downstream_pressure_unit):.4g} "
+                f"{config.run.downstream_pressure_unit}) disagrees with the outlet "
+                f"transducer, which read "
+                f"{units.from_atm(mean_outlet, config.run.downstream_pressure_unit):.4g} "
+                f"{config.run.downstream_pressure_unit} over the same window "
+                f"({disagreement:.1%}). Either the declared value is wrong, or the "
+                "outlet is not actually open to it."
+            )
 
     budget: UncertaintyBudget | None = None
     if config.run.uncertainty.enabled and mean_k > 0.0:
@@ -690,7 +733,7 @@ def summarize_run(
                 MeasurementPoint(
                     permeability_darcy=mean_k,
                     inlet_pressure_atm=mean_inlet,
-                    outlet_pressure_atm=mean_outlet,
+                    downstream_pressure_atm=mean_downstream,
                     flow_cm3_s=mean_reference_q,
                     reference_pressure_atm=mean_reference_p,
                     viscosity_cp=mean_mu,
@@ -742,7 +785,11 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
     flow_unit = run.display_flow_unit
 
     p1 = units.from_atm(reading.inlet_pressure_atm, pressure_unit)
-    p2 = units.from_atm(reading.outlet_pressure_atm, pressure_unit)
+    # The P2 actually in use, marked when it is a supplied value rather than a
+    # reading -- otherwise a constant column looks like a suspiciously steady
+    # transducer.
+    p2 = units.from_atm(reading.downstream_pressure_atm, pressure_unit)
+    p2_flag = "" if reading.downstream_pressure_atm == reading.outlet_pressure_atm else "*"
     flow = units.flow_from_cm3_s(reading.flow_cm3_s, flow_unit)
 
     if reading.permeability_darcy_avg is not None:
@@ -755,7 +802,7 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
     marker = "STEADY" if reading.steady_state else f"settling {reading.steady_state_passes}"
     line = (
         f"{reading.elapsed_s:7.1f}s  "
-        f"P1 {p1:9.3f}  P2 {p2:9.3f} {pressure_unit}  "
+        f"P1 {p1:9.3f}  P2 {p2:9.3f}{p2_flag:1} {pressure_unit}  "
         f"Q {flow:9.3f} {flow_unit}  "
         f"T {reading.temperature_c:6.2f}{temperature_flag:1}C  "
         f"k {k_text}  {marker:>11}"
@@ -768,7 +815,7 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
 def console_header(config: GaspermConfig) -> str:
     """Header line matching :func:`format_reading_line`'s column layout."""
     return (
-        f"{'time':>8}  {'inlet':>12} {'outlet':>12} "
+        f"{'time':>8}  {'P1':>12} {'P2':>12} "
         f"({config.run.display_pressure_unit})  "
         f"{'flow':>11} ({config.run.display_flow_unit})  "
         f"{'temp':>8}  "

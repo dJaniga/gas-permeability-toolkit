@@ -70,7 +70,9 @@ class MeasurementPoint:
 
     permeability_darcy: float
     inlet_pressure_atm: float
-    outlet_pressure_atm: float
+    #: P2 as it entered the Darcy equation -- the outlet transducer, or the
+    #: value the run supplied.
+    downstream_pressure_atm: float
     flow_cm3_s: float
     reference_pressure_atm: float
     viscosity_cp: float
@@ -229,8 +231,12 @@ def build_budget(
     calibration = hardware.pressure_calibration
 
     c_p1, c_p2 = pressure_sensitivities(
-        point.inlet_pressure_atm, point.outlet_pressure_atm
+        point.inlet_pressure_atm, point.downstream_pressure_atm
     )
+    # A supplied downstream pressure is a stated constant, not a reading: it
+    # carries the operator's own uncertainty and shares no transducer error
+    # with P1, so the covariance term must not be applied to it.
+    supplied_downstream = run.fixed_downstream_pressure_atm is not None
 
     # -- flow rate --------------------------------------------------------
     # The meter this run selected: its own range and specification, not the
@@ -278,21 +284,42 @@ def build_budget(
         )
     )
 
-    # -- outlet pressure --------------------------------------------------
-    u_p2_rel, p2_dof = _pressure_relative_uncertainty(
-        calibration.outlet, point.outlet_pressure_atm, run, daq_relative
-    )
+    # -- downstream pressure (P2) -----------------------------------------
+    if supplied_downstream:
+        spec = run.downstream_pressure_uncertainty
+        u_supplied_atm = units.to_atm(
+            spec.standard_uncertainty(
+                run.downstream_pressure, abs(run.downstream_pressure)
+            ),
+            run.downstream_pressure_unit,
+        )
+        u_p2_rel = u_supplied_atm / abs(point.downstream_pressure_atm)
+        p2_dof = spec.dof
+        p2_name = "downstream pressure"
+        p2_source = spec.source or "operator-supplied value"
+        notes.append(
+            "P2 was supplied rather than measured, so its uncertainty is that of the "
+            "stated value and it shares no transducer error with P1 -- the P1/P2 "
+            "covariance term does not apply."
+        )
+    else:
+        u_p2_rel, p2_dof = _pressure_relative_uncertainty(
+            calibration.outlet, point.downstream_pressure_atm, run, daq_relative
+        )
+        p2_name = "outlet pressure"
+        p2_source = calibration.outlet.uncertainty.source or "outlet transducer"
+
     components.append(
         _component(
-            name="outlet pressure",
+            name=p2_name,
             symbol="P2",
             evaluation_type="B",
-            value=point.outlet_pressure_atm,
+            value=point.downstream_pressure_atm,
             unit="atm",
             relative_uncertainty=u_p2_rel,
             sensitivity=c_p2,
             dof=p2_dof,
-            source=calibration.outlet.uncertainty.source or "outlet transducer",
+            source=p2_source,
         )
     )
 
@@ -304,14 +331,35 @@ def build_budget(
             "contributes no measurement uncertainty."
         )
     else:
-        source_channel = (
-            calibration.inlet
-            if flow.actual_pressure_source == "inlet"
-            else calibration.outlet
-        )
-        u_ref_rel, ref_dof = _pressure_relative_uncertainty(
-            source_channel, point.reference_pressure_atm, run, daq_relative
-        )
+        at_supplied_outlet = supplied_downstream and flow.actual_pressure_source == "outlet"
+        if at_supplied_outlet:
+            # The meter sits on a line whose pressure was stated, not measured,
+            # so charging it the outlet transducer's specification would bill a
+            # calibration error to a number no transducer produced.
+            u_ref_rel = u_p2_rel
+            ref_dof = p2_dof
+            ref_source = "operator-supplied downstream pressure"
+            notes.append(
+                "The flowmeter sits at the outlet, whose pressure was supplied rather "
+                "than measured, so P_ref is that same stated value. It is perfectly "
+                "correlated with P2; the budget treats them as independent, which "
+                "errs high."
+            )
+        else:
+            source_channel = (
+                calibration.inlet
+                if flow.actual_pressure_source == "inlet"
+                else calibration.outlet
+            )
+            u_ref_rel, ref_dof = _pressure_relative_uncertainty(
+                source_channel, point.reference_pressure_atm, run, daq_relative
+            )
+            ref_source = f"{flow.actual_pressure_source} transducer"
+            notes.append(
+                "flowmeter.reading_basis is 'actual', so the flow reference pressure is "
+                "a transducer reading and is correlated with that channel; the budget "
+                "treats it as independent, which errs high."
+            )
         components.append(
             _component(
                 name="flow reference pressure",
@@ -322,13 +370,8 @@ def build_budget(
                 relative_uncertainty=u_ref_rel,
                 sensitivity=1.0,
                 dof=ref_dof,
-                source=f"{flow.actual_pressure_source} transducer",
+                source=ref_source,
             )
-        )
-        notes.append(
-            "flowmeter.reading_basis is 'actual', so the flow reference pressure is a "
-            "transducer reading and is correlated with that channel; the budget treats "
-            "it as independent, which errs high."
         )
 
     # -- viscosity model --------------------------------------------------
@@ -430,7 +473,7 @@ def build_budget(
     variance = sum(component.variance_share for component in components)
 
     correlation_variance = 0.0
-    if calibration.correlation != 0.0:
+    if calibration.correlation != 0.0 and not supplied_downstream:
         correlation_variance = (
             2.0 * c_p1 * c_p2 * calibration.correlation * u_p1_rel * u_p2_rel
         )

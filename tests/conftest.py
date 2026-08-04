@@ -59,6 +59,7 @@ def write_fake_run(
     sidecar: bool = True,
     uncertainty_darcy: float | None = 1e-4,
     flowmeter: str = "low_range",
+    downstream_pressure: float | str = "measured",
 ) -> Path:
     """Write a run directory without driving the acquisition loop.
 
@@ -85,6 +86,7 @@ def write_fake_run(
         elapsed_s="0.0", mean_pressure_atm=f"{mean_pressure_atm:g}",
         inlet_pressure_atm=f"{mean_pressure_atm * 1.5:g}",
         outlet_pressure_atm=f"{mean_pressure_atm * 0.5:g}",
+        downstream_pressure_atm=f"{mean_pressure_atm * 0.5:g}",
         permeability_D=f"{permeability_darcy:g}", temperature_C="22.0",
         flow_cm3_s="1.5", steady_state="1" if steady else "0",
     )
@@ -102,7 +104,13 @@ def write_fake_run(
                 "rows": 2,
             },
             "metadata": {"sample_id": sample_id, "flowmeter": flowmeter},
-            "config": {"sample": {"id": sample_id}},
+            "config": {
+                "sample": {"id": sample_id},
+                "run": {
+                    "downstream_pressure": downstream_pressure,
+                    "downstream_pressure_unit": "kPa",
+                },
+            },
         }
         if steady:
             payload["summary"] = {

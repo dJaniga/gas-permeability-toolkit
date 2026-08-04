@@ -109,6 +109,7 @@ def fit_klinkenberg(
     *,
     coverage_probability: float = 0.95,
     allow_mixed_samples: bool = False,
+    allow_mixed_conditions: bool = False,
 ) -> KlinkenbergResult:
     """Regress ``k_g`` against ``1 / P_mean`` and recover ``k_L`` and ``b``.
 
@@ -129,6 +130,10 @@ def fit_klinkenberg(
             default: the correction is only meaningful within a single plug, and
             on a rig running many plugs, mixing runs is an easy and
             silent-looking mistake.
+        allow_mixed_conditions: Permit points whose runs obtained P2
+            differently (measured versus supplied). Off by default, for the
+            same reason: P2 determines the mean pressure this regression plots
+            against.
 
     Returns:
         The fit, including R^2, uncertainties, and any warnings worth showing.
@@ -154,6 +159,24 @@ def fit_klinkenberg(
             f"points come from {len(sample_ids)} different ones ({listing}). Select the "
             "runs for one plug, or pass --allow-mixed-samples if you genuinely mean to "
             "regress across them."
+        )
+
+    conventions = {p.downstream_convention for p in points if p.downstream_convention}
+    if len(conventions) > 1 and not allow_mixed_conditions:
+        from gasperm.storage import describe_convention
+
+        listing = "\n".join(
+            f"  {p.label or 'unlabelled'}: {describe_convention(p.downstream_convention)}"
+            for p in points
+            if p.downstream_convention
+        )
+        raise ValueError(
+            "These runs did not all obtain the downstream pressure the same way:\n"
+            f"{listing}\n"
+            "P2 sets both the apparent permeability and the mean pressure, and mean "
+            "pressure is this regression's own x-axis -- so mixing conventions "
+            "regresses points that are not on comparable axes. Use runs measured the "
+            "same way, or pass --allow-mixed-conditions if you genuinely mean to."
         )
 
     inverse_pressure = np.array([p.inverse_mean_pressure for p in points], dtype=float)
@@ -254,6 +277,15 @@ def fit_klinkenberg(
             + ", ".join(sorted(sample_ids))
             + "), which was explicitly allowed. The Klinkenberg correction is only "
             "valid within a single sample, so k_L here is not a property of any one plug."
+        )
+    if len(conventions) > 1:
+        from gasperm.storage import describe_convention
+
+        warnings.append(
+            "The runs obtained the downstream pressure differently ("
+            + ", ".join(sorted(describe_convention(c) for c in conventions))
+            + "), which was explicitly allowed. Mean pressure is computed from P2, so "
+            "these points are not on strictly comparable axes."
         )
 
     # b = slope / intercept. Guard the division rather than emitting inf.

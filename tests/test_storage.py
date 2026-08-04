@@ -17,6 +17,8 @@ from gasperm.storage import (
     READING_COLUMNS,
     RunWriter,
     collect_points,
+    describe_convention,
+    downstream_convention,
     find_runs,
     point_from_run,
     read_readings_csv,
@@ -115,6 +117,35 @@ class TestRunWriter:
         assert rows[0]["permeability_D"] == pytest.approx(
             loop.readings[0].permeability_darcy, rel=1e-6
         )
+
+    def test_records_both_the_measured_and_the_used_downstream_pressure(
+        self, run_config, fake_analog_source, fake_temperature_source
+    ):
+        run_config.run.downstream_pressure = 101.325
+        loop, writer = run_once(
+            run_config, fake_analog_source(VOLTAGES), fake_temperature_source()
+        )
+        rows = read_readings_csv(writer.readings_path)
+        assert rows[0]["outlet_pressure_atm"] == pytest.approx(
+            loop.readings[0].outlet_pressure_atm, rel=1e-6
+        )
+        assert rows[0]["downstream_pressure_atm"] == pytest.approx(
+            loop.readings[0].downstream_pressure_atm, rel=1e-6
+        )
+        assert rows[0]["outlet_pressure_atm"] != pytest.approx(
+            rows[0]["downstream_pressure_atm"]
+        )
+
+    def test_a_csv_without_the_downstream_column_still_loads(self, tmp_path):
+        """Runs recorded before P2 became overridable."""
+        path = tmp_path / "old.csv"
+        path.write_text(
+            "elapsed_s,mean_pressure_atm,permeability_D\n0.0,2.0,0.005\n",
+            encoding="utf-8",
+        )
+        rows = read_readings_csv(path)
+        assert rows[0]["downstream_pressure_atm"] is None
+        assert rows[0]["mean_pressure_atm"] == pytest.approx(2.0)
 
     def test_keeps_raw_voltages_for_reprocessing(
         self, run_config, fake_analog_source, fake_temperature_source
@@ -363,6 +394,67 @@ class TestPointFromRun:
         assert result.point_count == 3
         assert result.weighted is True
         assert 0.0 <= result.r_squared <= 1.0
+
+
+class TestDownstreamConvention:
+    """How a stored run obtained P2, recovered from its sidecar."""
+
+    def test_measured_runs(self):
+        assert downstream_convention({"run": {"downstream_pressure": "measured"}}) == "measured"
+
+    def test_a_supplied_value_is_keyed_in_atm(self):
+        key = downstream_convention(
+            {"run": {"downstream_pressure": 101.325, "downstream_pressure_unit": "kPa"}}
+        )
+        assert key.startswith("fixed:")
+
+    def test_the_same_pressure_in_two_units_compares_equal(self):
+        """101.325 kPa and 1.01325 bar are one convention, not two."""
+        in_kpa = downstream_convention(
+            {"run": {"downstream_pressure": 101.325, "downstream_pressure_unit": "kPa"}}
+        )
+        in_bar = downstream_convention(
+            {"run": {"downstream_pressure": 1.01325, "downstream_pressure_unit": "bar"}}
+        )
+        assert in_kpa == in_bar
+
+    def test_a_run_block_without_the_key_was_measured_by_definition(self):
+        """The hole this closes: it must not read as 'unknown'.
+
+        A set of runs recorded before P2 became overridable, plus one supplied
+        run, would otherwise collapse to a single distinct convention and slip
+        past the mixed-convention refusal.
+        """
+        assert downstream_convention({"run": {"output_dir": "./runs"}}) == "measured"
+
+    def test_no_run_block_is_genuinely_unknown(self):
+        assert downstream_convention({"sample": {"id": "core-001"}}) is None
+        assert downstream_convention({}) is None
+        assert downstream_convention(None) is None
+
+    def test_descriptions_are_readable(self):
+        assert describe_convention("measured") == "measured"
+        assert describe_convention(None) == "unknown"
+        assert "kPa" in describe_convention("fixed:1")
+
+    def test_a_record_carries_it(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 9, tzinfo=timezone.utc))
+        fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 10, tzinfo=timezone.utc),
+            downstream_pressure=101.325,
+        )
+        conventions = [r.downstream_convention for r in find_runs(runs)]
+        assert conventions[0] == "measured"
+        assert conventions[1].startswith("fixed:")
+
+    def test_a_point_carries_it(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        directory = fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+            downstream_pressure=101.325,
+        )
+        assert point_from_run(directory).downstream_convention.startswith("fixed:")
 
 
 class TestFindRuns:

@@ -613,6 +613,19 @@ class TestKlinkenbergDiscovery:
         assert "skipped" in result.output
         assert "(3 points" in result.output
 
+    def test_the_skip_reason_is_readable_not_a_file_path(self, tmp_path, fake_run_writer):
+        """The message leads with the CSV path, which is redundant and full of dots."""
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 20, tzinfo=timezone.utc), steady=False
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        skipped = next(line for line in result.output.splitlines() if "skipped:" in line)
+        reason = skipped.split("skipped:", 1)[1].strip()
+        assert reason.startswith("never reached steady state")
+        assert "readings" not in reason
+        assert str(runs) not in reason
+
     def test_allow_unsteady_includes_it(self, tmp_path, fake_run_writer):
         rig, runs = self._rig(tmp_path, fake_run_writer)
         fake_run_writer(
@@ -668,6 +681,106 @@ class TestKlinkenbergDiscovery:
         )
         assert result.exit_code == 0, result.output
         assert (runs / "klinkenberg_core-041.png").is_file()
+
+
+class TestMixedDownstreamConventions:
+    """`--sample` sweeps up every run, so a convention mismatch could hide."""
+
+    @staticmethod
+    def _rig(tmp_path, writer, *, conventions):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        runs = rig / "runs"
+        for hour, convention in enumerate(conventions, start=9):
+            writer(
+                runs, "core-041", datetime(2026, 8, 3, hour, tzinfo=timezone.utc),
+                mean_pressure_atm=2.0 + hour - 9,
+                downstream_pressure=convention,
+            )
+        return rig, runs
+
+    def test_a_uniform_series_regresses(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(
+            tmp_path, fake_run_writer, conventions=["measured"] * 3
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert result.exit_code == 0, result.output
+
+    def test_a_mixed_series_is_refused(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(
+            tmp_path, fake_run_writer, conventions=["measured", "measured", 101.325]
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert result.exit_code == 1
+        assert "did not all obtain the downstream" in result.output
+
+    def test_the_listing_shows_the_mismatch_before_the_refusal(
+        self, tmp_path, fake_run_writer
+    ):
+        rig, _ = self._rig(
+            tmp_path, fake_run_writer, conventions=["measured", "measured", 101.325]
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert "P2 measured" in result.output
+        assert "P2 fixed" in result.output
+
+    def test_it_can_be_forced(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(
+            tmp_path, fake_run_writer, conventions=["measured", "measured", 101.325]
+        )
+        result = runner.invoke(
+            app,
+            ["klinkenberg", "--sample", "core-041", "-c", str(rig),
+             "--allow-mixed-conditions"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "downstream pressure differently" in result.output
+
+
+class TestCollectDownstreamFlag:
+    """The flag itself, checked without opening a DAQ."""
+
+    def test_the_config_field_accepts_a_value_and_a_unit(self, tmp_path):
+        rig = tmp_path / "rig"
+        init_config(
+            rig, "run.downstream_pressure=1.0", "run.downstream_pressure_unit=bar"
+        )
+        run = load(rig).run
+        assert run.downstream_pressure == 1.0
+        assert run.fixed_downstream_pressure_atm == pytest.approx(
+            units.bar_to_atm(1.0)
+        )
+
+    def test_a_non_positive_value_is_refused_at_init(self, tmp_path):
+        result = runner.invoke(
+            app,
+            ["init", str(tmp_path / "rig"), "--non-interactive", "--force",
+             "--set", "run.downstream_pressure=0"],
+        )
+        assert result.exit_code == 1
+        assert "positive absolute pressure" in result.output
+
+    @pytest.mark.parametrize("flag", ["--downstream-pressure", "--outlet-pressure"])
+    def test_both_spellings_are_accepted(self, tmp_path, flag):
+        """The user's own wording is 'outlet'; the config field says 'downstream'."""
+        result = runner.invoke(
+            app, ["collect", flag, "101.8", "--config-dir", str(tmp_path)]
+        )
+        # It gets past option parsing and fails on the missing rig instead.
+        assert "No such option" not in result.output
+        assert "hardware.yaml" in result.output
+
+    def test_a_value_that_is_neither_a_number_nor_measured_is_rejected(self, tmp_path):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        add_sample(rig / "samples", "core-041")
+        result = runner.invoke(
+            app,
+            ["collect", "-c", str(rig), "--sample", str(rig / "samples" / "core-041.yaml"),
+             "--downstream-pressure", "ambient"],
+        )
+        assert result.exit_code == 1
+        assert "neither a number nor 'measured'" in result.output
 
 
 class TestCollectFooter:

@@ -32,10 +32,27 @@ flowmeter: null                               # one of: high_range, low_range (n
 confining_pressure: null
 confining_pressure_unit: MPa
 
-# Ambient reference. P1 and P2 are both measured on the DAQ, so this is
-# not a substitute for either -- it converts GAUGE transducer readings to
-# the absolute pressures the Darcy equation needs, and serves as the
-# flowmeter reference when actual_pressure_source is 'atmospheric'.
+# P2 in the Darcy equation. 'measured' reads the outlet transducer, which
+# is what a normally-plumbed rig wants. A number overrides it with a value
+# you supply -- for an outlet that vents to atmosphere, where the
+# transducer reads noise around zero or is not fitted.
+# P2 sets the apparent permeability AND the mean pressure, which is the
+# Klinkenberg regression's x-axis, so 'klinkenberg' refuses to mix runs
+# that used different conventions.
+downstream_pressure: measured                 # measured | a number in downstream_pressure_unit
+downstream_pressure_unit: kPa                 # only used when the above is a number
+downstream_pressure_uncertainty:
+  kind: absolute
+  value: 0.1
+  distribution: rectangular
+  coverage_factor: 2.0
+  degrees_of_freedom: null
+  source: operator-supplied downstream pressure
+
+# Ambient reference -- NOT P2 (see downstream_pressure above). It converts
+# GAUGE transducer readings to the absolute pressures the Darcy equation
+# needs, and serves as the flowmeter reference when actual_pressure_source
+# is 'atmospheric'.
 atmospheric_pressure: 101.325
 atmospheric_pressure_unit: kPa
 atmospheric_pressure_uncertainty:

@@ -10,6 +10,7 @@ import math
 
 import pytest
 
+from gasperm import units
 from gasperm.config import GaspermConfig
 from gasperm.config.common import UncertaintySpec
 from gasperm.models import SampleGeometry
@@ -37,7 +38,7 @@ def point(**overrides) -> MeasurementPoint:
     base = dict(
         permeability_darcy=0.005,
         inlet_pressure_atm=3.0,
-        outlet_pressure_atm=1.0,
+        downstream_pressure_atm=1.0,
         flow_cm3_s=1.6667,
         reference_pressure_atm=1.0,
         viscosity_cp=0.0178,
@@ -342,13 +343,85 @@ class TestCorrelation:
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         assert budget.correlation_relative_variance == 0.0
 
-    def test_correlation_always_applies_because_p2_is_always_a_transducer(self):
-        """Both pressures come from the DAQ, so the covariance term is never skipped."""
+    def test_correlation_applies_when_p2_is_a_transducer(self):
         config = config_with()
         config.hardware.pressure_calibration.correlation = 0.5
         budget = build_budget(point(), geometry(), config.hardware, config.run)
         assert budget.correlation_relative_variance != 0.0
         assert any("covariance term" in n for n in budget.notes)
+
+    def test_correlation_is_dropped_for_a_supplied_downstream_pressure(self):
+        """A stated constant shares no transducer error with P1."""
+        config = config_with(downstream_pressure=101.325)
+        config.hardware.pressure_calibration.correlation = 0.9
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        assert budget.correlation_relative_variance == 0.0
+        assert any("covariance term does not apply" in n for n in budget.notes)
+
+
+class TestSuppliedDownstreamPressure:
+    """P2 stated by the operator rather than read from ai1."""
+
+    def test_its_uncertainty_comes_from_the_run_not_the_transducer(self):
+        config = config_with(downstream_pressure=101.325)
+        config.run.downstream_pressure_uncertainty = UncertaintySpec(
+            kind="absolute", value=0.5
+        )
+        # Make the transducer spec absurd; it must not be consulted.
+        config.hardware.pressure_calibration.outlet.uncertainty = UncertaintySpec(
+            kind="percent_full_scale", value=50.0
+        )
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        p2 = next(c for c in budget.components if c.symbol == "P2")
+
+        expected = units.to_atm(0.5 / math.sqrt(3.0), "kPa") / 1.0
+        assert p2.relative_standard_uncertainty == pytest.approx(expected, rel=1e-9)
+        assert p2.name == "downstream pressure"
+
+    def test_the_symbol_stays_p2(self):
+        """Other tests assert on the symbol set; only the name changes."""
+        config = config_with(downstream_pressure=101.325)
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        assert {"P1", "P2"} <= {c.symbol for c in budget.components}
+
+    def test_a_gauge_rig_does_not_add_ambient_uncertainty_to_a_stated_p2(self):
+        config = config_with(downstream_pressure=101.325)
+        config.hardware.pressure_calibration.outlet.reading_type = "gauge"
+        strict = build_budget(point(), geometry(), config.hardware, config.run)
+        config.run.atmospheric_pressure_uncertainty = UncertaintySpec(
+            kind="absolute", value=50.0
+        )
+        loose = build_budget(point(), geometry(), config.hardware, config.run)
+        assert _p2(loose).relative_standard_uncertainty == pytest.approx(
+            _p2(strict).relative_standard_uncertainty
+        )
+
+    def test_a_meter_at_a_stated_outlet_is_charged_the_stated_uncertainty(self):
+        """Not the outlet transducer's spec -- no transducer produced that number."""
+        config = config_with(downstream_pressure=101.325)
+        config.hardware.flowmeters["low_range"].reading_basis = "actual"
+        config.hardware.pressure_calibration.outlet.uncertainty = UncertaintySpec(
+            kind="percent_full_scale", value=50.0
+        )
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        reference = next(c for c in budget.components if c.symbol == "P_ref")
+        assert reference.relative_standard_uncertainty == pytest.approx(
+            _p2(budget).relative_standard_uncertainty
+        )
+        assert any("perfectly correlated with P2" in n for n in budget.notes)
+
+    def test_a_meter_at_the_inlet_still_uses_the_inlet_transducer(self):
+        config = config_with(downstream_pressure=101.325)
+        meter = config.hardware.flowmeters["low_range"]
+        meter.reading_basis = "actual"
+        meter.actual_pressure_source = "inlet"
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        reference = next(c for c in budget.components if c.symbol == "P_ref")
+        assert reference.source == "inlet transducer"
+
+
+def _p2(budget):
+    return next(c for c in budget.components if c.symbol == "P2")
 
     def test_out_of_range_correlation_is_rejected_by_the_config(self):
         config = GaspermConfig()

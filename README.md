@@ -4,7 +4,7 @@ Gas permeability measurement for core plugs on a lab rig built around an
 **NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
 temperature probe on USB serial.
 
-Three commands:
+Four commands:
 
 | command | what it does |
 |---|---|
@@ -44,7 +44,9 @@ tight-gas-rig/
 
 They are split because they change on completely different timescales: the rig
 on recalibration, the run on every pressure step, the plug whenever a new one is
-loaded.
+loaded. Each run lands in its own timestamped directory: `readings.csv` (every
+sample, raw voltages included, in internal CGS units), `run_metadata.yaml` (a
+full config snapshot plus the summary and uncertainty budget) and `run.log`.
 
 `gasperm init` writes **only** `hardware.yaml` and `run.yaml` — a sample
 describes one plug and a rig measures many, so plugs come from
@@ -89,6 +91,15 @@ gasperm klinkenberg --sample core-041 --plot
 `init` prints the exact `new-sample` and `collect` lines for the folder you
 named, so the paths are never guesswork.
 
+### Adding plugs
+
+`--from` carries over what describes the **core** — lithology, formation, well,
+depth, grain density, porosity method, who prepared it. It never carries the
+id, the geometry, or the per-plug porosity and bulk density: every plug is cut
+and measured individually, and inheriting another plug's length or diameter
+would put a wrong number straight into the Darcy equation. Those are always
+asked for.
+
 ### Regressing a plug's runs
 
 `gasperm klinkenberg --sample core-041` finds **every** run recorded for that
@@ -126,16 +137,47 @@ Regress them:
   gasperm klinkenberg --sample core-041 --plot
 ```
 
-`--from` carries over what describes the **core** — lithology, formation, well,
-depth, grain density, porosity method, who prepared it. It never carries the
-id, the geometry, or the per-plug porosity and bulk density: every plug is cut
-and measured individually, and inheriting another plug's length or diameter
-would put a wrong number straight into the Darcy equation. Those are always
-asked for.
-
 `klinkenberg --sample` selects by plug, and **refuses** runs from more than one
 plug unless you pass `--allow-mixed-samples`. With a directory full of runs from
 a dozen plugs, regressing across rocks would otherwise be a silent mistake.
+
+### A supplied downstream pressure
+
+P2 is the outlet transducer by default. When the outlet vents to atmosphere and
+that transducer reads noise around zero — or is not fitted — supply the value
+instead:
+
+```bash
+gasperm collect --sample samples/core-041.yaml --outlet-pressure 101.8
+```
+
+or set it for a whole series in `run.yaml`:
+
+```yaml
+downstream_pressure: 101.8        # measured | a number
+downstream_pressure_unit: kPa
+```
+
+The outlet transducer is **still recorded** in every reading, and the run summary
+compares it against the value you declared:
+
+```
+! The supplied downstream pressure (101.8 kPa) disagrees with the outlet
+  transducer, which read 4.003 kPa over the same window (96.1%). Either the
+  declared value is wrong, or the outlet is not actually open to it.
+```
+
+That check is the point of keeping both numbers: declaring a pressure while a
+valve is quietly shut would otherwise scale every permeability with nothing to
+show for it.
+
+P2 sets the apparent permeability *and* the mean pressure, which is the
+Klinkenberg regression's own x-axis, so `klinkenberg` **refuses** to mix runs
+that obtained it differently — `--allow-mixed-conditions` overrides. In the
+uncertainty budget a supplied value carries its own
+`downstream_pressure_uncertainty` rather than the transducer's specification,
+and the P1/P2 covariance term is dropped: a stated constant shares no
+calibration error with the inlet.
 
 ### Several flowmeters
 
@@ -161,10 +203,6 @@ command line (`--flowmeter high_range`). Only the selected meter's analog input
 is added to the DAQ task; the others are never read. The meter used is recorded
 in every run's metadata, because two runs on the same plug routinely differ in
 nothing else.
-
-Each run lands in a timestamped directory containing `readings.csv` (every
-sample, raw voltages included, in internal CGS units), `run_metadata.yaml` (a
-full config snapshot plus the summary and uncertainty budget) and `run.log`.
 
 ## Steady state is required, not optional
 
@@ -238,7 +276,7 @@ and the internal calculation.
 ## Development
 
 ```bash
-pytest                    # ~400 tests, no hardware required
+pytest                    # no hardware required
 ruff check gasperm tests
 ```
 

@@ -765,6 +765,17 @@ def collect_command(
         None, "--flowmeter", "-F",
         help="Flowmeter to use for this run, by name from hardware.yaml.",
     ),
+    downstream_pressure: Optional[str] = typer.Option(
+        None, "--downstream-pressure", "--outlet-pressure", metavar="VALUE|measured",
+        help=(
+            "Use a supplied pressure as P2 instead of the outlet transducer, for a rig "
+            "venting to atmosphere. 'measured' forces the transducer back."
+        ),
+    ),
+    downstream_pressure_unit: Optional[str] = typer.Option(
+        None, "--downstream-pressure-unit",
+        help="Unit of --downstream-pressure. Defaults to run.yaml's setting.",
+    ),
     stop_when_steady: bool = typer.Option(
         False, "--stop-when-steady", help="End the run once steady state is confirmed."
     ),
@@ -798,6 +809,29 @@ def collect_command(
         config.run.output_dir = str(output_dir)
     if stop_when_steady:
         config.run.stop_when_steady = True
+    if downstream_pressure_unit is not None:
+        try:
+            config.run.downstream_pressure_unit = downstream_pressure_unit
+        except ValueError as exc:
+            _fail(str(exc))
+            return
+    if downstream_pressure is not None:
+        text = downstream_pressure.strip()
+        if text.lower() == "measured":
+            config.run.downstream_pressure = "measured"
+        else:
+            try:
+                config.run.downstream_pressure = float(text)
+            except ValueError:
+                _fail(
+                    f"--downstream-pressure {downstream_pressure!r} is neither a number "
+                    "nor 'measured'."
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - pydantic rejects non-positive
+                _fail(str(exc))
+                return
+
     if flowmeter is not None:
         if flowmeter not in config.hardware.flowmeters:
             _fail(
@@ -888,6 +922,12 @@ def collect_command(
         f"flowmeter {config.flowmeter_name} ({config.flowmeter.summary})",
         fg=typer.colors.CYAN,
     )
+    if not config.run.downstream_is_measured:
+        typer.secho(
+            f"P2 is the supplied {config.run.downstream_pressure:g} "
+            f"{config.run.downstream_pressure_unit}, not the outlet transducer.",
+            fg=typer.colors.YELLOW,
+        )
     if config.run.steady_state.enabled:
         criteria = config.run.steady_state
         typer.secho(
@@ -1173,14 +1213,36 @@ def _discover_points(records, *, window, allow_unsteady):
                 )
             )
         except (ValueError, FileNotFoundError) as exc:
-            reason = str(exc).split(".")[0].split(", so")[0]
-            skipped.append((record, reason))
+            skipped.append((record, _short_reason(exc, record)))
     return points, skipped
+
+
+def _short_reason(exc: Exception, record) -> str:
+    """The gist of a skip, without the path the operator can already see.
+
+    These messages lead with the CSV's full path, which is both redundant in a
+    listing keyed by run name and full of dots -- so naive sentence-splitting
+    truncates mid-path instead of mid-sentence.
+    """
+    reason = str(exc)
+    for noise in (str(record.readings_csv), str(record.directory)):
+        reason = reason.replace(noise, "")
+    reason = reason.strip().lstrip(":").strip()
+    # Keep the claim, drop the advice that follows it.
+    for separator in (", so ", ". "):
+        reason = reason.split(separator)[0]
+    return reason.strip() or "could not be used"
 
 
 def _print_discovered_runs(sample_id, runs_dir, records, skipped) -> None:
     """Say what was found, and what was left out and why."""
+    from gasperm.storage import describe_convention
+
     reasons = {record.name: reason for record, reason in skipped}
+    # Show P2's provenance only when it varies -- a uniform column is noise,
+    # but a mismatch should be visible here rather than only in the refusal.
+    conventions = {r.downstream_convention for r in records if r.downstream_convention}
+    show_convention = len(conventions) > 1
     typer.secho(
         f"\nFound {len(records)} run{'s' if len(records) != 1 else ''} for "
         f"{sample_id} in {runs_dir}",
@@ -1191,6 +1253,8 @@ def _print_discovered_runs(sample_id, runs_dir, records, skipped) -> None:
             record.started_at.strftime("%Y-%m-%d %H:%MZ") if record.started_at else "unknown"
         )
         line = f"  {record.name:<32} {when}"
+        if show_convention:
+            line += f"   P2 {describe_convention(record.downstream_convention)}"
         if record.name in reasons:
             line += f"   skipped: {reasons[record.name]}"
         elif not record.has_summary:
@@ -1259,6 +1323,10 @@ def klinkenberg_command(
     allow_mixed_samples: bool = typer.Option(
         False, "--allow-mixed-samples",
         help="Permit runs from more than one core plug in a single regression.",
+    ),
+    allow_mixed_conditions: bool = typer.Option(
+        False, "--allow-mixed-conditions",
+        help="Permit runs that obtained P2 differently (measured vs supplied).",
     ),
     coverage: float = typer.Option(
         0.95, "--coverage", help="Level of confidence for the uncertainty on k_L."
@@ -1361,6 +1429,7 @@ def klinkenberg_command(
             points,
             coverage_probability=coverage,
             allow_mixed_samples=allow_mixed_samples,
+            allow_mixed_conditions=allow_mixed_conditions,
         )
     except ValueError as exc:
         _fail(str(exc))

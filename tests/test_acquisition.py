@@ -145,14 +145,15 @@ class TestSampleProcessor:
         )
         assert reading.permeability_darcy == pytest.approx(expected, rel=1e-12)
 
-    def test_p2_always_comes_from_the_outlet_transducer(self, base_config):
-        """P2 is measured on ai1; configuration never substitutes for it."""
+    def test_p2_comes_from_the_outlet_transducer_by_default(self, base_config):
+        """The default is 'measured'; configuration does not substitute for it."""
         base_config = in_kpa(base_config)
         reading = make_processor(base_config).process(
             index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
         )
         # ai1 = 0.5 V of 0-5 V -> 100 kPa, which is NOT the 101.325 kPa ambient.
         assert reading.outlet_pressure_atm == pytest.approx(units.kpa_to_atm(100.0))
+        assert reading.downstream_pressure_atm == reading.outlet_pressure_atm
         assert reading.outlet_pressure_atm != pytest.approx(
             base_config.run.atmospheric_pressure_atm
         )
@@ -225,6 +226,124 @@ class TestSampleProcessor:
         )
         assert reading.steady_state is True
         assert reading.steady_state_passes == 3
+
+
+class TestSuppliedDownstreamPressure:
+    """P2 given by the operator, for a rig whose outlet vents to atmosphere."""
+
+    @staticmethod
+    def _config(base_config, value=101.325):
+        config = in_kpa(base_config)
+        config.run.downstream_pressure = value
+        config.run.downstream_pressure_unit = "kPa"
+        return config
+
+    def _read(self, base_config, voltages=VOLTAGES, **kwargs):
+        processor = make_processor(self._config(base_config, **kwargs))
+        return processor.process(
+            index=0, elapsed_s=0.0, voltages=voltages, temperature=sample()
+        )
+
+    def test_the_supplied_value_becomes_p2(self, base_config):
+        reading = self._read(base_config)
+        assert reading.downstream_pressure_atm == pytest.approx(
+            units.kpa_to_atm(101.325)
+        )
+
+    def test_the_transducer_is_still_recorded(self, base_config):
+        """It is the only evidence the declared pressure matches the rig."""
+        reading = self._read(base_config)
+        assert reading.outlet_pressure_atm == pytest.approx(units.kpa_to_atm(100.0))
+        assert reading.outlet_pressure_atm != reading.downstream_pressure_atm
+
+    def test_mean_pressure_uses_the_supplied_value(self, base_config):
+        reading = self._read(base_config)
+        assert reading.mean_pressure_atm == pytest.approx(
+            (reading.inlet_pressure_atm + units.kpa_to_atm(101.325)) / 2.0
+        )
+
+    def test_the_outlet_voltage_no_longer_moves_the_permeability(self, base_config):
+        low = self._read(base_config, {**VOLTAGES, "ai1": 0.5})
+        high = self._read(base_config, {**VOLTAGES, "ai1": 2.5})
+        assert high.outlet_pressure_atm > low.outlet_pressure_atm
+        assert high.permeability_darcy == pytest.approx(low.permeability_darcy)
+
+    def test_the_darcy_result_matches_a_hand_calculation(self, base_config):
+        config = self._config(base_config)
+        config.sample.dimension_unit = "cm"
+        config.sample.length = 5.0
+        config.sample.diameter = 2.54
+        reading = make_processor(config, viscosity_cp=0.0178).process(
+            index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
+        )
+        expected = compute_gas_permeability(
+            flow_rate_cm3_s=200.0 / 60.0,
+            reference_pressure_atm=units.kpa_to_atm(101.325),
+            viscosity_cp=0.0178,
+            length_cm=5.0,
+            area_cm2=units.circle_area_cm2(2.54),
+            inlet_pressure_atm=units.kpa_to_atm(500.0),
+            outlet_pressure_atm=units.kpa_to_atm(101.325),
+        )
+        assert reading.permeability_darcy == pytest.approx(expected, rel=1e-12)
+
+    def test_a_meter_at_the_outlet_is_referenced_to_the_supplied_value(self, base_config):
+        """Declaring the outlet line's pressure applies to a meter sitting on it."""
+        config = self._config(base_config)
+        config.hardware.flowmeters["low_range"].reading_basis = "actual"
+        reading = make_processor(config).process(
+            index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
+        )
+        assert reading.flow_reference_pressure_atm == pytest.approx(
+            units.kpa_to_atm(101.325)
+        )
+
+    def test_measured_can_be_restored(self, base_config):
+        config = self._config(base_config)
+        config.run.downstream_pressure = "measured"
+        reading = make_processor(config).process(
+            index=0, elapsed_s=0.0, voltages=VOLTAGES, temperature=sample()
+        )
+        assert reading.downstream_pressure_atm == reading.outlet_pressure_atm
+
+    def test_the_console_marks_a_supplied_p2(self, base_config):
+        supplied = self._read(base_config)
+        assert "*" in format_reading_line(supplied, self._config(base_config))
+
+
+class TestDownstreamCrossCheck:
+    """A declared P2 is an assertion; the transducer is the evidence."""
+
+    def _summary(self, config, analog, temperature, samples=80):
+        config.run.max_samples = samples
+        loop = build_loop(config, analog(VOLTAGES), temperature(), clock=FakeClock(step=0.05))
+        loop.run(install_signal_handler=False)
+        return loop.summarize()
+
+    def test_a_large_disagreement_is_reported(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        config = in_kpa(quick_steady_config)
+        # ai1 reads 100 kPa; declaring 300 kPa means something is shut.
+        config.run.downstream_pressure = 300.0
+        summary = self._summary(config, fake_analog_source, fake_temperature_source)
+        assert any("disagrees with the outlet transducer" in w for w in summary.warnings)
+
+    def test_a_matching_value_is_silent(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        config = in_kpa(quick_steady_config)
+        config.run.downstream_pressure = 100.0  # exactly what ai1 reads
+        summary = self._summary(config, fake_analog_source, fake_temperature_source)
+        assert not any("disagrees" in w for w in summary.warnings)
+
+    def test_a_measured_run_is_never_checked(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        summary = self._summary(
+            in_kpa(quick_steady_config), fake_analog_source, fake_temperature_source
+        )
+        assert not any("disagrees" in w for w in summary.warnings)
 
 
 class TestRealGasCorrection:

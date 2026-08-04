@@ -288,6 +288,65 @@ class TestSteadyStateAwareness:
         assert not any("steady state" in w for w in result.warnings)
 
 
+def _mixed_convention_points():
+    """Three points where one run supplied P2 and the others measured it."""
+    points = list(synthetic_points((1.0, 2.0, 4.0)))
+    return [
+        KlinkenbergPoint(
+            mean_pressure_atm=p.mean_pressure_atm,
+            apparent_permeability_darcy=p.apparent_permeability_darcy,
+            label=f"run-{index}",
+            sample_id="core-001",
+            downstream_convention="fixed:1" if index == 1 else "measured",
+        )
+        for index, p in enumerate(points)
+    ]
+
+
+class TestMixedDownstreamConventions:
+    """P2 sets the mean pressure, which is this regression's own x-axis."""
+
+    def test_mixed_conventions_are_refused(self):
+        with pytest.raises(ValueError, match="did not all obtain the downstream"):
+            fit_klinkenberg(_mixed_convention_points())
+
+    def test_the_refusal_names_the_runs_and_their_conventions(self):
+        with pytest.raises(ValueError) as info:
+            fit_klinkenberg(_mixed_convention_points())
+        message = str(info.value)
+        assert "run-0" in message and "run-1" in message
+        assert "measured" in message and "fixed" in message
+
+    def test_it_can_be_forced_and_is_then_warned_about(self):
+        result = fit_klinkenberg(_mixed_convention_points(), allow_mixed_conditions=True)
+        assert any("downstream pressure differently" in w for w in result.warnings)
+
+    def test_one_convention_throughout_is_fine(self):
+        points = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy,
+                downstream_convention="measured",
+            )
+            for p in synthetic_points((1.0, 2.0, 4.0))
+        ]
+        result = fit_klinkenberg(points)
+        assert not any("downstream" in w for w in result.warnings)
+
+    def test_an_unknown_convention_alone_does_not_trigger_it(self):
+        """A run with no sidecar says nothing about how P2 was obtained."""
+        points = list(synthetic_points((1.0, 2.0, 4.0)))
+        mixed = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p.mean_pressure_atm,
+                apparent_permeability_darcy=p.apparent_permeability_darcy,
+                downstream_convention=None if index == 1 else "measured",
+            )
+            for index, p in enumerate(points)
+        ]
+        assert fit_klinkenberg(mixed).point_count == 3
+
+
 class TestRejectedInputs:
     def test_single_point_is_rejected(self):
         with pytest.raises(ValueError, match="at least 2 points"):

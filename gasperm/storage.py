@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -52,6 +52,8 @@ __all__ = [
     "resolve_run_paths",
     "point_from_run",
     "collect_points",
+    "describe_convention",
+    "downstream_convention",
     "safe_sample_id",
     "write_klinkenberg_result",
 ]
@@ -71,6 +73,7 @@ READING_COLUMNS: tuple[str, ...] = (
     "flow_voltage_V",
     "inlet_pressure_atm",
     "outlet_pressure_atm",
+    "downstream_pressure_atm",
     "mean_pressure_atm",
     "flow_cm3_s",
     "flow_reference_cm3_s",
@@ -136,6 +139,7 @@ def _reading_row(reading: Reading) -> dict[str, Any]:
         "flow_voltage_V": f"{reading.flow_voltage:.6f}",
         "inlet_pressure_atm": f"{reading.inlet_pressure_atm:.8g}",
         "outlet_pressure_atm": f"{reading.outlet_pressure_atm:.8g}",
+        "downstream_pressure_atm": f"{reading.downstream_pressure_atm:.8g}",
         "mean_pressure_atm": f"{reading.mean_pressure_atm:.8g}",
         "flow_cm3_s": f"{reading.flow_cm3_s:.8g}",
         "flow_reference_cm3_s": f"{reading.flow_reference_cm3_s:.8g}",
@@ -285,6 +289,10 @@ def read_readings_csv(path: str | Path) -> list[dict[str, Any]]:
                 "mean_pressure_atm": _float_or_none(row.get("mean_pressure_atm")),
                 "inlet_pressure_atm": _float_or_none(row.get("inlet_pressure_atm")),
                 "outlet_pressure_atm": _float_or_none(row.get("outlet_pressure_atm")),
+                # Absent from runs recorded before P2 became overridable.
+                "downstream_pressure_atm": _float_or_none(
+                    row.get("downstream_pressure_atm")
+                ),
                 "permeability_D": _float_or_none(row.get("permeability_D")),
                 "temperature_C": temperature_c,
                 "flow_cm3_s": _float_or_none(row.get("flow_cm3_s")),
@@ -347,11 +355,51 @@ class RunRecord:
     permeability_darcy: float | None = None
     steady_state_reached: bool | None = None
     flowmeter: str | None = None
+    #: How this run obtained P2; see :func:`downstream_convention`.
+    downstream_convention: str | None = None
 
     @property
     def name(self) -> str:
         """The run directory's name, which is what the operator sees."""
         return self.directory.name
+
+
+def downstream_convention(stored_config: Mapping[str, Any] | None) -> str | None:
+    """Canonical key for how a stored run obtained P2.
+
+    ``"measured"``, or ``"fixed:<atm>"`` so that the same physical pressure
+    written as ``101.8 kPa`` and as ``1.018 bar`` compares equal.
+
+    Derived from the *presence of the run block*, not of the key: a sidecar
+    written before P2 became overridable was measured by definition. Returning
+    ``None`` for those would let a set of old runs plus one supplied-P2 run
+    collapse to a single distinct convention and slip past the very check this
+    exists for. ``None`` means genuinely unknown -- no sidecar at all.
+    """
+    if not stored_config:
+        return None
+    run_block = stored_config.get("run")
+    if run_block is None:
+        return None
+
+    value = run_block.get("downstream_pressure", "measured")
+    if isinstance(value, str):
+        return "measured"
+    unit = run_block.get("downstream_pressure_unit", "kPa")
+    try:
+        return f"fixed:{units.to_atm(float(value), unit):.6g}"
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_convention(key: str | None) -> str:
+    """Human-readable form of a convention key, for listings and messages."""
+    if key is None:
+        return "unknown"
+    if key == "measured":
+        return "measured"
+    atm = float(key.split(":", 1)[1])
+    return f"fixed {units.from_atm(atm, 'kPa'):.4g} kPa"
 
 
 def _parse_started_at(metadata: dict[str, Any], directory_name: str) -> datetime | None:
@@ -410,6 +458,7 @@ def _record_from_directory(directory: Path) -> RunRecord:
         permeability_darcy=summary.get("permeability_darcy"),
         steady_state_reached=summary.get("steady_state_reached"),
         flowmeter=experiment.get("flowmeter"),
+        downstream_convention=downstream_convention(stored_config),
     )
 
 
@@ -527,6 +576,7 @@ def point_from_run(
     stored_config = metadata.get("config", {}) if isinstance(metadata, dict) else {}
     sample_id = (stored_config.get("sample") or {}).get("id")
     label = Path(readings_path).parent.name
+    convention = downstream_convention(stored_config)
 
     summary = metadata.get("summary") if isinstance(metadata, dict) else None
     if (
@@ -548,6 +598,7 @@ def point_from_run(
             source_path=str(readings_path),
             sample_id=sample_id or summary.get("sample_id"),
             steady_state=True,
+            downstream_convention=convention,
         )
 
     rows = read_readings_csv(readings_path)
@@ -599,6 +650,7 @@ def point_from_run(
         source_path=str(readings_path),
         sample_id=sample_id,
         steady_state=window is not None,
+        downstream_convention=convention,
     )
 
 
@@ -646,6 +698,7 @@ def write_klinkenberg_result(result, path: str | Path) -> Path:
                 "label": point.label,
                 "sample_id": point.sample_id,
                 "steady_state": point.steady_state,
+                "downstream_pressure": describe_convention(point.downstream_convention),
                 "mean_pressure_atm": point.mean_pressure_atm,
                 "inverse_mean_pressure_per_atm": point.inverse_mean_pressure,
                 "apparent_permeability_D": point.apparent_permeability_darcy,

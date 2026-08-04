@@ -582,11 +582,20 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "Confining/overburden pressure for this run. Usually MPa-scale while\n"
             "pore pressure is kPa-scale, hence its own independent unit."
         ),
+        "downstream_pressure": (
+            "P2 in the Darcy equation. 'measured' reads the outlet transducer, which\n"
+            "is what a normally-plumbed rig wants. A number overrides it with a value\n"
+            "you supply -- for an outlet that vents to atmosphere, where the\n"
+            "transducer reads noise around zero or is not fitted.\n"
+            "P2 sets the apparent permeability AND the mean pressure, which is the\n"
+            "Klinkenberg regression's x-axis, so 'klinkenberg' refuses to mix runs\n"
+            "that used different conventions."
+        ),
         "atmospheric_pressure": (
-            "Ambient reference. P1 and P2 are both measured on the DAQ, so this is\n"
-            "not a substitute for either -- it converts GAUGE transducer readings to\n"
-            "the absolute pressures the Darcy equation needs, and serves as the\n"
-            "flowmeter reference when actual_pressure_source is 'atmospheric'."
+            "Ambient reference -- NOT P2 (see downstream_pressure above). It converts\n"
+            "GAUGE transducer readings to the absolute pressures the Darcy equation\n"
+            "needs, and serves as the flowmeter reference when actual_pressure_source\n"
+            "is 'atmospheric'."
         ),
         "steady_state": (
             "Permeability is only representative once the rig has equilibrated, so\n"
@@ -608,6 +617,8 @@ def render_run_yaml(config: GaspermConfig) -> str:
     }
     comments = {
         "flowmeter": f"one of: {available} (null = rig default)",
+        "downstream_pressure": "measured | a number in downstream_pressure_unit",
+        "downstream_pressure_unit": "only used when the above is a number",
         "gas.name": "any CoolProp fluid: Air, CarbonDioxide, Methane, ...",
         "gas.properties_source": "coolprop (recommended) | fixed",
         "gas.fixed_viscosity_cp": "only when properties_source == fixed",
@@ -751,10 +762,20 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
 
     # -- pressure plausibility -------------------------------------------
     inlet = config.hardware.pressure_calibration.inlet
-    if units.to_atm(inlet.value_max, inlet.unit) < config.run.atmospheric_pressure_atm:
+    inlet_full_scale_atm = units.to_atm(inlet.value_max, inlet.unit)
+    if inlet_full_scale_atm < config.run.atmospheric_pressure_atm:
         warnings.append(
             "The inlet transducer's full-scale reading is below atmospheric pressure; "
             "check pressure_calibration.inlet.unit."
+        )
+
+    supplied_p2 = config.run.fixed_downstream_pressure_atm
+    if supplied_p2 is not None and supplied_p2 >= inlet_full_scale_atm:
+        warnings.append(
+            f"run.downstream_pressure ({config.run.downstream_pressure:g} "
+            f"{config.run.downstream_pressure_unit}) is at or above the inlet "
+            "transducer's full scale, so no reading could ever show a positive "
+            "differential. Check the value and its unit."
         )
 
     # The active meter, for the checks below. Which one is in use is reported

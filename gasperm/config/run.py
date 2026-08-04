@@ -152,13 +152,40 @@ class RunConfig(_Base):
     confining_pressure: float | None = None
     confining_pressure_unit: PressureUnit = "MPa"
 
+    # -- downstream pressure (P2) -----------------------------------------
+    #: What to use as P2 in the Darcy equation.
+    #:
+    #: ``"measured"`` (the default) reads the outlet transducer, which is what
+    #: a normally-plumbed rig wants. A **number** overrides it with a value the
+    #: operator supplies, in ``downstream_pressure_unit`` -- for a rig whose
+    #: outlet vents to atmosphere, where the transducer reads noise around zero
+    #: or is not fitted at all.
+    #:
+    #: This is not a cosmetic choice: P2 sets the apparent permeability through
+    #: ``P1^2 - P2^2`` *and* the mean pore pressure, which is the Klinkenberg
+    #: regression's own abscissa. Runs that used different conventions are
+    #: refused by ``klinkenberg`` unless explicitly allowed.
+    downstream_pressure: float | Literal["measured"] = "measured"
+    downstream_pressure_unit: PressureUnit = "kPa"
+    #: Uncertainty of a supplied downstream pressure, in
+    #: ``downstream_pressure_unit``. Deliberately its own spec rather than
+    #: sharing ``atmospheric_pressure_uncertainty``: that one also feeds the
+    #: gauge-to-absolute conversion of *both* transducers, so widening this
+    #: figure to admit "the back-pressure number is an estimate" must not
+    #: silently widen P1 as well.
+    downstream_pressure_uncertainty: UncertaintySpec = Field(
+        default_factory=lambda: UncertaintySpec(
+            kind="absolute", value=0.1, source="operator-supplied downstream pressure"
+        )
+    )
+
     # -- ambient reference ------------------------------------------------
-    #: Local atmospheric pressure. P1 and P2 both come from their transducers
-    #: on the DAQ, so this is *not* a stand-in for either: it is used only to
-    #: convert **gauge** transducer readings to the absolute pressures the
-    #: Darcy equation needs, and as the flowmeter's reference pressure when
-    #: ``flowmeter.actual_pressure_source`` is ``atmospheric``. With absolute
-    #: transducers on both ports and a standard-basis meter it is unused.
+    #: Local atmospheric pressure. This is *not* P2 -- see
+    #: ``downstream_pressure`` for that. It converts **gauge** transducer
+    #: readings to the absolute pressures the Darcy equation needs, and serves
+    #: as the flowmeter's reference when ``flowmeter.actual_pressure_source``
+    #: is ``atmospheric``. With absolute transducers on both ports and a
+    #: standard-basis meter it is unused.
     atmospheric_pressure: float = Field(default=101.325, gt=0.0)
     atmospheric_pressure_unit: PressureUnit = "kPa"
     #: Uncertainty of that ambient value, in ``atmospheric_pressure_unit``.
@@ -200,6 +227,7 @@ class RunConfig(_Base):
         "atmospheric_pressure_unit",
         "display_pressure_unit",
         "confining_pressure_unit",
+        "downstream_pressure_unit",
     )
     @classmethod
     def _check_pressure_unit(cls, value: str) -> str:
@@ -218,6 +246,22 @@ class RunConfig(_Base):
         return value
 
     @model_validator(mode="after")
+    def _downstream_pressure_is_usable(self) -> RunConfig:
+        """A supplied P2 must be positive and absolute.
+
+        Caught here rather than at the first sample: a mistyped ``0`` would
+        otherwise make *every* reading unusable and only surface as "no sample
+        produced a usable permeability" minutes into the run.
+        """
+        if not isinstance(self.downstream_pressure, str) and self.downstream_pressure <= 0.0:
+            raise ValueError(
+                f"downstream_pressure must be a positive absolute pressure, got "
+                f"{self.downstream_pressure}. Use 'measured' to read the outlet "
+                "transducer instead."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _stop_when_steady_needs_detection(self) -> RunConfig:
         if self.stop_when_steady and not self.steady_state.enabled:
             raise ValueError(
@@ -230,6 +274,18 @@ class RunConfig(_Base):
     def atmospheric_pressure_atm(self) -> float:
         """Configured atmospheric pressure, atm."""
         return units.to_atm(self.atmospheric_pressure, self.atmospheric_pressure_unit)
+
+    @property
+    def fixed_downstream_pressure_atm(self) -> float | None:
+        """The supplied P2 in atm, or ``None`` when it is measured."""
+        if isinstance(self.downstream_pressure, str):
+            return None
+        return units.to_atm(self.downstream_pressure, self.downstream_pressure_unit)
+
+    @property
+    def downstream_is_measured(self) -> bool:
+        """Whether P2 comes from the outlet transducer."""
+        return isinstance(self.downstream_pressure, str)
 
     @property
     def confining_pressure_atm(self) -> float | None:
