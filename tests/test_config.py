@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 import yaml
@@ -27,6 +28,8 @@ from gasperm.config import (
     config_to_dict,
     experiment_metadata,
     load_config,
+    load_run_config,
+    load_sample_config,
     render_hardware_yaml,
     render_run_yaml,
     render_sample_yaml,
@@ -544,6 +547,61 @@ class TestThreeFileIo:
         paths = ConfigPaths.in_directory(tmp_path)
         assert paths.hardware == tmp_path / HARDWARE_FILENAME
         assert len(paths.as_tuple()) == 3
+
+
+class TestSingleSectionLoading:
+    """`klinkenberg` needs run.yaml alone; a rig folder has no sample.yaml."""
+
+    def test_run_config_loads_from_a_rig_folder_without_a_sample(self, tmp_path, base_config):
+        save_config(base_config, tmp_path, sections=("hardware", "run"))
+        assert not (tmp_path / SAMPLE_FILENAME).exists()
+        assert load_run_config(tmp_path / RUN_FILENAME).output_dir == base_config.run.output_dir
+
+    def test_a_wrapped_run_file_also_loads(self, tmp_path, base_config):
+        data = {"run": base_config.run.model_dump(mode="json")}
+        path = tmp_path / RUN_FILENAME
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        assert load_run_config(path).output_dir == base_config.run.output_dir
+
+    def test_a_missing_run_file_names_the_path(self, tmp_path):
+        with pytest.raises(ConfigError, match=RUN_FILENAME):
+            load_run_config(tmp_path / RUN_FILENAME)
+
+    def test_sample_config_loads_on_its_own(self, tmp_path, base_config):
+        base_config.sample.id = "core-042"
+        path = tmp_path / "core-042.yaml"
+        path.write_text(render_sample_yaml(base_config), encoding="utf-8")
+        assert load_sample_config(path).id == "core-042"
+
+    def test_an_invalid_sample_file_is_rejected(self, tmp_path):
+        path = tmp_path / "bad.yaml"
+        path.write_text("length: -5\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="length"):
+            load_sample_config(path)
+
+
+class TestResolvedOutputDir:
+    """Relative paths in the config mean 'relative to the config folder'."""
+
+    def test_relative_output_is_anchored_to_the_config_folder(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        loaded = load_config(tmp_path)
+        assert loaded.run.output_dir == "./runs"
+        assert loaded.resolved_output_dir().resolve() == (tmp_path / "runs").resolve()
+
+    def test_an_absolute_output_is_left_alone(self, tmp_path, base_config):
+        base_config.run.output_dir = (tmp_path / "elsewhere").as_posix()
+        save_config(base_config, tmp_path)
+        assert load_config(tmp_path).resolved_output_dir() == tmp_path / "elsewhere"
+
+    def test_an_unloaded_config_falls_back_to_the_raw_path(self, base_config):
+        """A config built in memory has no folder to anchor against."""
+        assert base_config.config_dir is None
+        assert base_config.resolved_output_dir() == Path(base_config.run.output_dir)
+
+    def test_the_anchor_is_not_serialised(self, tmp_path, base_config):
+        save_config(base_config, tmp_path)
+        assert "config_dir" not in config_to_dict(load_config(tmp_path))
 
 
 class TestLegacyRejection:

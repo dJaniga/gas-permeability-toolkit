@@ -9,8 +9,11 @@ else drives the acquisition loop through the ``AnalogInputSource`` /
 
 from __future__ import annotations
 
+import csv
 import sys
 import types
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -43,6 +46,86 @@ def quick_steady_config(base_config: GaspermConfig) -> GaspermConfig:
     base_config.run.steady_state.min_samples = 3
     base_config.hardware.daq.sample_rate_hz = 1000.0
     return base_config
+
+
+def write_fake_run(
+    runs_dir,
+    sample_id: str,
+    started_at: datetime,
+    *,
+    mean_pressure_atm: float = 2.0,
+    permeability_darcy: float = 0.005,
+    steady: bool = True,
+    sidecar: bool = True,
+    uncertainty_darcy: float | None = 1e-4,
+    flowmeter: str = "low_range",
+) -> Path:
+    """Write a run directory without driving the acquisition loop.
+
+    Enough for discovery and reduction because ``point_from_run`` short-circuits
+    on a stored steady summary and never reads the CSV. Omitting the summary
+    (``steady=False`` or ``sidecar=False``) makes it replay the two-row CSV
+    instead, which cannot satisfy the steady-state criteria -- so those runs are
+    genuinely unsteady rather than merely labelled so.
+    """
+    import yaml
+
+    from gasperm.storage import (
+        METADATA_FILENAME,
+        READING_COLUMNS,
+        READINGS_FILENAME,
+        run_directory_name,
+    )
+
+    directory = Path(runs_dir) / run_directory_name(sample_id, started_at)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    row = {name: "" for name in READING_COLUMNS}
+    row.update(
+        elapsed_s="0.0", mean_pressure_atm=f"{mean_pressure_atm:g}",
+        inlet_pressure_atm=f"{mean_pressure_atm * 1.5:g}",
+        outlet_pressure_atm=f"{mean_pressure_atm * 0.5:g}",
+        permeability_D=f"{permeability_darcy:g}", temperature_C="22.0",
+        flow_cm3_s="1.5", steady_state="1" if steady else "0",
+    )
+    with (directory / READINGS_FILENAME).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(READING_COLUMNS))
+        writer.writeheader()
+        for index in (0, 1):
+            writer.writerow({**row, "index": index, "elapsed_s": f"{index:.1f}"})
+
+    if sidecar:
+        payload = {
+            "gasperm_run": {
+                "started_at": started_at.isoformat(),
+                "readings_csv": READINGS_FILENAME,
+                "rows": 2,
+            },
+            "metadata": {"sample_id": sample_id, "flowmeter": flowmeter},
+            "config": {"sample": {"id": sample_id}},
+        }
+        if steady:
+            payload["summary"] = {
+                "sample_id": sample_id,
+                "steady_state_reached": True,
+                "mean_pressure_atm": mean_pressure_atm,
+                "permeability_darcy": permeability_darcy,
+                "uncertainty": (
+                    {"combined_standard_uncertainty_darcy": uncertainty_darcy}
+                    if uncertainty_darcy is not None
+                    else None
+                ),
+            }
+        (directory / METADATA_FILENAME).write_text(
+            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+        )
+    return directory
+
+
+@pytest.fixture
+def fake_run_writer():
+    """Factory for :func:`write_fake_run`."""
+    return write_fake_run
 
 
 @pytest.fixture

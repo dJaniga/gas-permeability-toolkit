@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
@@ -40,13 +42,17 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "READING_COLUMNS",
+    "RunRecord",
     "RunWriter",
+    "find_runs",
     "read_readings_csv",
     "read_run_metadata",
     "run_directory_name",
+    "runs_for_sample",
     "resolve_run_paths",
     "point_from_run",
     "collect_points",
+    "safe_sample_id",
     "write_klinkenberg_result",
 ]
 
@@ -83,11 +89,20 @@ READING_COLUMNS: tuple[str, ...] = (
 )
 
 
+def safe_sample_id(sample_id: str) -> str:
+    """Filesystem-safe form of a sample id, as used in run directory names.
+
+    Lossy on purpose: ``core/041`` and ``core_041`` both become ``core_041``.
+    The metadata sidecar is therefore authoritative for a run's sample id, and
+    the directory prefix is only a fallback for a run whose sidecar was lost.
+    """
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in sample_id) or "sample"
+
+
 def run_directory_name(sample_id: str, started_at: datetime | None = None) -> str:
     """Timestamped directory name for a run, e.g. ``core-001_20260803T141530Z``."""
     moment = (started_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in sample_id) or "sample"
-    return f"{safe_id}_{moment.strftime('%Y%m%dT%H%M%SZ')}"
+    return f"{safe_sample_id(sample_id)}_{moment.strftime('%Y%m%dT%H%M%SZ')}"
 
 
 def _unique_directory(preferred: Path) -> Path:
@@ -146,7 +161,8 @@ class RunWriter:
         self.config = config
         self.started_at = started_at or datetime.now(timezone.utc)
         self.directory = _unique_directory(
-            Path(config.run.output_dir) / run_directory_name(config.sample.id, self.started_at)
+            config.resolved_output_dir()
+            / run_directory_name(config.sample.id, self.started_at)
         )
         self.readings_path = self.directory / READINGS_FILENAME
         self.metadata_path = self.directory / METADATA_FILENAME
@@ -296,6 +312,154 @@ def read_run_metadata(path: str | Path) -> dict[str, Any]:
         logger.warning("Could not parse %s: %s", metadata_path, exc)
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# --------------------------------------------------------------------------
+# Discovering runs
+# --------------------------------------------------------------------------
+
+#: ``<sample>_<YYYYMMDDTHHMMSSZ>`` with an optional ``-2`` collision suffix.
+_RUN_DIR_PATTERN = re.compile(r"^(?P<sample>.+)_(?P<stamp>\d{8}T\d{6}Z)(?:-\d+)?$")
+
+#: Sort floor for a run whose start time cannot be determined at all.
+_UNKNOWN_START = datetime(1, 1, 1, tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """One discovered ``collect`` run, summarised without reading its CSV.
+
+    Discovery has to stay cheap over a directory holding hundreds of runs, so
+    everything here comes from the metadata sidecar. The measured fields are
+    ``None`` for a run that never got one; :func:`point_from_run` reads the CSV
+    later, and only for the runs actually used.
+    """
+
+    directory: Path
+    readings_csv: Path
+    metadata_path: Path | None
+    sample_id: str | None
+    #: False when the id was recovered from the directory name, which is lossy.
+    sample_id_from_metadata: bool
+    started_at: datetime | None
+    has_summary: bool
+    mean_pressure_atm: float | None = None
+    permeability_darcy: float | None = None
+    steady_state_reached: bool | None = None
+    flowmeter: str | None = None
+
+    @property
+    def name(self) -> str:
+        """The run directory's name, which is what the operator sees."""
+        return self.directory.name
+
+
+def _parse_started_at(metadata: dict[str, Any], directory_name: str) -> datetime | None:
+    """Start time from the sidecar, falling back to the directory stamp."""
+    stamp = (metadata.get("gasperm_run") or {}).get("started_at")
+    if isinstance(stamp, str) and stamp:
+        text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            moment = None
+        if moment is not None:
+            # A hand-edited sidecar can be naive; make every record comparable
+            # so sorting cannot raise.
+            return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+    match = _RUN_DIR_PATTERN.match(directory_name)
+    if match:
+        try:
+            return datetime.strptime(match["stamp"], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            pass
+    return None
+
+
+def _record_from_directory(directory: Path) -> RunRecord:
+    """Summarise one run directory that is known to hold a readings CSV."""
+    metadata_path = directory / METADATA_FILENAME
+    metadata = read_run_metadata(metadata_path) if metadata_path.is_file() else {}
+
+    stored_config = metadata.get("config") or {}
+    experiment = metadata.get("metadata") or {}
+    summary = metadata.get("summary") or {}
+
+    sample_id = (
+        (stored_config.get("sample") or {}).get("id")
+        or experiment.get("sample_id")
+        or summary.get("sample_id")
+    )
+    from_metadata = bool(sample_id)
+    if not sample_id:
+        match = _RUN_DIR_PATTERN.match(directory.name)
+        sample_id = match["sample"] if match else None
+
+    return RunRecord(
+        directory=directory,
+        readings_csv=directory / READINGS_FILENAME,
+        metadata_path=metadata_path if metadata_path.is_file() else None,
+        sample_id=sample_id,
+        sample_id_from_metadata=from_metadata,
+        started_at=_parse_started_at(metadata, directory.name),
+        has_summary=bool(summary),
+        mean_pressure_atm=summary.get("mean_pressure_atm"),
+        permeability_darcy=summary.get("permeability_darcy"),
+        steady_state_reached=summary.get("steady_state_reached"),
+        flowmeter=experiment.get("flowmeter"),
+    )
+
+
+def find_runs(runs_dir: str | Path) -> list[RunRecord]:
+    """Every ``collect`` run directly under ``runs_dir``, oldest first.
+
+    A run is an immediate subdirectory containing ``readings.csv``. That test
+    also excludes the ``klinkenberg_*.yaml`` and ``.png`` result files that sit
+    alongside the runs. A run whose sidecar is missing or corrupt is still
+    listed -- the CSV is the measurement, and hiding it would be worse than
+    showing it with unknown metadata.
+
+    Raises:
+        FileNotFoundError: ``runs_dir`` does not exist or is not a directory.
+            An empty list would not distinguish "wrong path" from "nothing
+            recorded yet", and those need different fixes.
+    """
+    base = Path(runs_dir)
+    if not base.is_dir():
+        raise FileNotFoundError(
+            f"No such runs directory: {base}. Nothing has been recorded there yet, or "
+            "the path is wrong -- check run.output_dir, or pass --runs-dir."
+        )
+
+    records = [
+        _record_from_directory(child)
+        for child in base.iterdir()
+        if child.is_dir() and (child / READINGS_FILENAME).is_file()
+    ]
+    records.sort(key=lambda record: (record.started_at or _UNKNOWN_START, record.name))
+    return records
+
+
+def runs_for_sample(records: Sequence[RunRecord], sample_id: str) -> list[RunRecord]:
+    """The records belonging to one core plug.
+
+    Ids that came from a sidecar are compared exactly. Ids recovered from a
+    directory name are compared against the sanitised form, because that is all
+    the name preserves.
+    """
+    wanted_safe = safe_sample_id(sample_id)
+    return [
+        record
+        for record in records
+        if (
+            record.sample_id == sample_id
+            if record.sample_id_from_metadata
+            else record.sample_id == wanted_safe
+        )
+    ]
 
 
 def resolve_run_paths(target: str | Path) -> tuple[Path, Path | None]:

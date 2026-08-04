@@ -7,7 +7,9 @@ operator drives between runs -- adding plugs and choosing a meter.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import yaml
@@ -83,15 +85,31 @@ class TestInitFolder:
         """A bench's config, plugs and measurements stay together."""
         rig = tmp_path / "rig"
         init_config(rig)
-        assert load(rig).run.output_dir == f"{rig.as_posix()}/runs"
+        # Written relative to the rig folder, not to whatever directory init
+        # was invoked from -- the folder name must not be baked in.
+        assert load(rig).run.output_dir == cli.DEFAULT_OUTPUT_DIR == "./runs"
 
-    def test_a_relative_folder_keeps_a_relative_output_dir(self):
-        """And an absolute one is not mangled with a leading './'."""
-        assert cli._default_output_dir(Path("tight-gas-rig")) == "./tight-gas-rig/runs"
-        assert cli._default_output_dir(Path("./rig")) == "./rig/runs"
-        absolute = Path.cwd() / "rig"
-        assert cli._default_output_dir(absolute) == f"{absolute.as_posix()}/runs"
-        assert not cli._default_output_dir(absolute).startswith("./")
+    def test_the_runs_directory_does_not_move_with_the_working_directory(self, tmp_path):
+        """The bug this replaced: './rig/runs' became 'rig/rig/runs' after a cd."""
+        rig = tmp_path / "rig"
+        init_config(rig)
+        expected = (rig / "runs").resolve()
+        assert load(rig).resolved_output_dir().resolve() == expected
+
+        import os
+
+        previous = os.getcwd()
+        os.chdir(rig)
+        try:
+            assert load(Path(".")).resolved_output_dir().resolve() == expected
+        finally:
+            os.chdir(previous)
+
+    def test_an_absolute_output_dir_is_left_alone(self, tmp_path):
+        rig = tmp_path / "rig"
+        absolute = (tmp_path / "elsewhere").as_posix()
+        init_config(rig, f"run.output_dir={absolute}")
+        assert load(rig).resolved_output_dir() == Path(absolute)
 
     def test_an_explicit_output_dir_still_wins(self, tmp_path):
         rig = tmp_path / "rig"
@@ -489,6 +507,218 @@ class TestUnitPromptHelper:
         for unit in units.SUPPORTED_PRESSURE_UNITS:
             self._answers(monkeypatch, [unit])
             assert cli._prompt_pressure_unit("Pressure unit", "kPa") == unit
+
+
+class TestKlinkenbergDiscovery:
+    """`--sample` replaces typing every run directory."""
+
+    @staticmethod
+    def _rig(tmp_path, writer, *, plugs=("core-041",), runs_per_plug=3):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        runs = rig / "runs"
+        hour = 9
+        for plug in plugs:
+            for step in range(runs_per_plug):
+                writer(
+                    runs, plug, datetime(2026, 8, 3, hour, 0, tzinfo=timezone.utc),
+                    mean_pressure_atm=2.0 + step,
+                    permeability_darcy=0.005 * (1.0 + 0.2 / (2.0 + step)),
+                )
+                hour += 1
+        return rig, runs
+
+    def test_regresses_every_run_for_the_plug(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(tmp_path, fake_run_writer)
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert result.exit_code == 0, result.output
+        assert "Found 3 runs for core-041" in result.output
+        assert "k_L (liquid-equivalent)" in result.output
+
+    def test_results_are_named_per_plug(self, tmp_path, fake_run_writer):
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert (runs / "klinkenberg_core-041.yaml").is_file()
+        assert not (runs / "klinkenberg.yaml").exists()
+
+    def test_a_second_plug_does_not_overwrite_the_first(self, tmp_path, fake_run_writer):
+        """The collision this change fixes."""
+        rig, runs = self._rig(tmp_path, fake_run_writer, plugs=("core-041", "core-042"))
+        for plug in ("core-041", "core-042"):
+            result = runner.invoke(app, ["klinkenberg", "--sample", plug, "-c", str(rig)])
+            assert result.exit_code == 0, result.output
+
+        first = yaml.safe_load((runs / "klinkenberg_core-041.yaml").read_text(encoding="utf-8"))
+        second = yaml.safe_load((runs / "klinkenberg_core-042.yaml").read_text(encoding="utf-8"))
+        assert {p["sample_id"] for p in first["points"]} == {"core-041"}
+        assert {p["sample_id"] for p in second["points"]} == {"core-042"}
+
+    def test_only_the_named_plugs_runs_are_used(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(tmp_path, fake_run_writer, plugs=("core-041", "core-042"))
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert "Found 3 runs" in result.output
+        assert "core-042" not in result.output
+
+    def test_a_sample_file_works_the_same_as_an_id(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(tmp_path, fake_run_writer)
+        sample_file = add_sample(rig / "samples", "core-041")
+        by_id = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        by_file = runner.invoke(app, ["klinkenberg", "--sample", str(sample_file), "-c", str(rig)])
+        assert by_file.exit_code == 0, by_file.output
+        assert "Found 3 runs for core-041" in by_file.output
+        assert by_id.exit_code == by_file.exit_code
+
+    def test_a_missing_sample_file_is_not_treated_as_an_id(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(tmp_path, fake_run_writer)
+        result = runner.invoke(
+            app, ["klinkenberg", "--sample", "samples/nope.yaml", "-c", str(rig)]
+        )
+        assert result.exit_code == 1
+        assert "No such sample file" in result.output
+
+    def test_an_unknown_plug_lists_the_ones_present(self, tmp_path, fake_run_writer):
+        rig, _ = self._rig(tmp_path, fake_run_writer, plugs=("core-041", "core-042"))
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-999", "-c", str(rig)])
+        assert result.exit_code == 1
+        assert "core-041" in result.output and "core-042" in result.output
+
+    def test_runs_dir_works_without_any_run_yaml(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "loose"
+        for step in range(3):
+            fake_run_writer(
+                runs, "core-041", datetime(2026, 8, 3, 9 + step, tzinfo=timezone.utc),
+                mean_pressure_atm=2.0 + step,
+            )
+        result = runner.invoke(
+            app, ["klinkenberg", "--sample", "core-041", "--runs-dir", str(runs)]
+        )
+        assert result.exit_code == 0, result.output
+        assert (runs / "klinkenberg_core-041.yaml").is_file()
+
+    def test_no_runs_dir_and_no_run_yaml_says_so(self, tmp_path):
+        result = runner.invoke(
+            app, ["klinkenberg", "--sample", "core-041", "-c", str(tmp_path)]
+        )
+        assert result.exit_code == 1
+        assert "--runs-dir" in result.output
+
+    def test_an_unsteady_run_is_skipped_with_a_reason(self, tmp_path, fake_run_writer):
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 20, tzinfo=timezone.utc), steady=False
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert result.exit_code == 0, result.output
+        assert "Found 4 runs" in result.output
+        assert "skipped" in result.output
+        assert "(3 points" in result.output
+
+    def test_allow_unsteady_includes_it(self, tmp_path, fake_run_writer):
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 20, tzinfo=timezone.utc), steady=False
+        )
+        result = runner.invoke(
+            app, ["klinkenberg", "--sample", "core-041", "-c", str(rig), "--allow-unsteady"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "(4 points" in result.output
+
+    def test_too_few_usable_runs_fails_clearly(self, tmp_path, fake_run_writer):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        fake_run_writer(
+            rig / "runs", "core-041", datetime(2026, 8, 3, 9, tzinfo=timezone.utc)
+        )
+        result = runner.invoke(app, ["klinkenberg", "--sample", "core-041", "-c", str(rig)])
+        assert result.exit_code == 1
+        assert "at least" in result.output
+
+    def test_sample_cannot_be_combined_with_paths_or_csv(self, tmp_path, fake_run_writer):
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        both = runner.invoke(
+            app, ["klinkenberg", str(runs), "--sample", "core-041", "-c", str(rig)]
+        )
+        assert both.exit_code == 1
+        assert "exactly one" in both.output
+
+    def test_nothing_at_all_mentions_sample(self, tmp_path):
+        result = runner.invoke(app, ["klinkenberg"])
+        assert result.exit_code == 1
+        assert "--sample" in result.output
+
+    def test_positional_mode_also_gets_a_per_plug_filename(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        directories = [
+            fake_run_writer(
+                runs, "core-041", datetime(2026, 8, 3, 9 + step, tzinfo=timezone.utc),
+                mean_pressure_atm=2.0 + step,
+            )
+            for step in range(3)
+        ]
+        result = runner.invoke(app, ["klinkenberg", *[str(d) for d in directories]])
+        assert result.exit_code == 0, result.output
+        assert (runs / "klinkenberg_core-041.yaml").is_file()
+
+    def test_plot_lands_beside_the_results(self, tmp_path, fake_run_writer):
+        pytest.importorskip("matplotlib")
+        rig, runs = self._rig(tmp_path, fake_run_writer)
+        result = runner.invoke(
+            app, ["klinkenberg", "--sample", "core-041", "-c", str(rig), "--plot"]
+        )
+        assert result.exit_code == 0, result.output
+        assert (runs / "klinkenberg_core-041.png").is_file()
+
+
+class TestCollectFooter:
+    """The count printed after a run. Deliberately says nothing about targets."""
+
+    def test_the_command_line_for_the_current_folder(self):
+        assert cli._klinkenberg_command_line("core-041", Path(".")) == (
+            "gasperm klinkenberg --sample core-041 --plot"
+        )
+
+    def test_a_rig_folder_is_passed_through(self):
+        line = cli._klinkenberg_command_line("core-041", Path("tight-gas-rig"))
+        assert "-c tight-gas-rig" in line and "--sample core-041" in line
+
+    def test_an_overridden_output_dir_is_spelled_out(self):
+        line = cli._klinkenberg_command_line("core-041", Path("."), Path("/data/runs"))
+        assert "--runs-dir" in line
+
+    def test_the_footer_counts_the_plugs_runs(self, tmp_path, fake_run_writer, base_config):
+        runs = tmp_path / "runs"
+        for step in range(3):
+            fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 9 + step, tzinfo=timezone.utc))
+        base_config.sample.id = "core-041"
+
+        class _Writer:
+            directory = runs / "core-041_20260803T090000Z"
+
+        printed = []
+        with mock.patch.object(cli.typer, "echo", lambda *a, **k: printed.append(str(a[0] if a else ""))), \
+             mock.patch.object(cli.typer, "secho", lambda *a, **k: printed.append(str(a[0] if a else ""))):
+            cli._print_collect_next_steps(base_config, _Writer(), Path("."), False)
+        text = "\n".join(printed)
+        assert "3 runs recorded for core-041" in text
+        assert "gasperm klinkenberg --sample core-041" in text
+
+    def test_the_footer_offers_no_target_or_coaching(self, tmp_path, fake_run_writer, base_config):
+        """The user asked to manage the point count themselves."""
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 9, tzinfo=timezone.utc))
+        base_config.sample.id = "core-041"
+
+        class _Writer:
+            directory = runs / "core-041_20260803T090000Z"
+
+        printed = []
+        with mock.patch.object(cli.typer, "echo", lambda *a, **k: printed.append(str(a[0] if a else ""))), \
+             mock.patch.object(cli.typer, "secho", lambda *a, **k: printed.append(str(a[0] if a else ""))):
+            cli._print_collect_next_steps(base_config, _Writer(), Path("."), False)
+        text = "\n".join(printed).lower()
+        for banned in (" of 3", "target", "suggest", "at least", "only ", "more point"):
+            assert banned not in text, f"footer should not coach the operator: {banned!r}"
 
 
 class TestVersion:

@@ -78,13 +78,53 @@ cd tight-gas-rig
 gasperm new-sample core-041 --dir samples        # -> samples/core-041.yaml
 gasperm new-sample --dir samples --from samples/core-041.yaml   # asks id, then this plug
 
+# one collect per mean pressure -- at least three for a Klinkenberg fit
+gasperm collect --sample samples/core-041.yaml --flowmeter low_range
 gasperm collect --sample samples/core-041.yaml --flowmeter low_range
 gasperm collect --sample samples/core-041.yaml --flowmeter high_range
-gasperm klinkenberg runs/core-041_* --plot
+
+gasperm klinkenberg --sample core-041 --plot
 ```
 
 `init` prints the exact `new-sample` and `collect` lines for the folder you
 named, so the paths are never guesswork.
+
+### Regressing a plug's runs
+
+`gasperm klinkenberg --sample core-041` finds **every** run recorded for that
+plug and regresses them — no globbing, no typing directory names. It reports
+what it found first:
+
+```
+Found 4 runs for core-041 in runs
+  core-041_20260804T091200Z        2026-08-04 09:12Z
+  core-041_20260804T095100Z        2026-08-04 09:51Z
+  core-041_20260804T102300Z        2026-08-04 10:23Z
+  core-041_20260804T110400Z        2026-08-04 11:04Z   skipped: never reached steady state
+1 run skipped. Pass --allow-unsteady to include them.
+```
+
+A run that never settled is skipped with its reason rather than failing the
+whole regression — a plug's history legitimately includes aborted attempts.
+`--allow-unsteady` includes them.
+
+`--sample` takes a bare id or the sample file you passed to `collect`
+(`--sample samples/core-041.yaml`), whichever is to hand. The runs directory
+comes from `run.yaml`; `--runs-dir` overrides it, and `-c <rig folder>` works
+from anywhere.
+
+Results are written per plug — `runs/klinkenberg_core-041.yaml` and its `.png`
+— so measuring the next plug never overwrites the last one.
+
+How many points to take is your call; nothing here nags about it. After each
+run `collect` simply says how many that plug now has:
+
+```
+3 runs recorded for core-041 in runs.
+
+Regress them:
+  gasperm klinkenberg --sample core-041 --plot
+```
 
 `--from` carries over what describes the **core** — lithology, formation, well,
 depth, grain density, porosity method, who prepared it. It never carries the
@@ -93,9 +133,9 @@ and measured individually, and inheriting another plug's length or diameter
 would put a wrong number straight into the Darcy equation. Those are always
 asked for.
 
-`klinkenberg` **refuses** runs from more than one plug unless you pass
-`--allow-mixed-samples`. With a directory full of runs from a dozen plugs, a
-careless glob is otherwise a silent way to regress across rocks.
+`klinkenberg --sample` selects by plug, and **refuses** runs from more than one
+plug unless you pass `--allow-mixed-samples`. With a directory full of runs from
+a dozen plugs, regressing across rocks would otherwise be a silent mistake.
 
 ### Several flowmeters
 

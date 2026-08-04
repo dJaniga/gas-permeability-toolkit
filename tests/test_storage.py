@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime, timezone
 
 import pytest
 import yaml
@@ -16,11 +17,14 @@ from gasperm.storage import (
     READING_COLUMNS,
     RunWriter,
     collect_points,
+    find_runs,
     point_from_run,
     read_readings_csv,
     read_run_metadata,
     resolve_run_paths,
     run_directory_name,
+    runs_for_sample,
+    safe_sample_id,
     write_klinkenberg_result,
 )
 
@@ -359,6 +363,121 @@ class TestPointFromRun:
         assert result.point_count == 3
         assert result.weighted is True
         assert 0.0 <= result.r_squared <= 1.0
+
+
+class TestFindRuns:
+    """Discovery over a runs directory, without reading any CSV."""
+
+    def _tree(self, tmp_path, writer):
+        runs = tmp_path / "runs"
+        writer(runs, "core-041", datetime(2026, 8, 3, 14, 15, tzinfo=timezone.utc),
+               mean_pressure_atm=2.07)
+        writer(runs, "core-041", datetime(2026, 8, 3, 15, 22, tzinfo=timezone.utc),
+               mean_pressure_atm=4.64)
+        writer(runs, "core-042", datetime(2026, 8, 3, 16, 1, tzinfo=timezone.utc),
+               mean_pressure_atm=3.11)
+        return runs
+
+    def test_finds_every_run(self, tmp_path, fake_run_writer):
+        runs = self._tree(tmp_path, fake_run_writer)
+        assert len(find_runs(runs)) == 3
+
+    def test_finds_runs_written_by_the_real_writer(
+        self, run_config, fake_analog_source, fake_temperature_source
+    ):
+        _, writer = run_once(run_config, fake_analog_source(VOLTAGES), fake_temperature_source())
+        writer.write_metadata()
+        records = find_runs(writer.directory.parent)
+        assert [r.directory for r in records] == [writer.directory]
+        assert records[0].sample_id == run_config.sample.id
+
+    def test_ignores_things_that_are_not_runs(self, tmp_path, fake_run_writer):
+        runs = self._tree(tmp_path, fake_run_writer)
+        (runs / "klinkenberg_core-041.yaml").write_text("x: 1\n", encoding="utf-8")
+        (runs / "klinkenberg_core-041.png").write_bytes(b"")
+        (runs / "notes").mkdir()
+        assert len(find_runs(runs)) == 3
+
+    def test_sorted_oldest_first(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc))
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc))
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+        hours = [r.started_at.hour for r in find_runs(runs)]
+        assert hours == [9, 12, 16]
+
+    def test_carries_the_summary_fields(self, tmp_path, fake_run_writer):
+        runs = self._tree(tmp_path, fake_run_writer)
+        record = find_runs(runs)[0]
+        assert record.has_summary
+        assert record.mean_pressure_atm == pytest.approx(2.07)
+        assert record.permeability_darcy == pytest.approx(0.005)
+        assert record.steady_state_reached is True
+        assert record.flowmeter == "low_range"
+        assert record.sample_id_from_metadata is True
+
+    def test_a_run_without_a_sidecar_is_still_found(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc),
+                        sidecar=False)
+        record = find_runs(runs)[0]
+        assert record.sample_id == "core-041"
+        assert record.sample_id_from_metadata is False
+        assert record.has_summary is False
+        assert record.started_at.hour == 14  # recovered from the directory stamp
+
+    def test_a_corrupt_sidecar_does_not_hide_the_run(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        directory = fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+        )
+        (directory / METADATA_FILENAME).write_text("{[not yaml\n", encoding="utf-8")
+        record = find_runs(runs)[0]
+        assert record.directory == directory
+        assert record.has_summary is False
+
+    def test_a_collision_suffixed_directory_is_understood(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        directory = fake_run_writer(
+            runs, "core-041", datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc), sidecar=False
+        )
+        directory.rename(directory.with_name(directory.name + "-2"))
+        record = find_runs(runs)[0]
+        assert record.sample_id == "core-041"
+        assert record.started_at.hour == 14
+
+    def test_a_missing_directory_is_an_error_not_an_empty_list(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="No such runs directory"):
+            find_runs(tmp_path / "nope")
+
+    def test_an_empty_directory_is_simply_empty(self, tmp_path):
+        (tmp_path / "runs").mkdir()
+        assert find_runs(tmp_path / "runs") == []
+
+
+class TestRunsForSample:
+    def test_filters_to_one_plug(self, tmp_path, fake_run_writer):
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc))
+        fake_run_writer(runs, "core-041", datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc))
+        fake_run_writer(runs, "core-042", datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc))
+        records = find_runs(runs)
+        assert len(runs_for_sample(records, "core-041")) == 2
+        assert len(runs_for_sample(records, "core-042")) == 1
+        assert runs_for_sample(records, "core-099") == []
+
+    def test_a_sidecarless_run_matches_on_the_sanitised_id(self, tmp_path, fake_run_writer):
+        """The directory name is all that is left, and it is lossy."""
+        runs = tmp_path / "runs"
+        fake_run_writer(runs, "core/041", datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc),
+                        sidecar=False)
+        records = find_runs(runs)
+        assert records[0].sample_id == "core_041"
+        assert len(runs_for_sample(records, "core/041")) == 1
+
+    def test_safe_sample_id_matches_the_directory_prefix(self):
+        name = run_directory_name("core/041 A", datetime(2026, 8, 3, tzinfo=timezone.utc))
+        assert name.startswith(safe_sample_id("core/041 A"))
 
 
 class TestKlinkenbergOutput:

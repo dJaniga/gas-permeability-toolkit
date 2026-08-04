@@ -483,21 +483,10 @@ def _prompt_run(data: dict[str, Any]) -> None:
     )
 
 
-def _default_output_dir(directory: Path) -> str:
-    """Where runs should go for a rig configured in ``directory``.
-
-    Inside the rig's own folder, so a bench's configuration, its plugs and its
-    measurements stay together instead of scattering into whatever directory
-    ``collect`` happened to be invoked from.
-    """
-    output = directory / "runs"
-    text = output.as_posix()
-    # Only mark a relative path as relative. A Windows absolute path starts
-    # with a drive letter, not a slash, so testing the string would turn
-    # "C:/rig/runs" into "./C:/rig/runs".
-    if output.is_absolute() or text.startswith("."):
-        return text
-    return f"./{text}"
+#: Runs live inside the rig folder. Written relative to that folder, not to the
+#: caller's working directory, so the rig stays self-contained and relocatable
+#: -- ``resolved_output_dir()`` anchors it to wherever run.yaml is found.
+DEFAULT_OUTPUT_DIR = "./runs"
 
 
 @app.command("init")
@@ -538,9 +527,7 @@ def init_command(
 
     defaults = GaspermConfig()
     data = config_to_dict(defaults)
-    # Offer the rig's own runs/ as the default output, so the prompt shows it
-    # and --set can still override it.
-    data["run"]["output_dir"] = _default_output_dir(directory)
+    data["run"]["output_dir"] = DEFAULT_OUTPUT_DIR
     if not non_interactive:
         try:
             _prompt_hardware(data, defaults)
@@ -956,10 +943,63 @@ def collect_command(
             f"{len(loop.warnings)} note(s) logged to {writer.log_path}",
             fg=typer.colors.YELLOW,
         )
+
+    try:
+        _print_collect_next_steps(config, writer, config_dir, output_dir is not None)
+    except OSError as exc:
+        # A convenience footer must never turn a good run into a traceback, nor
+        # swallow the exit code that says steady state was not reached.
+        logger.debug("Could not summarise sibling runs: %s", exc)
+
     if summary is not None and not summary.steady_state_reached:
         exit_code = exit_code or 2
     if exit_code:
         raise typer.Exit(code=exit_code)
+
+
+def _klinkenberg_command_line(
+    sample_id: str, config_dir: Path, runs_dir: Path | None = None
+) -> str:
+    """The ready-to-paste regression command for this plug."""
+    parts = ["gasperm klinkenberg"]
+    if config_dir != Path("."):
+        parts.append(f"-c {config_dir}")
+    parts.append(f"--sample {sample_id}")
+    if runs_dir is not None:
+        # run.yaml no longer names where this run went, so spell it out.
+        parts.append(f"--runs-dir {runs_dir}")
+    parts.append("--plot")
+    return " ".join(parts)
+
+
+def _print_collect_next_steps(
+    config: GaspermConfig, writer, config_dir: Path, output_dir_overridden: bool
+) -> None:
+    """Say how many runs this plug has now, and how to regress them.
+
+    Deliberately a plain count: how many points a Klinkenberg series needs is
+    the operator's call, so nothing here suggests a target or a next pressure.
+    """
+    from gasperm.storage import find_runs, runs_for_sample
+
+    # The writer's own parent, not run.output_dir, so the count and the command
+    # can never disagree with where this run actually landed.
+    runs_dir = writer.directory.parent
+    recorded = runs_for_sample(find_runs(runs_dir), config.sample.id)
+
+    typer.echo("")
+    typer.secho(
+        f"{len(recorded)} run{'s' if len(recorded) != 1 else ''} recorded for "
+        f"{config.sample.id} in {runs_dir}.",
+        fg=typer.colors.CYAN,
+    )
+    typer.echo("\nRegress them:")
+    typer.echo(
+        "  "
+        + _klinkenberg_command_line(
+            config.sample.id, config_dir, runs_dir if output_dir_overridden else None
+        )
+    )
 
 
 def _print_run_summary(summary, config: GaspermConfig) -> None:
@@ -1068,11 +1108,135 @@ def _print_budget(budget) -> None:
 # --------------------------------------------------------------------------
 
 
+def _resolve_sample_id(value: str) -> str:
+    """A sample id from either a bare id or a path to a sample file.
+
+    ``collect --sample`` takes a path, so an operator will reasonably paste the
+    same value here. A value that was clearly *meant* as a path but does not
+    exist is an error rather than a literal id -- otherwise a typo'd path turns
+    into a baffling "no runs found for samples/core-041.yaml".
+    """
+    from gasperm.config import load_sample_config
+
+    candidate = Path(value)
+    if candidate.is_file():
+        try:
+            return load_sample_config(candidate).id
+        except ConfigError as exc:
+            _fail(str(exc))
+    looks_like_a_path = (
+        "/" in value or "\\" in value or value.lower().endswith((".yaml", ".yml"))
+    )
+    if looks_like_a_path:
+        _fail(f"No such sample file: {value}")
+    return value
+
+
+def _resolve_runs_dir(runs_dir: Path | None, config_dir: Path) -> Path:
+    """Where a plug's runs live: an explicit path, or run.yaml's output_dir."""
+    from gasperm.config import RUN_FILENAME, load_run_config
+
+    if runs_dir is not None:
+        return runs_dir
+
+    run_file = config_dir / RUN_FILENAME
+    try:
+        run_config = load_run_config(run_file)
+    except ConfigError as exc:
+        _fail(
+            f"{exc}\n\nCannot tell where the runs are. Pass --runs-dir <dir>, or "
+            "--config-dir pointing at the rig folder that holds run.yaml."
+        )
+        raise  # unreachable
+    output = Path(run_config.output_dir)
+    return output if output.is_absolute() else config_dir / output
+
+
+def _discover_points(records, *, window, allow_unsteady):
+    """Reduce discovered runs to points, skipping the ones that cannot be used.
+
+    ``--sample`` means "every run for this plug", which will legitimately
+    include aborted and exploratory ones. Failing the whole regression over a
+    single bad run is exactly the friction this command removes, so they are
+    skipped and reported. Nothing is silent.
+    """
+    from gasperm.storage import point_from_run
+
+    points, skipped = [], []
+    for record in records:
+        try:
+            points.append(
+                point_from_run(
+                    record.directory,
+                    averaging_window_s=window,
+                    allow_unsteady=allow_unsteady,
+                )
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            reason = str(exc).split(".")[0].split(", so")[0]
+            skipped.append((record, reason))
+    return points, skipped
+
+
+def _print_discovered_runs(sample_id, runs_dir, records, skipped) -> None:
+    """Say what was found, and what was left out and why."""
+    reasons = {record.name: reason for record, reason in skipped}
+    typer.secho(
+        f"\nFound {len(records)} run{'s' if len(records) != 1 else ''} for "
+        f"{sample_id} in {runs_dir}",
+        bold=True,
+    )
+    for record in records:
+        when = (
+            record.started_at.strftime("%Y-%m-%d %H:%MZ") if record.started_at else "unknown"
+        )
+        line = f"  {record.name:<32} {when}"
+        if record.name in reasons:
+            line += f"   skipped: {reasons[record.name]}"
+        elif not record.has_summary:
+            line += "   (no summary recorded)"
+        typer.echo(line)
+    if skipped:
+        typer.secho(
+            f"{len(skipped)} run{'s' if len(skipped) != 1 else ''} skipped. "
+            "Pass --allow-unsteady to include them.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _default_klinkenberg_output(base: Path, sample_ids: set[str]) -> Path:
+    """Results path for a regression, named per plug.
+
+    Without the sample id in the name, measuring a second plug silently
+    overwrites the first plug's results.
+    """
+    from gasperm.storage import safe_sample_id
+
+    if len(sample_ids) == 1:
+        return base / f"klinkenberg_{safe_sample_id(next(iter(sample_ids)))}.yaml"
+    return base / "klinkenberg.yaml"
+
+
 @app.command("klinkenberg")
 def klinkenberg_command(
     runs: list[Path] = typer.Argument(
         None, metavar="[RUN]...",
         help="Run directories (or readings.csv paths) from previous collect runs.",
+    ),
+    sample: Optional[str] = typer.Option(
+        None, "--sample", metavar="ID|FILE",
+        help=(
+            "Regress every recorded run for this core plug. Takes a sample id "
+            "(core-041) or a sample file (samples/core-041.yaml)."
+        ),
+    ),
+    runs_dir: Optional[Path] = typer.Option(
+        None, "--runs-dir",
+        help="Where the run directories are. Defaults to run.yaml's output_dir.",
+    ),
+    config_dir: Path = typer.Option(
+        Path("."), "--config-dir", "-c",
+        help="Rig folder holding run.yaml. Only read when --sample is used.",
     ),
     csv_path: Optional[Path] = typer.Option(
         None, "--csv",
@@ -1117,20 +1281,27 @@ def klinkenberg_command(
     reduced over its detected steady-state window, and the fit is weighted by
     the runs' uncertainties when they carry them.
     """
-    from gasperm.klinkenberg import fit_klinkenberg, load_points_from_csv
-    from gasperm.storage import collect_points, write_klinkenberg_result
+    from gasperm.klinkenberg import MIN_POINTS, fit_klinkenberg, load_points_from_csv
+    from gasperm.storage import (
+        collect_points,
+        find_runs,
+        runs_for_sample,
+        write_klinkenberg_result,
+    )
 
     _configure_logging(verbose)
 
     runs = [r for r in (runs or []) if r is not None]
-    if not runs and csv_path is None:
+    sources = sum(1 for source in (runs, csv_path, sample) if source)
+    if sources == 0:
         _fail(
-            "Nothing to regress. Pass two or more collect run directories, or --csv with "
-            "a file of mean-pressure / apparent-permeability pairs."
+            "Nothing to regress. Pass --sample core-041 to use every recorded run for "
+            "that plug, or name run directories explicitly, or --csv with a file of "
+            "mean-pressure / apparent-permeability pairs."
         )
         return
-    if runs and csv_path is not None:
-        _fail("Pass either run directories or --csv, not both.")
+    if sources > 1:
+        _fail("Pass exactly one of --sample, run directories, or --csv.")
         return
 
     try:
@@ -1141,6 +1312,7 @@ def klinkenberg_command(
         _fail(str(exc))
         return
 
+    discovered_dir: Path | None = None
     try:
         if csv_path is not None:
             points = load_points_from_csv(
@@ -1148,6 +1320,34 @@ def klinkenberg_command(
                 pressure_unit=csv_pressure_unit,
                 permeability_unit=csv_permeability_unit,
             )
+        elif sample is not None:
+            sample_id = _resolve_sample_id(sample)
+            discovered_dir = _resolve_runs_dir(runs_dir, config_dir)
+            matching = runs_for_sample(find_runs(discovered_dir), sample_id)
+            if not matching:
+                present = sorted(
+                    {r.sample_id for r in find_runs(discovered_dir) if r.sample_id}
+                )
+                _fail(
+                    f"No runs found for {sample_id!r} in {discovered_dir}."
+                    + (
+                        f" Plugs recorded there: {', '.join(present)}."
+                        if present
+                        else " That directory holds no runs yet."
+                    )
+                )
+                return
+            points, skipped = _discover_points(
+                matching, window=window, allow_unsteady=allow_unsteady
+            )
+            _print_discovered_runs(sample_id, discovered_dir, matching, skipped)
+            if len(points) < MIN_POINTS:
+                _fail(
+                    f"\nOnly {len(points)} of {len(matching)} runs could be used, and the "
+                    f"regression needs at least {MIN_POINTS}."
+                    + (" Pass --allow-unsteady to include the skipped ones." if skipped else "")
+                )
+                return
         else:
             points = collect_points(
                 runs, averaging_window_s=window, allow_unsteady=allow_unsteady
@@ -1169,8 +1369,11 @@ def klinkenberg_command(
     _print_klinkenberg(result, permeability_unit, pressure_unit)
 
     destination = output
-    if destination is None and csv_path is None and runs:
-        destination = Path(runs[0]).parent / "klinkenberg.yaml"
+    if destination is None and csv_path is None:
+        base = discovered_dir if discovered_dir is not None else Path(runs[0]).parent
+        destination = _default_klinkenberg_output(
+            base, {p.sample_id for p in result.points if p.sample_id}
+        )
     if destination is not None:
         written = write_klinkenberg_result(result, destination)
         typer.secho(f"\nResults written to {written}", fg=typer.colors.GREEN)

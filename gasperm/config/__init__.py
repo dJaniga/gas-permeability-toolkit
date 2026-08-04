@@ -82,6 +82,8 @@ __all__ = [
     "RUN_FILENAME",
     "SECTION_NAMES",
     "load_config",
+    "load_run_config",
+    "load_sample_config",
     "save_config",
     "config_to_dict",
     "experiment_metadata",
@@ -123,6 +125,11 @@ class GaspermConfig(_Base):
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     sample: SampleConfig = Field(default_factory=SampleConfig)
     run: RunConfig = Field(default_factory=RunConfig)
+    #: Folder the config was loaded from. Relative paths inside the config are
+    #: resolved against it, so a rig folder can be moved or worked in from any
+    #: directory without its runs moving too. Not serialised: it describes
+    #: where the files were found, not what they say.
+    config_dir: Path | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def _selected_flowmeter_exists(self) -> GaspermConfig:
@@ -131,6 +138,19 @@ class GaspermConfig(_Base):
         return self
 
     # -- convenience accessors used across the package --------------------
+
+    def resolved_output_dir(self) -> Path:
+        """Where this rig's runs go, as an absolute-or-cwd-relative path.
+
+        ``run.output_dir`` is relative to the config folder, not to whatever
+        directory the command happened to be invoked from. Otherwise ``collect``
+        and ``klinkenberg`` would disagree about where the runs are the moment
+        anyone ran one of them from somewhere else.
+        """
+        output = Path(self.run.output_dir)
+        if output.is_absolute() or self.config_dir is None:
+            return output
+        return self.config_dir / output
 
     def geometry(self) -> SampleGeometry:
         """The core plug geometry, with its caliper uncertainties."""
@@ -321,13 +341,45 @@ def load_config(
     run = _validate_section(RunConfig, _unwrap(run_raw, "run"), paths.run)
 
     try:
-        return GaspermConfig(hardware=hardware, sample=sample, run=run)
+        # The run file's folder anchors relative paths: it is the file that
+        # names output_dir, so it is the one whose location that path means.
+        return GaspermConfig(
+            hardware=hardware, sample=sample, run=run, config_dir=paths.run.parent
+        )
     except ValidationError as exc:
         # Cross-file checks -- a run naming a meter the rig does not define, for
         # instance. Neither file is wrong on its own, so name both.
         raise ConfigError(
             _format_validation_error(exc, f"{paths.run} together with {paths.hardware}")
         ) from exc
+
+
+def load_run_config(path: str | Path) -> RunConfig:
+    """Load and validate ``run.yaml`` alone.
+
+    ``klinkenberg`` needs only ``output_dir`` to find a plug's runs, and a rig
+    folder legitimately has no ``sample.yaml`` -- plugs live in ``samples/`` --
+    so the three-file :func:`load_config` would fail on a perfectly good rig.
+
+    Raises:
+        ConfigError: the file is missing, malformed, or fails validation.
+    """
+    run_path = Path(path)
+    return _validate_section(
+        RunConfig, _unwrap(_read_mapping(run_path, "run"), "run"), run_path
+    )
+
+
+def load_sample_config(path: str | Path) -> SampleConfig:
+    """Load and validate one core plug's file on its own.
+
+    Raises:
+        ConfigError: the file is missing, malformed, or fails validation.
+    """
+    sample_path = Path(path)
+    return _validate_section(
+        SampleConfig, _unwrap(_read_mapping(sample_path, "sample"), "sample"), sample_path
+    )
 
 
 def config_to_dict(config: GaspermConfig) -> dict[str, Any]:
