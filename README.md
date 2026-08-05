@@ -83,7 +83,7 @@ gasperm new-sample --dir samples --from samples/core-041.yaml   # asks id, then 
 # one collect per mean pressure -- at least three for a Klinkenberg fit
 gasperm collect --sample samples/core-041.yaml --flowmeter low_range
 gasperm collect --sample samples/core-041.yaml --flowmeter low_range
-gasperm collect --sample samples/core-041.yaml --flowmeter high_range
+gasperm collect --sample samples/core-041.yaml --flowmeter high_range --stop-after-steady 120
 
 gasperm klinkenberg --sample core-041 --plot
 ```
@@ -222,6 +222,29 @@ The reported permeability is the mean over the detected steady window. A run
 that never settles still produces a full CSV and summary, clearly marked **not
 representative**, and `klinkenberg` refuses it unless you pass
 `--allow-unsteady`.
+
+### Stopping once it has held
+
+`stop_after_steady_s` ends the run after steady state has held that long, so a
+pressure step can be left to finish itself:
+
+```bash
+gasperm collect --sample samples/core-041.yaml --stop-after-steady 120
+```
+
+```yaml
+stop_after_steady_s: 120    # null = run until Ctrl+C; 0 = stop on confirmation
+```
+
+The clock starts when steady state is **confirmed**, not when the plateau began
+— the latter is only known in hindsight, and by then a plateau is already
+several windows old. So with the default 3×30 s criteria and a 120 s soak, a run
+confirming at 90 s stops at 210 s and reports the mean over the whole 210 s
+plateau.
+
+If the rig leaves steady state the clock restarts: a hold that was interrupted
+did not last. Pair it with `steady_state.max_wait_s` so a rig that never settles
+gives up instead of running forever.
 
 ## Uncertainty (ISO/IEC Guide 98-3, the GUM)
 

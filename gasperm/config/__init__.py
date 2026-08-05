@@ -639,7 +639,7 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "display_pressure_unit": "console/plot only",
         "display_permeability_unit": "mD | D | uD | um2 | m2",
         "duration_s": "null = run until Ctrl+C",
-        "stop_when_steady": "end the run once steady state is confirmed",
+        "stop_after_steady_s": "seconds of confirmed steady state, then stop; null = Ctrl+C",
     }
     return _render_yaml(data, header=header, notes=notes, comments=comments)
 

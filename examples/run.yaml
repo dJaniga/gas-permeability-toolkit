@@ -102,5 +102,5 @@ display_flow_unit: sccm
 # Stop conditions.
 duration_s: null                              # null = run until Ctrl+C
 max_samples: null
-stop_when_steady: false                       # end the run once steady state is confirmed
+stop_after_steady_s: null                     # seconds of confirmed steady state, then stop; null = Ctrl+C
 flush_every_n: 20

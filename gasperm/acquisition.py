@@ -355,7 +355,7 @@ class AcquisitionLoop:
     """Drives sampling at ``daq.sample_rate_hz`` until stopped.
 
     Stops on Ctrl+C, on ``run.duration_s``, on ``run.max_samples``, on
-    ``run.stop_when_steady`` once steady state is confirmed, or on
+    ``run.stop_after_steady_s`` once steady state has held that long, or on
     ``steady_state.max_wait_s`` if it never is -- whichever comes first. Always
     closes its sources.
     """
@@ -388,6 +388,11 @@ class AcquisitionLoop:
         #: plateau, it should be reported alongside it.
         self.steady_start_s: float | None = None
         self.steady_end_s: float | None = None
+        #: When the detector last *declared* steady state. Distinct from
+        #: :attr:`steady_start_s`, which is where the plateau turns out to have
+        #: begun; this is when we became sure of it, and it is what the soak
+        #: time is measured from. Cleared if the rig leaves steady state.
+        self.steady_confirmed_at_s: float | None = None
         self.ended_unsteady = False
 
         self._stop_requested = False
@@ -453,15 +458,16 @@ class AcquisitionLoop:
                 if reading is not None:
                     self.readings.append(reading)
                     self._emit(reading)
+                    hold_s = run_config.stop_after_steady_s
                     if (
-                        run_config.stop_when_steady
-                        and self.detector.is_steady
-                        and self.steady_end_s is not None
-                        and self.steady_start_s is not None
-                        and (self.steady_end_s - self.steady_start_s)
-                        >= run_config.steady_state.window_s
+                        hold_s is not None
+                        and self.steady_confirmed_at_s is not None
+                        and (elapsed - self.steady_confirmed_at_s) >= hold_s
                     ):
-                        self._stop_reason = "steady state confirmed (stop_when_steady)"
+                        self._stop_reason = (
+                            f"steady state held for {hold_s:g} s "
+                            "(run.stop_after_steady_s)"
+                        )
                         break
                 index += 1
 
@@ -524,12 +530,18 @@ class AcquisitionLoop:
 
         if self.detector.is_steady:
             if not was_steady:
+                self.steady_confirmed_at_s = elapsed
                 self._record_warning(
                     f"Steady state confirmed at {elapsed:.1f} s "
                     f"({self.status.progress} windows)."
                 )
             self.steady_start_s = self.detector.steady_since_elapsed_s
             self.steady_end_s = elapsed
+        elif was_steady:
+            # The hold has to be continuous: an interrupted soak did not last,
+            # so the clock restarts from the next confirmation. The plateau
+            # bounds are left alone -- a late wobble should not erase them.
+            self.steady_confirmed_at_s = None
 
         return provisional.model_copy(
             update={

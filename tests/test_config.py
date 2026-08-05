@@ -137,9 +137,21 @@ class TestValidation:
         with pytest.raises(ValueError, match="impossible"):
             SampleConfig(grain_density_g_cm3=2.65, bulk_density_g_cm3=2.80)
 
-    def test_stop_when_steady_needs_detection_enabled(self):
+    def test_stop_after_steady_needs_detection_enabled(self):
         with pytest.raises(ValueError, match="would never be detected"):
-            RunConfig(stop_when_steady=True, steady_state=SteadyStateConfig(enabled=False))
+            RunConfig(
+                stop_after_steady_s=120.0, steady_state=SteadyStateConfig(enabled=False)
+            )
+
+    def test_a_negative_soak_time_is_rejected(self):
+        with pytest.raises(ValueError):
+            RunConfig(stop_after_steady_s=-1.0)
+
+    def test_zero_is_allowed_and_means_stop_on_confirmation(self):
+        assert RunConfig(stop_after_steady_s=0.0).stop_after_steady_s == 0.0
+
+    def test_running_until_interrupted_is_the_default(self):
+        assert RunConfig().stop_after_steady_s is None
 
     def test_steady_state_needs_at_least_one_signal(self):
         with pytest.raises(ValueError, match="nothing would be tested"):

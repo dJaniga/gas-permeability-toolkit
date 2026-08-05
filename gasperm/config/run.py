@@ -212,14 +212,19 @@ class RunConfig(_Base):
     display_flow_unit: str = "sccm"
 
     # -- stop conditions --------------------------------------------------
-    #: ``null`` on both means run until Ctrl+C (or until steady state, if
-    #: ``stop_when_steady`` is set).
+    #: ``null`` on both means run until Ctrl+C (or until steady state has held
+    #: for ``stop_after_steady_s``, if that is set).
     duration_s: float | None = Field(default=None, gt=0.0)
     max_samples: int | None = Field(default=None, gt=0)
-    #: End the run once steady state has been confirmed and held for
-    #: ``steady_state.window_s``. Useful unattended; off by default so an
-    #: operator can watch the plateau hold.
-    stop_when_steady: bool = False
+    #: Seconds of *confirmed* steady state to record before ending the run.
+    #: ``null`` runs until Ctrl+C.
+    #:
+    #: The clock starts when the detector declares steady state -- not when the
+    #: plateau began, which is only known in hindsight -- so this is the soak
+    #: time on top of whatever established steadiness. ``0`` stops the moment
+    #: it is confirmed. If the rig leaves steady state the clock resets, since
+    #: a hold that was interrupted did not last.
+    stop_after_steady_s: float | None = Field(default=None, ge=0.0)
     #: Flush the CSV every N samples so a crash cannot lose the whole run.
     flush_every_n: int = Field(default=20, gt=0)
 
@@ -262,11 +267,11 @@ class RunConfig(_Base):
         return self
 
     @model_validator(mode="after")
-    def _stop_when_steady_needs_detection(self) -> RunConfig:
-        if self.stop_when_steady and not self.steady_state.enabled:
+    def _stop_after_steady_needs_detection(self) -> RunConfig:
+        if self.stop_after_steady_s is not None and not self.steady_state.enabled:
             raise ValueError(
-                "run.stop_when_steady is true but run.steady_state.enabled is false, "
-                "so steady state would never be detected and the run would not stop"
+                "run.stop_after_steady_s is set but run.steady_state.enabled is false, "
+                "so steady state would never be detected and the run would never stop"
             )
         return self
 

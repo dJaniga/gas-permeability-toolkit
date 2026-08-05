@@ -806,8 +806,12 @@ def collect_command(
         None, "--downstream-pressure-unit",
         help="Unit of --downstream-pressure. Defaults to run.yaml's setting.",
     ),
-    stop_when_steady: bool = typer.Option(
-        False, "--stop-when-steady", help="End the run once steady state is confirmed."
+    stop_after_steady: Optional[float] = typer.Option(
+        None, "--stop-after-steady", metavar="SECONDS",
+        help=(
+            "End the run after steady state has held this long. The clock starts when "
+            "steady state is confirmed; 0 stops immediately on confirmation."
+        ),
     ),
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="Override run.output_dir."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -837,8 +841,8 @@ def collect_command(
         config.run.max_samples = samples
     if output_dir is not None:
         config.run.output_dir = str(output_dir)
-    if stop_when_steady:
-        config.run.stop_when_steady = True
+    if stop_after_steady is not None:
+        config.run.stop_after_steady_s = stop_after_steady
     if downstream_pressure_unit is not None:
         try:
             config.run.downstream_pressure_unit = downstream_pressure_unit

@@ -637,10 +637,10 @@ class TestSteadyStateGating:
         loop.run(install_signal_handler=False)
         assert not loop.steady_state_reached
 
-    def test_stop_when_steady_ends_the_run(
+    def test_a_zero_soak_stops_on_confirmation(
         self, quick_steady_config, fake_analog_source, fake_temperature_source
     ):
-        quick_steady_config.run.stop_when_steady = True
+        quick_steady_config.run.stop_after_steady_s = 0.0
         quick_steady_config.run.max_samples = 500
         loop = build_loop(
             quick_steady_config, fake_analog_source(VOLTAGES), fake_temperature_source(),
@@ -649,7 +649,93 @@ class TestSteadyStateGating:
         readings = loop.run(install_signal_handler=False)
         assert loop.steady_state_reached
         assert len(readings) < 500
-        assert "steady state confirmed" in loop.stop_reason
+        assert "stop_after_steady_s" in loop.stop_reason
+        # Stopped on the very sample that confirmed it.
+        assert readings[-1].elapsed_s == pytest.approx(loop.steady_confirmed_at_s)
+
+
+class TestSteadySoakTime:
+    """`stop_after_steady_s` records N seconds of *confirmed* steady state."""
+
+    def _run(self, config, analog, temperature, *, soak, step=0.05, samples=2000):
+        config.run.stop_after_steady_s = soak
+        config.run.max_samples = samples
+        loop = build_loop(config, analog, temperature, clock=FakeClock(step=step))
+        loop.run(install_signal_handler=False)
+        return loop
+
+    def test_the_run_continues_for_the_soak_after_confirmation(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        loop = self._run(
+            quick_steady_config, fake_analog_source(VOLTAGES),
+            fake_temperature_source(), soak=1.0,
+        )
+        assert loop.steady_state_reached
+        assert loop.steady_confirmed_at_s is not None
+        held = loop.readings[-1].elapsed_s - loop.steady_confirmed_at_s
+        assert held >= 1.0
+        assert "held for 1 s" in loop.stop_reason
+
+    def test_a_longer_soak_records_a_longer_run(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        short = self._run(
+            quick_steady_config.model_copy(deep=True), fake_analog_source(VOLTAGES),
+            fake_temperature_source(), soak=0.5,
+        )
+        long = self._run(
+            quick_steady_config.model_copy(deep=True), fake_analog_source(VOLTAGES),
+            fake_temperature_source(), soak=2.0,
+        )
+        assert len(long.readings) > len(short.readings)
+
+    def test_the_soak_is_counted_from_confirmation_not_the_plateau_start(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """The plateau is already window_s old when it is declared."""
+        loop = self._run(
+            quick_steady_config, fake_analog_source(VOLTAGES),
+            fake_temperature_source(), soak=1.0,
+        )
+        # Measured from the plateau start the span is longer than the soak,
+        # which is exactly the distinction the two readings differ on.
+        assert loop.steady_start_s < loop.steady_confirmed_at_s
+        assert (loop.readings[-1].elapsed_s - loop.steady_start_s) > 1.0
+
+    def test_losing_steady_state_restarts_the_clock(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """An interrupted hold did not last, so it must not count."""
+        # Steady, then a step change, then steady again.
+        settled = [VOLTAGES] * 40
+        disturbed = [{**VOLTAGES, "ai0": 4.0}] * 20
+        recovered = [{**VOLTAGES, "ai0": 4.0}] * 400
+        loop = self._run(
+            quick_steady_config, fake_analog_source(settled + disturbed + recovered),
+            fake_temperature_source(), soak=1.0,
+        )
+        assert loop.steady_state_reached
+        # Steady state was declared twice: the first hold was interrupted, so
+        # the clock restarted rather than the run stopping on the first plateau.
+        confirmations = [w for w in loop.warnings if "Steady state confirmed" in w]
+        assert len(confirmations) == 2
+        # The soak is measured from the second confirmation, not the first.
+        held = loop.readings[-1].elapsed_s - loop.steady_confirmed_at_s
+        assert held == pytest.approx(1.0, abs=0.3)
+
+    def test_without_a_soak_the_run_is_not_stopped_by_steadiness(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.run.max_samples = 120
+        loop = build_loop(
+            quick_steady_config, fake_analog_source(VOLTAGES), fake_temperature_source(),
+            clock=FakeClock(step=0.05),
+        )
+        readings = loop.run(install_signal_handler=False)
+        assert loop.steady_state_reached
+        assert len(readings) == 120
+        assert "max_samples" in loop.stop_reason
 
     def test_max_wait_gives_up_on_a_rig_that_never_settles(
         self, quick_steady_config, fake_analog_source, fake_temperature_source
