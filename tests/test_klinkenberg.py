@@ -140,6 +140,96 @@ class TestWarnings:
         assert any("slope is negative" in w for w in result.warnings)
 
 
+class TestConstantFlowOffset:
+    """The microdarcy failure: a flowmeter reporting its zero, not the plug.
+
+    Below about ten microdarcy the flow is a fraction of a percent of a normal
+    meter's full scale, so the meter reports its own offset. That offset is
+    genuinely stable, so every upstream check passes; the only trace left is
+    flow that does not move when pressure does.
+    """
+
+    #: Reproduced from a constant 0.25 sccm offset with no sample flow at all,
+    #: at inlet pressures of 5, 10 and 30 atm venting to atmosphere. This is
+    #: the reported field symptom, to the digit.
+    OFFSET_SERIES = ((3.0, 2.711e-6), (5.5, 0.657e-6), (15.4, 0.072e-6))
+
+    def _offset_points(self, flow_cm3_s=0.25 / 60.0):
+        return [
+            KlinkenbergPoint(
+                mean_pressure_atm=p,
+                apparent_permeability_darcy=k,
+                flow_cm3_s=flow_cm3_s,
+                label=f"P={p}",
+                sample_id="core-001",
+            )
+            for p, k in self.OFFSET_SERIES
+        ]
+
+    def test_the_symptom_is_reproduced(self):
+        """Without the guard this fits convincingly and is entirely spurious."""
+        result = fit_klinkenberg(self._offset_points())
+        assert result.liquid_permeability_darcy < 0.0
+        assert result.slippage_factor_atm < 0.0
+        assert result.r_squared > 0.9  # and still looks like a decent fit
+
+    def test_flow_that_ignores_pressure_is_called_out(self):
+        result = fit_klinkenberg(self._offset_points())
+        flagged = [w for w in result.warnings if "Flow barely responded" in w]
+        assert len(flagged) == 1
+        assert "varied by 0.0%" in flagged[0]
+        assert "5.1x" in flagged[0]
+        assert "check the meter's zero" in flagged[0].lower()
+
+    def test_a_real_series_is_not_flagged(self):
+        """Darcy flow rises steeply with the differential -- as it must."""
+        points = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p,
+                apparent_permeability_darcy=TRUE_K_L * (1.0 + TRUE_B / p),
+                # Q ~ (P1^2 - P2^2), so it climbs far faster than P_mean does.
+                flow_cm3_s=0.05 * p**2,
+                sample_id="core-001",
+            )
+            for p in (1.0, 2.0, 4.0, 8.0)
+        ]
+        result = fit_klinkenberg(points)
+        assert not any("Flow barely responded" in w for w in result.warnings)
+
+    def test_flow_that_moves_a_little_is_still_accepted(self):
+        """10 % of movement is a weak response, not an absent one."""
+        points = self._offset_points()
+        moved = [
+            KlinkenbergPoint(
+                **{**p.model_dump(), "flow_cm3_s": p.flow_cm3_s * (1.0 + 0.1 * i)}
+            )
+            for i, p in enumerate(points)
+        ]
+        result = fit_klinkenberg(moved)
+        assert not any("Flow barely responded" in w for w in result.warnings)
+
+    def test_a_narrow_pressure_range_is_not_enough_to_judge(self):
+        """Flat flow means nothing if the pressure was never really varied."""
+        points = [
+            KlinkenbergPoint(
+                mean_pressure_atm=p,
+                apparent_permeability_darcy=k,
+                flow_cm3_s=0.25 / 60.0,
+                sample_id="core-001",
+            )
+            for p, k in ((3.0, 2.711e-6), (4.0, 2.0e-6), (5.5, 0.657e-6))
+        ]
+        result = fit_klinkenberg(points)
+        assert not any("Flow barely responded" in w for w in result.warnings)
+
+    def test_points_without_a_recorded_flow_are_skipped(self):
+        """Older sidecars carry no flow; that is silence, not an all-clear."""
+        result = fit_klinkenberg(self._offset_points(flow_cm3_s=None))
+        assert not any("Flow barely responded" in w for w in result.warnings)
+        # The non-physical intercept is still reported, just not explained.
+        assert any("not positive" in w for w in result.warnings)
+
+
 class TestUncertainty:
     def test_an_unweighted_fit_reports_the_intercept_standard_error(self):
         result = fit_klinkenberg(synthetic_points())

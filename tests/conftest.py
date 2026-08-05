@@ -60,6 +60,7 @@ def write_fake_run(
     uncertainty_darcy: float | None = 1e-4,
     flowmeter: str = "low_range",
     downstream_pressure: float | str = "measured",
+    mean_flow_cm3_s: float | None = None,
 ) -> Path:
     """Write a run directory without driving the acquisition loop.
 
@@ -68,6 +69,9 @@ def write_fake_run(
     (``steady=False`` or ``sidecar=False``) makes it replay the two-row CSV
     instead, which cannot satisfy the steady-state criteria -- so those runs are
     genuinely unsteady rather than merely labelled so.
+
+    ``mean_flow_cm3_s`` left at ``None`` omits the key entirely, which is what
+    a sidecar written before that field existed looks like.
     """
     import yaml
 
@@ -124,6 +128,8 @@ def write_fake_run(
                     else None
                 ),
             }
+            if mean_flow_cm3_s is not None:
+                payload["summary"]["mean_flow_cm3_s"] = mean_flow_cm3_s
         (directory / METADATA_FILENAME).write_text(
             yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
         )

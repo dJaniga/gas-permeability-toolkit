@@ -162,9 +162,16 @@ class FlowmeterConfig(LinearCalibration):
     #: reported volume is at.
     actual_pressure_source: Literal["outlet", "atmospheric", "inlet"] = "outlet"
     #: Type B uncertainty, in this meter's flow unit.
+    #:
+    #: Thermal mass flowmeters are specified against **full scale**, so that is
+    #: the default. The distinction is not cosmetic: a meter running at 0.7 % of
+    #: full scale has a specification larger than the signal it is reporting,
+    #: and declaring ``percent_reading`` instead would understate the flow term
+    #: by around seventy times and let a non-measurement look precise. Use
+    #: ``percent_reading`` only when the datasheet genuinely says so.
     uncertainty: UncertaintySpec = Field(
         default_factory=lambda: UncertaintySpec(
-            kind="percent_reading", value=1.0, source="mass flowmeter datasheet"
+            kind="percent_full_scale", value=0.5, source="mass flowmeter datasheet"
         )
     )
 

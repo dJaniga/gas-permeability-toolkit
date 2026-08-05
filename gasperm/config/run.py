@@ -100,6 +100,14 @@ class SteadyStateConfig(_Base):
     #: Give up waiting after this long and end the run unsteady rather than
     #: running forever. ``null`` waits indefinitely.
     max_wait_s: float | None = Field(default=None, gt=0.0)
+    #: Warn when the steady window is shorter than this many characteristic
+    #: pressure-equilibration times ``t ~ phi mu L^2 / (k P_mean)``. Tight rock
+    #: takes hours to equilibrate -- around two at 1 uD and 5 atm mean pressure
+    #: -- while these criteria can declare steady state in ninety seconds, so a
+    #: plateau can be real and the rig still not equilibrated. ``null``
+    #: disables the check, which also happens when the sample's porosity is
+    #: unrecorded.
+    equilibration_factor: float | None = Field(default=1.0, gt=0.0)
 
     @model_validator(mode="after")
     def _at_least_one_signal(self) -> SteadyStateConfig:
@@ -124,6 +132,13 @@ class UncertaintyReportConfig(_Base):
     #: Override the coverage factor instead of deriving it from Student-t at
     #: the effective degrees of freedom. ``null`` derives it (GUM annex G).
     fixed_coverage_factor: float | None = Field(default=None, gt=0.0)
+    #: Say so when one input's relative contribution ``|c_i| u(x_i)/x_i``
+    #: exceeds this. Not a share of the budget -- a healthy budget can easily
+    #: have one term at half the variance -- but its absolute size: a single
+    #: term worth 25 % of the result means the result is not a measurement.
+    #: The usual cause is a flowmeter running at a fraction of a percent of
+    #: full scale. ``null`` disables the check.
+    max_component_contribution: float | None = Field(default=0.25, gt=0.0)
 
 
 class RunConfig(_Base):

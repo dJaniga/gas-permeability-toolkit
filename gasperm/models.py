@@ -428,6 +428,11 @@ class KlinkenbergPoint(BaseModel):
     standard_uncertainty_darcy: float | None = None
     #: False when the source run never reached steady state.
     steady_state: bool = True
+    #: Mean flow behind this point, cm3/s. ``None`` for points from a CSV or
+    #: from a sidecar written before this was recorded. Flow that barely moves
+    #: while pressure moves a lot is the signature of a meter reporting its own
+    #: zero offset rather than the sample.
+    flow_cm3_s: float | None = None
     #: Canonical key for how P2 was obtained (``"measured"`` or
     #: ``"fixed:<atm>"``). ``None`` when the source run did not record it.
     #: Regressing runs that disagree mixes two different x-axes, since mean

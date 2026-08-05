@@ -79,8 +79,8 @@ flowmeters:
     standard_pressure_unit: kPa
     actual_pressure_source: outlet            # only used when reading_basis == actual
     uncertainty:
-      kind: percent_reading                   # flowmeters are usually spec'd % of reading
-      value: 1.0
+      kind: percent_full_scale                # thermal MFMs are spec'd % of FULL SCALE, not of reading
+      value: 0.5
       distribution: rectangular
       coverage_factor: 2.0
       degrees_of_freedom: null
@@ -103,8 +103,8 @@ flowmeters:
     standard_pressure_unit: kPa
     actual_pressure_source: outlet            # only used when reading_basis == actual
     uncertainty:
-      kind: percent_reading                   # flowmeters are usually spec'd % of reading
-      value: 1.0
+      kind: percent_full_scale                # thermal MFMs are spec'd % of FULL SCALE, not of reading
+      value: 0.5
       distribution: rectangular
       coverage_factor: 2.0
       degrees_of_freedom: null

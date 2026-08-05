@@ -104,6 +104,57 @@ class TestTypeBSpecs:
         assert UncertaintySpec(degrees_of_freedom=9).dof == 9.0
 
 
+class TestShippedFlowmeterSpec:
+    """The flow term must not flatter a meter running near its zero.
+
+    A thermal mass flowmeter is specified against full scale, so its absolute
+    uncertainty does not shrink as the flow does. Declaring it as a percent of
+    *reading* instead is what let a ~1 uD run -- a few sccm on a 500 sccm meter
+    -- present a one-percent budget for a number that was mostly meter offset.
+    """
+
+    def test_the_default_is_percent_of_full_scale(self):
+        spec = GaspermConfig().flowmeter.uncertainty
+        assert spec.kind == "percent_full_scale"
+        assert spec.value == pytest.approx(0.5)
+
+    def test_a_microdarcy_flow_makes_the_flow_term_dominate(self):
+        # 1 uD plug at P1 = 30 atm passes ~3.45 sccm; the meter is 0-500 sccm.
+        config = config_with()
+        meter = config.flowmeter
+        assert meter.value_max == pytest.approx(500.0)
+        budget = build_budget(
+            point(flow_cm3_s=units.flow_to_cm3_s(3.4549, meter.unit)),
+            geometry(),
+            config.hardware,
+            config.run,
+        )
+        flow = next(c for c in budget.components if c.symbol == "Q")
+        # 0.5 % of 500 sccm = 2.5 sccm half-width, rectangular -> /sqrt(3),
+        # reported in the internal cm3/s rather than the meter's own unit.
+        assert flow.standard_uncertainty == pytest.approx(
+            units.flow_to_cm3_s(2.5 / math.sqrt(3.0), meter.unit), rel=1e-6
+        )
+        assert flow.relative_standard_uncertainty == pytest.approx(0.418, abs=0.002)
+        # Flow enters the Darcy equation linearly, so it carries straight
+        # through to the result and swamps every other term.
+        assert flow.relative_contribution == pytest.approx(0.418, abs=0.002)
+        assert budget.dominant_components(1)[0].symbol == "Q"
+
+    def test_the_old_percent_of_reading_spec_hid_it(self):
+        """Why the default changed: same flow, seventy times smaller a term."""
+        config = config_with()
+        config.flowmeter.uncertainty = UncertaintySpec(kind="percent_reading", value=1.0)
+        budget = build_budget(
+            point(flow_cm3_s=units.flow_to_cm3_s(3.4549, config.flowmeter.unit)),
+            geometry(),
+            config.hardware,
+            config.run,
+        )
+        flow = next(c for c in budget.components if c.symbol == "Q")
+        assert flow.relative_standard_uncertainty == pytest.approx(0.0058, abs=0.0005)
+
+
 class TestSensitivities:
     def test_hand_calculated_pressure_coefficients(self):
         # P1 = 3, P2 = 1 -> P1^2 - P2^2 = 8

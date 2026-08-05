@@ -338,6 +338,46 @@ class TestPointFromRun:
             summary.permeability_darcy, rel=1e-3
         )
 
+    def test_the_flow_survives_from_the_stored_summary(
+        self, run_config, fake_analog_source, fake_temperature_source
+    ):
+        """Klinkenberg needs the flow to spot a meter stuck at its offset."""
+        loop, writer = run_once(
+            run_config, fake_analog_source(VOLTAGES), fake_temperature_source()
+        )
+        summary = loop.summarize()
+        writer.write_metadata(summary)
+        point = point_from_run(writer.directory)
+        assert point.flow_cm3_s == pytest.approx(summary.mean_flow_cm3_s, rel=1e-6)
+
+    def test_the_flow_survives_a_csv_replay(
+        self, run_config, fake_analog_source, fake_temperature_source
+    ):
+        loop, writer = run_once(
+            run_config, fake_analog_source(VOLTAGES), fake_temperature_source()
+        )
+        summary = loop.summarize()
+        writer.write_metadata(summary)
+        replayed = point_from_run(
+            writer.directory, averaging_window_s=run_config.run.steady_state.window_s
+        )
+        assert replayed.flow_cm3_s == pytest.approx(summary.mean_flow_cm3_s, rel=1e-3)
+
+    def test_a_sidecar_predating_the_flow_field_reads_as_unknown(
+        self, tmp_path, fake_run_writer
+    ):
+        """Absent is absent -- never zero, which would read as a stuck meter."""
+        directory = fake_run_writer(tmp_path, "core-001", datetime(2026, 3, 1, 9, 0, 0))
+        assert point_from_run(directory).flow_cm3_s is None
+
+    def test_a_sidecar_carrying_the_flow_field_reports_it(
+        self, tmp_path, fake_run_writer
+    ):
+        directory = fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 1, 9, 0, 0), mean_flow_cm3_s=0.0042
+        )
+        assert point_from_run(directory).flow_cm3_s == pytest.approx(0.0042)
+
     def test_a_run_that_never_settled_is_refused_by_default(
         self, run_config, fake_analog_source, fake_temperature_source
     ):

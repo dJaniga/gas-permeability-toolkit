@@ -510,7 +510,7 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
                     "only used when reading_basis == actual"
                 ),
                 f"flowmeters.{name}.uncertainty.kind": (
-                    "flowmeters are usually spec'd % of reading"
+                    "thermal MFMs are spec'd % of FULL SCALE, not of reading"
                 ),
             }
         )
@@ -633,8 +633,14 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "steady_state.settling_time_s": "ignore this much of the run start outright",
         "steady_state.slope_significance": "null = use the drift bound alone",
         "steady_state.max_wait_s": "null = wait indefinitely",
+        "steady_state.equilibration_factor": (
+            "warn if the window is shorter than this x phi.mu.L^2/(k.P)"
+        ),
         "uncertainty.coverage_probability": "0.95 -> k ~ 2 for large dof",
         "uncertainty.fixed_coverage_factor": "null = derive from Student-t",
+        "uncertainty.max_component_contribution": (
+            "warn when one input is worth this fraction of k"
+        ),
         "averaging_window_s": "live display only; the result uses the steady window",
         "display_pressure_unit": "console/plot only",
         "display_permeability_unit": "mD | D | uD | um2 | m2",

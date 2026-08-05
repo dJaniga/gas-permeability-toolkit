@@ -62,6 +62,12 @@ DOWNSTREAM_MISMATCH_TOLERANCE = 0.05
 #: the point at which "slower than the sample rate" becomes "not answering".
 MISSED_CONVERSIONS = 3
 
+#: Porosity to fall back on when the sample sheet does not record one, used
+#: only to bound the equilibration time from below -- consolidated rock is
+#: rarely tighter than this, so the true time can only be longer. It decides
+#: whether the missing datum is worth mentioning, never what the answer is.
+LOW_POROSITY_BOUND = 0.05
+
 __all__ = [
     "RollingWindow",
     "SampleProcessor",
@@ -639,6 +645,116 @@ class AcquisitionLoop:
 # --------------------------------------------------------------------------
 
 
+def _dominant_component_warnings(
+    budget: UncertaintyBudget, config: GaspermConfig, mean_flow_cm3_s: float
+) -> list[str]:
+    """Say so when one input is large enough to negate the result.
+
+    A budget is allowed to be dominated by one term -- viscosity often is. What
+    is not allowed is a term worth a quarter of the answer on its own, which
+    means the instrument reporting it cannot resolve what it is being asked to
+    measure.
+
+    Only the worst offender is reported, however many exceed the threshold. At
+    a low differential the two pressures blow up together with the flow, and
+    three near-identical warnings would crowd out the ones the operator has not
+    already been told; the printed budget ranks every component anyway.
+    """
+    threshold = config.run.uncertainty.max_component_contribution
+    if threshold is None or not budget.components:
+        return []
+
+    offenders = [
+        c
+        for c in budget.dominant_components(len(budget.components))
+        if c.relative_contribution > threshold
+    ]
+    if not offenders:
+        return []
+
+    component = offenders[0]
+    message = (
+        f"{component.name} contributes {component.relative_contribution:.0%} of the "
+        f"permeability on its own (|c| = {abs(component.relative_sensitivity):.3g}, "
+        f"u/x = {component.relative_standard_uncertainty:.1%})."
+    )
+    if component.symbol == "Q":
+        meter = config.flowmeter
+        reading = units.flow_from_cm3_s(mean_flow_cm3_s, meter.unit)
+        full_scale = abs(meter.value_max - meter.value_min)
+        if full_scale > 0:
+            message += (
+                f" The meter is at {reading / full_scale:.2%} of its "
+                f"{meter.value_max:g} {meter.unit} full scale, where its specification "
+                "exceeds the signal. This is not a measurement of the sample -- fit a "
+                "meter sized for this flow, or raise the pore pressure."
+            )
+    if len(offenders) > 1:
+        others = ", ".join(c.name for c in offenders[1:])
+        message += f" {len(offenders) - 1} other input(s) also exceed it: {others}."
+    return [message]
+
+
+def _equilibration_warnings(
+    config: GaspermConfig,
+    permeability_darcy: float,
+    mean_pressure_atm: float,
+    viscosity_cp: float,
+    window_readings: Sequence[Reading],
+) -> list[str]:
+    """Compare the run's length against the rock's own equilibration time.
+
+    Pressure diffuses through a plug on a timescale ``t ~ phi mu L^2 / (k P)``.
+    For tight rock that is hours, while the detector's criteria can confirm a
+    plateau in ninety seconds -- so a signal can be genuinely flat while the
+    core is still filling. The permeability is then measuring the transient.
+
+    What matters is how long the plug has had since pressure was applied, which
+    is the elapsed time at the end of the averaging window -- not the width of
+    that window. A run that held pressure for an hour has equilibrated whether
+    its plateau was averaged over thirty seconds or three hundred.
+    """
+    geometry = config.geometry()
+    factor = config.run.steady_state.equilibration_factor
+    porosity = geometry.porosity_fraction
+    if factor is None or permeability_darcy <= 0.0 or not window_readings:
+        return []
+
+    # Strict SI, since the expression mixes k with pressure and viscosity.
+    k_m2 = units.darcy_to(permeability_darcy, "m2")
+    length_m = geometry.length_cm / 100.0
+    equilibration_s = (
+        (porosity if porosity is not None else LOW_POROSITY_BOUND)
+        * units.cp_to_pa_s(viscosity_cp)
+        * length_m**2
+        / (k_m2 * mean_pressure_atm * units.ATM_IN_PA)
+    )
+    elapsed_s = window_readings[-1].elapsed_s
+    if elapsed_s >= factor * equilibration_s:
+        # With an unrecorded porosity this used the low-end bound, so passing
+        # here means the true time is longer -- but the check is a lower bound
+        # on t, and clearing it does not settle the question. Stay quiet
+        # anyway: nagging every run for optional metadata trains people to
+        # ignore the warnings that matter.
+        return []
+    if porosity is None:
+        return [
+            f"This run lasted {elapsed_s:.0f} s, and pressure equilibration through this "
+            f"plug would take at least {equilibration_s:.0f} s even at a porosity of "
+            f"{LOW_POROSITY_BOUND:.0%} -- longer at anything realistic. "
+            "sample.porosity_fraction is unrecorded, so this cannot be checked properly; "
+            "record it. The signal can be flat while the core is still filling."
+        ]
+    return [
+        f"This run lasted {elapsed_s:.0f} s but pressure equilibration through this plug "
+        f"takes about {equilibration_s:.0f} s "
+        f"(t ~ phi mu L^2 / (k P_mean), phi = {porosity:g}). The signal can be flat while "
+        "the core is still filling, so this may be measuring the transient rather than "
+        "the rock. Equilibration scales as 1/P_mean, so a higher pore pressure shortens "
+        "it proportionally."
+    ]
+
+
 def summarize_run(
     readings: Sequence[Reading],
     config: GaspermConfig,
@@ -782,6 +898,15 @@ def summarize_run(
             )
         except ValueError as exc:
             collected_warnings.append(f"Could not evaluate the uncertainty budget: {exc}")
+
+    if budget is not None:
+        collected_warnings.extend(_dominant_component_warnings(budget, config, mean_q))
+
+    collected_warnings.extend(
+        _equilibration_warnings(
+            config, mean_k, mean_p, mean_mu, window_readings
+        )
+    )
 
     first, last = usable[0], usable[-1]
     return RunSummary(

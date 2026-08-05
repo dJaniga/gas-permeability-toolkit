@@ -82,6 +82,7 @@ steady_state:
   slope_significance: null                    # null = use the drift bound alone
   signals: [permeability, inlet_pressure, flow]
   max_wait_s: null                            # null = wait indefinitely
+  equilibration_factor: 1.0                   # warn if the window is shorter than this x phi.mu.L^2/(k.P)
 
 # ISO/IEC Guide 98-3 (GUM) evaluation. Type A comes from the scatter of
 # the steady-state window; Type B from the specs in hardware.yaml and
@@ -91,6 +92,7 @@ uncertainty:
   coverage_probability: 0.95                  # 0.95 -> k ~ 2 for large dof
   include_type_a: true
   fixed_coverage_factor: null                 # null = derive from Student-t
+  max_component_contribution: 0.25            # warn when one input is worth this fraction of k
 averaging_window_s: 5.0                       # live display only; the result uses the steady window
 
 # Output.

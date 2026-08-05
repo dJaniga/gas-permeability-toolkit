@@ -43,6 +43,13 @@ RECOMMENDED_POINTS = 3
 #: Below this R^2 the points are not convincingly linear in 1/P.
 POOR_FIT_R_SQUARED = 0.95
 
+#: Flow varying by less than this across the series, relative to its mean,
+#: is not responding to pressure at all.
+FLAT_FLOW_CV = 0.05
+#: ... which only means something once mean pressure has actually been varied
+#: by at least this ratio between the extreme points.
+OFFSET_PRESSURE_SPAN = 2.0
+
 
 def _weighted_fit(
     x: np.ndarray, y: np.ndarray, u: np.ndarray
@@ -102,6 +109,47 @@ def _slippage_uncertainty(
         + 2.0 * d_slope * d_intercept * covariance
     )
     return math.sqrt(variance) if variance > 0.0 else 0.0
+
+
+def _constant_flow_warnings(points: Sequence[KlinkenbergPoint]) -> list[str]:
+    """Catch a flowmeter reporting its zero offset instead of the sample.
+
+    Below roughly ten microdarcy a thermal mass flowmeter sized for a normal
+    plug sits at a fraction of a percent of full scale, where it reports its
+    own offset -- a genuinely stable number, so the steady-state detector
+    confirms it and nothing else complains. The signature is flow that hardly
+    moves while pressure moves a great deal.
+
+    A constant ``Q0`` also explains the shape of the failure. With the outlet
+    at atmosphere, ``k_g`` proportional to ``Q / (P1^2 - 1)`` becomes
+    ``k_g ~ 1 / (P_mean (P_mean - 1))``, which is convex in ``1/P_mean`` rather
+    than the straight line Klinkenberg assumes, and a straight fit through it
+    lands on a negative intercept and a negative slippage factor.
+    """
+    flows = [p.flow_cm3_s for p in points]
+    if len(points) < 2 or any(f is None or f <= 0.0 for f in flows):
+        return []
+
+    mean_flow = float(np.mean(flows))
+    # Population spread, not the sample estimator: this asks how much the
+    # series moved, not what a wider population would do.
+    flow_cv = float(np.std(flows)) / mean_flow
+    pressures = [p.mean_pressure_atm for p in points]
+    span = max(pressures) / min(pressures)
+    if flow_cv >= FLAT_FLOW_CV or span < OFFSET_PRESSURE_SPAN:
+        return []
+
+    return [
+        f"Flow barely responded to pressure: it varied by {flow_cv:.1%} across the "
+        f"series while mean pressure spanned {span:.1f}x. Darcy flow through a plug "
+        "should rise steeply with the pressure differential, so this looks like the "
+        "flowmeter reporting a constant offset rather than the sample -- the usual "
+        "cause below about ten microdarcy, where the flow is a fraction of a percent "
+        "of the meter's full scale. A constant offset is convex in 1/P_mean, which is "
+        "what drives a straight-line fit to a negative k_L. Check the meter's zero "
+        "with the inlet closed, and fit a meter sized for this flow before trusting "
+        "any k_L from these runs."
+    ]
 
 
 def fit_klinkenberg(
@@ -258,6 +306,8 @@ def fit_klinkenberg(
             "are not behaving linearly in 1/P_mean -- check for non-steady-state runs, "
             "a leaking sleeve, or turbulent (non-Darcy) flow at the highest rate."
         )
+
+    warnings.extend(_constant_flow_warnings(points))
 
     if intercept <= 0.0:
         warnings.append(

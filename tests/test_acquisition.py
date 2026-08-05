@@ -852,6 +852,154 @@ class TestSummary:
         )
 
 
+class TestDominatedBudgetWarning:
+    """A term worth a quarter of the answer means there is no answer.
+
+    The failure this guards against is a thermal flowmeter parked near its
+    zero: perfectly stable, so the steady-state detector confirms it, and the
+    budget is the only thing that knows the number is meaningless.
+    """
+
+    def _summary(self, config, analog_factory, temperature_factory, voltages):
+        config.run.max_samples = 80
+        loop = build_loop(
+            config, analog_factory(voltages), temperature_factory(), clock=FakeClock(step=0.05)
+        )
+        loop.run(install_signal_handler=False)
+        return loop.summarize()
+
+    def test_a_meter_near_its_zero_is_called_out(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        # 0.02 V on a 0-10 V, 0-500 sccm meter is 1 sccm: 0.2 % of full scale,
+        # where the +/-0.5 % FS specification is 144 % of the reading.
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source,
+            {**VOLTAGES, "ai2": 0.02},
+        )
+        offending = [w for w in summary.warnings if "flow rate contributes" in w]
+        assert len(offending) == 1
+        assert "0.20% of its 500 sccm full scale" in offending[0]
+        assert "not a measurement of the sample" in offending[0]
+
+    def test_only_the_worst_offender_is_reported(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """One message, however many terms blow up together."""
+        quick_steady_config.run.uncertainty.max_component_contribution = 1e-6
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source, VOLTAGES
+        )
+        offending = [w for w in summary.warnings if "contributes" in w]
+        assert len(offending) == 1
+        assert "other input(s) also exceed it" in offending[0]
+
+    def test_a_meter_in_its_working_range_is_not(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        # 4.0 V is 200 sccm, 40 % of full scale -> the spec is 1.25 % of it.
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source, VOLTAGES
+        )
+        assert not any("contributes" in w for w in summary.warnings)
+
+    def test_the_threshold_is_configurable(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.run.uncertainty.max_component_contribution = 0.001
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source, VOLTAGES
+        )
+        assert any("contributes" in w for w in summary.warnings)
+
+    def test_the_check_can_be_switched_off(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.run.uncertainty.max_component_contribution = None
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source,
+            {**VOLTAGES, "ai2": 0.02},
+        )
+        assert not any("contributes" in w for w in summary.warnings)
+
+
+class TestEquilibrationWarning:
+    """A plateau is not equilibrium.
+
+    ``t ~ phi mu L^2 / (k P_mean)`` is hours for tight rock, and the detector
+    can confirm a plateau in ninety seconds. The two facts are compatible: the
+    signal is flat because the core is still filling at a steady rate.
+    """
+
+    def _summary(self, config, analog_factory, temperature_factory):
+        config.run.max_samples = 80
+        loop = build_loop(
+            config, analog_factory(VOLTAGES), temperature_factory(), clock=FakeClock(step=0.05)
+        )
+        loop.run(install_signal_handler=False)
+        return loop.summarize()
+
+    def permeable(self, config):
+        """A 2.2 mD plug on a 1 cm core: t is well under the run's length."""
+        in_kpa(config)
+        config.sample.diameter = 10.0
+        return config
+
+    def test_a_tight_plug_run_too_briefly_is_flagged(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        # The shipped 0-68.95 MPa transducers put ai0 = 2.5 V at 340 atm, and
+        # 200 sccm through this plug at that differential is 0.47 uD -- so the
+        # default test rig really does describe a microdarcy sample.
+        quick_steady_config.sample.porosity_fraction = 0.15
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source
+        )
+        flagged = [w for w in summary.warnings if "equilibration" in w]
+        assert len(flagged) == 1
+        assert "phi = 0.15" in flagged[0]
+        assert "measuring the transient" in flagged[0]
+
+    def test_a_permeable_plug_is_left_alone(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        config = self.permeable(quick_steady_config)
+        config.sample.porosity_fraction = 0.15
+        summary = self._summary(config, fake_analog_source, fake_temperature_source)
+        assert not any("equilibration" in w for w in summary.warnings)
+
+    def test_an_unrecorded_porosity_is_bounded_rather_than_guessed(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        assert quick_steady_config.sample.porosity_fraction is None
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source
+        )
+        flagged = [w for w in summary.warnings if "equilibration" in w]
+        assert len(flagged) == 1
+        assert "porosity_fraction is unrecorded" in flagged[0]
+        assert "even at a porosity of 5%" in flagged[0]
+
+    def test_an_unrecorded_porosity_alone_is_not_worth_mentioning(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """Silence when the bound clears: optional metadata must not nag."""
+        config = self.permeable(quick_steady_config)
+        assert config.sample.porosity_fraction is None
+        summary = self._summary(config, fake_analog_source, fake_temperature_source)
+        assert not any("porosity_fraction" in w for w in summary.warnings)
+
+    def test_the_check_can_be_switched_off(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.sample.porosity_fraction = 0.15
+        quick_steady_config.run.steady_state.equilibration_factor = None
+        summary = self._summary(
+            quick_steady_config, fake_analog_source, fake_temperature_source
+        )
+        assert not any("equilibration" in w for w in summary.warnings)
+
+
 class TestConsoleFormatting:
     def test_line_uses_the_configured_display_units(self, base_config):
         base_config.run.display_pressure_unit = "bar"

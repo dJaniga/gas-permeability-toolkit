@@ -260,6 +260,20 @@ def _float_or_none(value: str | None) -> float | None:
         return None
 
 
+def _summary_float(value: Any) -> float | None:
+    """Coerce one number out of a metadata sidecar, tolerating age and junk.
+
+    Sidecars written by older versions simply lack the newer keys, which must
+    read as "unknown" rather than raise.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def read_readings_csv(path: str | Path) -> list[dict[str, Any]]:
     """Read a run's ``readings.csv`` into typed dicts.
 
@@ -601,6 +615,7 @@ def point_from_run(
             sample_id=sample_id or summary.get("sample_id"),
             steady_state=True,
             downstream_convention=convention,
+            flow_cm3_s=_summary_float(summary.get("mean_flow_cm3_s")),
         )
 
     rows = read_readings_csv(readings_path)
@@ -644,6 +659,7 @@ def point_from_run(
         raise ValueError(
             f"{readings_path}: the steady window has a non-positive mean pressure."
         )
+    flows = [row["flow_cm3_s"] for row in selected if row.get("flow_cm3_s") is not None]
 
     return KlinkenbergPoint(
         mean_pressure_atm=mean_p,
@@ -653,6 +669,7 @@ def point_from_run(
         sample_id=sample_id,
         steady_state=window is not None,
         downstream_convention=convention,
+        flow_cm3_s=sum(flows) / len(flows) if flows else None,
     )
 
 

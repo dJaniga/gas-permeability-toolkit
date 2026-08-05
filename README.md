@@ -278,6 +278,85 @@ degrees of freedom.
 `collect` prints the whole budget, ranked by contribution, so it is obvious
 which term to improve next.
 
+## Low-permeability samples
+
+Below roughly ten microdarcy this rig stops measuring the rock and starts
+measuring itself. The symptom is a Klinkenberg fit with a **negative** `k_L` and
+a negative slippage factor at a respectable R², from runs that every steady-state
+check passed. Nothing is broken; the flow is simply too small for the meter.
+
+### The flow is below the meter's resolution
+
+A 1 µD plug (38.1 mm × 50 mm, nitrogen, venting to atmosphere) passes:
+
+| inlet | flow | on a 500 sccm meter | `u(Q)/Q` at ±0.5 % FS |
+|---|---|---|---|
+| 5 atm | 0.09 sccm | 0.018 % FS | 1600 % |
+| 10 atm | 0.38 sccm | 0.076 % FS | 380 % |
+| 30 atm | 3.45 sccm | 0.69 % FS | 42 % |
+
+A thermal meter down there reports its own zero offset. That offset is genuinely
+stable, so the detector confirms steady state and is right to — the quantity it
+confirmed just is not the sample. A constant `Q0` makes `k_g ∝ 1/(P̄(P̄−1))`,
+which is convex in `1/P̄` rather than the straight line Klinkenberg assumes, and
+a straight fit through it lands on a negative intercept. A 0.25 sccm offset and
+no sample flow at all reproduces the field symptom exactly: `k_L = −0.78 µD`,
+`b = −12.7 atm`, `R² = 0.94`.
+
+**Size the meter to the flow.** For a relative flow uncertainty of `target` at a
+flow `Q`, a `±0.5 %` full-scale meter needs
+
+```
+FS <= Q * target * sqrt(3) / 0.005
+```
+
+At 30 atm and 1 µD (3.45 sccm) that is ≤ 60 sccm for 5 % flow accuracy, or
+≤ 240 sccm for 20 %. The shipped 500 sccm meter cannot do better than 42 % there.
+
+This is why `flowmeters.*.uncertainty.kind` defaults to `percent_full_scale`:
+thermal meters are specified that way, and declaring `percent_reading` instead
+understates the flow term by around seventy times — enough to make a
+non-measurement look precise. Change it only if your datasheet really says so.
+
+### Equilibration takes hours, not seconds
+
+Pressure diffuses through a plug on a timescale
+
+```
+t ~ phi mu L^2 / (k P_mean)
+```
+
+At 1 µD and 10 % porosity that is **2.2 h** at 5.5 atm mean pressure and 48 min
+at 15.5 atm, against shipped criteria that can confirm a plateau in 90 s. Both
+are correct at once: the signal is flat because the core is still filling at a
+steady rate. Note the `1/P_mean`: raising the pore pressure shortens
+equilibration proportionally, which is the cheapest lever available.
+
+Recording `porosity_fraction` in the sample file lets the tool check this
+properly; without it the check falls back to a 5 % porosity as a lower bound and
+says so.
+
+### What the tool does about it
+
+Three guards, all after the fact, all reported in the run summary or the fit:
+
+- **A dominated budget.** Any input whose relative contribution exceeds
+  `run.uncertainty.max_component_contribution` (default 0.25) is named, and for
+  the flowmeter the message gives where the meter sits on its own scale.
+- **Too short a run.** `run.steady_state.equilibration_factor` (default 1.0)
+  compares the elapsed time against `t` above.
+- **A meter stuck at its offset.** `klinkenberg` warns when flow varies by less
+  than 5 % across a series whose mean pressure spans more than 2×. This is what
+  makes already-recorded runs self-diagnosing: re-run `gasperm klinkenberg
+  --sample <id>` and it will say so.
+
+### What it does not do
+
+The outlet vents to atmosphere, so `P̄ ≈ P1/2` — mean pressure cannot be varied
+independently of the differential without a back-pressure regulator. And below
+about 10 µD the standard method is pulse decay, which is a different acquisition
+path entirely. Neither is implemented here.
+
 ## A slow temperature probe
 
 A DS18B20 converts in 750 ms at 12-bit resolution while the DAQ samples every
