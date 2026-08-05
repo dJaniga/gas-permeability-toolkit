@@ -118,6 +118,10 @@ temperature:
   parse_pattern: T:{value}                    # '{value}' marks the number; null = first float
   timeout_s: 2.0
   units: C                                    # C | K | F
+  conversion_time_s: 0.75                     # DS18B20: 0.75 s at 12-bit, 0.19 s at 9-bit
+  warmup_timeout_s: 5.0                       # startup wait for the probe's first reading
+  plausible_min_c: -20.0                      # readings outside the band are discarded;
+  plausible_max_c: 60.0                       # excludes the DS18B20 -127 and 85 sentinels
   required: true                              # refuse to start collect if the port will not open
   fallback_temperature_c: 20.0
   stale_after_s: 10.0

@@ -347,15 +347,22 @@ class FakeTemperatureSource:
     """A ``TemperatureSource`` returning a scripted sample."""
 
     def __init__(
-        self, temperature_c: float | None = 22.0, *, stale: bool = False, raw: str | None = None
+        self, temperature_c: float | None = 22.0, *, stale: bool = False,
+        raw: str | None = None, age_s: float | None = 0.0,
     ) -> None:
         self.temperature_c = temperature_c
         self.stale = stale
         self.raw = raw
+        self.age_s = age_s
         self.closed = False
 
     def latest(self) -> TemperatureSample:
-        return TemperatureSample(self.temperature_c, 0.0, self.raw, self.stale)
+        return TemperatureSample(
+            self.temperature_c, 0.0, self.raw, self.stale, self.age_s
+        )
+
+    def wait_for_first_reading(self, timeout_s: float) -> bool:
+        return self.temperature_c is not None
 
     def close(self) -> None:
         self.closed = True

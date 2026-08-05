@@ -386,6 +386,117 @@ class TestSerialReader:
             reader.close()
 
 
+class TestSlowSensor:
+    """A DS18B20 converts in 750 ms while the DAQ samples every 100 ms."""
+
+    def test_a_value_is_held_between_conversions(self, fake_serial):
+        """The gap between conversions must not read as 'unavailable'."""
+        fake_serial.lines = [b"T:21.0\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            _wait_for_reading(reader)
+            # No further lines arrive, as between two conversions.
+            for _ in range(5):
+                sample = reader.latest()
+                assert sample.temperature_c == pytest.approx(21.0)
+                assert sample.stale is False
+        finally:
+            reader.close()
+
+    def test_the_age_of_a_held_value_is_reported(self, fake_serial):
+        fake_serial.lines = [b"T:21.0\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            _wait_for_reading(reader)
+            time.sleep(0.05)
+            sample = reader.latest()
+            assert sample.age_s is not None and sample.age_s >= 0.04
+        finally:
+            reader.close()
+
+    def test_waiting_for_the_first_reading_succeeds(self, fake_serial):
+        fake_serial.lines = [b"T:21.0\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            assert reader.wait_for_first_reading(2.0) is True
+            assert reader.latest().temperature_c == pytest.approx(21.0)
+        finally:
+            reader.close()
+
+    def test_waiting_times_out_when_the_probe_never_speaks(self, fake_serial):
+        """A port that opens but says nothing -- wrong baud, or no sketch."""
+        fake_serial.lines = []
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            assert reader.wait_for_first_reading(0.2) is False
+            assert reader.latest().temperature_c is None
+        finally:
+            reader.close()
+
+    def test_an_unparseable_line_does_not_satisfy_the_wait(self, fake_serial):
+        fake_serial.lines = [b"Arduino ready\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            assert reader.wait_for_first_reading(0.2) is False
+        finally:
+            reader.close()
+
+    def test_a_static_source_never_waits(self):
+        assert StaticTemperatureSource(20.0).wait_for_first_reading(99.0) is True
+
+
+class TestImplausibleReadings:
+    """The DS18B20 sentinels parse as ordinary numbers and must not pass."""
+
+    @pytest.mark.parametrize("sentinel", [b"T:-127.00\n", b"T:85.00\n"])
+    def test_a_sentinel_is_discarded_and_the_last_value_kept(self, fake_serial, sentinel):
+        fake_serial.lines = [b"T:21.0\n", sentinel]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            _wait_until(lambda: reader.implausible_count >= 1)
+            assert reader.latest().temperature_c == pytest.approx(21.0)
+        finally:
+            reader.close()
+
+    def test_the_rejection_is_reported(self, fake_serial):
+        fake_serial.lines = [b"T:21.0\n", b"T:-127.00\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            _wait_until(lambda: reader.implausible_count >= 1)
+            assert any("Implausible temperature" in w for w in reader.warnings)
+        finally:
+            reader.close()
+
+    def test_a_sentinel_first_does_not_satisfy_the_wait(self, fake_serial):
+        """Otherwise a dead sensor would look like a working one at startup."""
+        fake_serial.lines = [b"T:-127.00\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            assert reader.wait_for_first_reading(0.2) is False
+        finally:
+            reader.close()
+
+    def test_the_band_is_configurable(self, fake_serial):
+        fake_serial.lines = [b"T:85.00\n"]
+        reader = SerialTemperatureReader(
+            "COM4", 9600, plausible_min_c=-40.0, plausible_max_c=125.0
+        ).open()
+        try:
+            assert reader.wait_for_first_reading(2.0) is True
+            assert reader.latest().temperature_c == pytest.approx(85.0)
+        finally:
+            reader.close()
+
+    def test_an_ordinary_reading_is_untouched(self, fake_serial):
+        fake_serial.lines = [b"T:21.0\n"]
+        reader = SerialTemperatureReader("COM4", 9600).open()
+        try:
+            _wait_for_reading(reader)
+            assert reader.implausible_count == 0
+        finally:
+            reader.close()
+
+
 class TestPortDiscovery:
     def test_a_present_port_is_found(self, fake_serial):
         import sys

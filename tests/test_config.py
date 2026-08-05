@@ -672,10 +672,23 @@ class TestLegacyRejection:
 
 
 class TestValidateForCollect:
-    def test_a_healthy_config_passes(self, base_config, fake_serial):
+    def test_a_healthy_config_raises_nothing(self, base_config, fake_serial):
         import sys
 
         sys.modules["serial.tools.list_ports"].available = ["COM4"]
+        warnings = validate_for_collect(base_config)
+        # The shipped probe (0.75 s) is slower than the shipped sample rate
+        # (10 Hz), so the informational cadence note is expected. Nothing else.
+        assert len(warnings) == 1
+        assert "held for about" in warnings[0]
+
+    def test_a_faster_probe_than_the_sample_rate_says_nothing(
+        self, base_config, fake_serial
+    ):
+        import sys
+
+        sys.modules["serial.tools.list_ports"].available = ["COM4"]
+        base_config.hardware.temperature.conversion_time_s = 0.01
         assert validate_for_collect(base_config) == []
 
     def test_a_missing_required_port_is_fatal(self, base_config, fake_serial):

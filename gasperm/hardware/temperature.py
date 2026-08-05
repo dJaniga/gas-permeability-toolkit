@@ -54,6 +54,10 @@ class TemperatureSample:
     raw_line: str | None
     #: True when this value has been carried over past ``stale_after_s``.
     stale: bool = False
+    #: Seconds since this value arrived. A sensor slower than the sample rate
+    #: is held between conversions, so a small age is normal; a growing one
+    #: means the probe has stopped answering.
+    age_s: float | None = None
 
 
 class TemperatureSource(Protocol):
@@ -173,6 +177,8 @@ class SerialTemperatureReader:
         unit: str = "C",
         stale_after_s: float = 10.0,
         max_parse_warnings: int = 5,
+        plausible_min_c: float = -20.0,
+        plausible_max_c: float = 60.0,
     ) -> None:
         """Args:
         port: Serial port, e.g. ``COM4``.
@@ -192,15 +198,19 @@ class SerialTemperatureReader:
         self.unit = unit
         self.stale_after_s = stale_after_s
         self.max_parse_warnings = max_parse_warnings
+        self.plausible_min_c = plausible_min_c
+        self.plausible_max_c = plausible_max_c
         self._parser = build_line_parser(parse_pattern)
 
         self._serial = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._first_reading = threading.Event()
         self._sample = TemperatureSample(None, None, None)
         self._parse_failures = 0
         self._read_errors = 0
+        self._implausible = 0
         self.warnings: list[str] = []
 
     # -- lifecycle --------------------------------------------------------
@@ -316,8 +326,27 @@ class SerialTemperatureReader:
                     )
                 continue
 
+            if not self.plausible_min_c <= value <= self.plausible_max_c:
+                # A DS18B20 reports -127 when it does not answer and 85 after a
+                # power-on reset. Both parse as ordinary numbers and would go
+                # straight into the viscosity lookup, so they are discarded and
+                # the last good value kept -- exactly like an unparseable line.
+                self._implausible += 1
+                message = (
+                    f"Implausible temperature on {self.port}: {value:g} degC is outside "
+                    f"{self.plausible_min_c:g}..{self.plausible_max_c:g}. Keeping the "
+                    "last good value."
+                )
+                if self._implausible <= self.max_parse_warnings:
+                    logger.warning("%s", message)
+                    self._record_warning(message)
+                else:
+                    logger.debug("%s", message)
+                continue
+
             with self._lock:
                 self._sample = TemperatureSample(value, time.monotonic(), line, False)
+            self._first_reading.set()
 
     def _record_warning(self, message: str) -> None:
         with self._lock:
@@ -337,11 +366,32 @@ class SerialTemperatureReader:
         if sample.temperature_c is None or sample.received_at is None:
             return sample
         age = time.monotonic() - sample.received_at
-        if age > self.stale_after_s and not sample.stale:
-            return TemperatureSample(
-                sample.temperature_c, sample.received_at, sample.raw_line, True
-            )
-        return sample
+        return TemperatureSample(
+            sample.temperature_c,
+            sample.received_at,
+            sample.raw_line,
+            age > self.stale_after_s,
+            age,
+        )
+
+    def wait_for_first_reading(self, timeout_s: float) -> bool:
+        """Block until the probe produces its first usable value.
+
+        A sensor with a long conversion time -- 750 ms for a DS18B20 -- leaves
+        the first fraction of a second of a run with nothing to report, and
+        those samples would otherwise silently use a guessed temperature for
+        the viscosity lookup. Waiting once at startup costs less than one
+        conversion and removes the gap entirely.
+
+        Returns:
+            True if a reading arrived within ``timeout_s``.
+        """
+        return self._first_reading.wait(timeout_s)
+
+    @property
+    def implausible_count(self) -> int:
+        """Readings discarded for falling outside the plausible band."""
+        return self._implausible
 
     @property
     def parse_failure_count(self) -> int:
@@ -367,7 +417,11 @@ class StaticTemperatureSource:
 
     def latest(self) -> TemperatureSample:
         """The configured constant, always flagged stale."""
-        return TemperatureSample(self.temperature_c, time.monotonic(), None, True)
+        return TemperatureSample(self.temperature_c, time.monotonic(), None, True, 0.0)
+
+    def wait_for_first_reading(self, timeout_s: float) -> bool:
+        """Always ready: there is no probe to wait for."""
+        return True
 
     def close(self) -> None:
         """No-op; there is nothing to release."""

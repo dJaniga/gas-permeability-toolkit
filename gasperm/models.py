@@ -290,6 +290,10 @@ class Reading(BaseModel):
     temperature_ok: bool = True
     #: True when the temperature is a carried-over last-known-good value.
     temperature_stale: bool = False
+    #: Seconds since the probe produced this temperature. A sensor slower than
+    #: the sample rate is held between conversions, so a small age is normal;
+    #: a growing one means the probe has stopped answering.
+    temperature_age_s: float | None = None
 
     viscosity_cp: float
     compressibility_z: float | None = None

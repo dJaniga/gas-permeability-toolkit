@@ -57,6 +57,11 @@ logger = logging.getLogger(__name__)
 #: uncalibrated near ambient, tight enough to catch a closed valve.
 DOWNSTREAM_MISMATCH_TOLERANCE = 0.05
 
+#: How many conversion times a temperature may age before the probe counts as
+#: having missed a beat. Two is a hold across one skipped conversion, which is
+#: the point at which "slower than the sample rate" becomes "not answering".
+MISSED_CONVERSIONS = 3
+
 __all__ = [
     "RollingWindow",
     "SampleProcessor",
@@ -320,6 +325,7 @@ class SampleProcessor:
             temperature_c=temperature_c,
             temperature_ok=temperature_ok,
             temperature_stale=temperature.stale or not temperature_ok,
+            temperature_age_s=temperature.age_s,
             viscosity_cp=gas_state.viscosity_cp,
             compressibility_z=z_factor,
             permeability_darcy=permeability,
@@ -698,6 +704,22 @@ def summarize_run(
     )
     mean_reference_q, _ = _mean_stddev([r.flow_reference_cm3_s for r in window_readings])
     mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window_readings])
+
+    # Whether the probe kept up. Holding a value between conversions is normal
+    # for a slow sensor; a value held for many conversions is the probe having
+    # stopped, which the operator can otherwise only infer from the console.
+    conversion_time_s = config.hardware.temperature.conversion_time_s
+    ages = [r.temperature_age_s for r in window_readings if r.temperature_age_s is not None]
+    if ages:
+        missed_beats = sum(1 for age in ages if age > MISSED_CONVERSIONS * conversion_time_s)
+        if missed_beats:
+            collected_warnings.append(
+                f"The temperature probe fell behind on {missed_beats} of {len(ages)} "
+                f"steady-state samples: the value was older than "
+                f"{MISSED_CONVERSIONS} x conversion_time_s "
+                f"({MISSED_CONVERSIONS * conversion_time_s:.2f} s), peaking at "
+                f"{max(ages):.2f} s. Viscosity was computed from a held temperature."
+            )
 
     # A declared downstream pressure is an assertion about the rig. The outlet
     # transducer is still being read, so check it: a shut valve would otherwise

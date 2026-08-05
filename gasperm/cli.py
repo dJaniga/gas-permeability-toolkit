@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -731,9 +732,11 @@ def _open_temperature_source(config: GaspermConfig):
         timeout_s=settings.timeout_s,
         unit=settings.units,
         stale_after_s=settings.stale_after_s,
+        plausible_min_c=settings.plausible_min_c,
+        plausible_max_c=settings.plausible_max_c,
     )
     try:
-        return reader.open()
+        reader.open()
     except OSError as exc:
         if settings.required:
             raise
@@ -744,6 +747,33 @@ def _open_temperature_source(config: GaspermConfig):
             settings.fallback_temperature_c,
             note=f"{settings.port} could not be opened",
         )
+
+    # Wait out the sensor's conversion time once, so that no sample falls back
+    # to a guessed temperature. A DS18B20 needs 750 ms; the run is minutes.
+    typer.secho(
+        f"Waiting for the temperature probe on {settings.port}...",
+        fg=typer.colors.CYAN,
+        nl=False,
+    )
+    started = time.monotonic()
+    if reader.wait_for_first_reading(settings.warmup_timeout_s):
+        typer.secho(f" {time.monotonic() - started:.1f} s", fg=typer.colors.CYAN)
+        return reader
+
+    typer.echo("")
+    reader.close()
+    message = (
+        f"The port {settings.port} opened but the probe sent no usable reading within "
+        f"{settings.warmup_timeout_s:g} s. Check the baud rate ({settings.baud_rate}), "
+        f"that the sketch is running, and that temperature.parse_pattern matches what "
+        "it prints."
+    )
+    if settings.required:
+        raise OSError(message)
+    logger.warning("%s Continuing on the fallback temperature.", message)
+    return StaticTemperatureSource(
+        settings.fallback_temperature_c, note=f"{settings.port} never answered"
+    )
 
 
 @app.command("collect")

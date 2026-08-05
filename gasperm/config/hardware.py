@@ -242,7 +242,23 @@ class TemperatureConfig(_Base):
     parse_pattern: str | None = "T:{value}"
     timeout_s: float = Field(default=2.0, gt=0.0)
     units: Literal["C", "K", "F"] = "C"
-    #: Refuse to start ``collect`` if the port cannot be opened.
+    #: How long the sensor takes to produce a reading. A DS18B20 needs 750 ms
+    #: at 12-bit resolution (187 ms at 9-bit). Acquisition normally samples
+    #: faster than this, so each value is *held* for several samples -- which
+    #: is correct, not a fault: temperature moves far more slowly than the
+    #: pressures. Used to judge whether the probe is keeping up.
+    conversion_time_s: float = Field(default=0.75, gt=0.0)
+    #: How long ``collect`` waits at startup for the probe's first reading, so
+    #: that no sample falls back to a guessed temperature.
+    warmup_timeout_s: float = Field(default=5.0, gt=0.0)
+    #: Readings outside this band are discarded and the last good value kept.
+    #: The default excludes the two DS18B20 sentinels that would otherwise pass
+    #: as ordinary numbers: -127 means the sensor did not answer, and 85 is its
+    #: power-on reset value. Widen it for a genuinely hot rig.
+    plausible_min_c: float = -20.0
+    plausible_max_c: float = 60.0
+    #: Refuse to start ``collect`` if the port cannot be opened, or if the
+    #: probe opens but never speaks within ``warmup_timeout_s``.
     required: bool = True
     #: Used only when the probe never produced a reading and ``required`` is
     #: False -- keeps viscosity lookups possible on a degraded run.
@@ -257,6 +273,15 @@ class TemperatureConfig(_Base):
             kind="absolute", value=0.5, source="probe datasheet, degC"
         )
     )
+
+    @model_validator(mode="after")
+    def _plausible_band_is_ordered(self) -> TemperatureConfig:
+        if self.plausible_min_c >= self.plausible_max_c:
+            raise ValueError(
+                f"temperature.plausible_min_c ({self.plausible_min_c}) must be below "
+                f"plausible_max_c ({self.plausible_max_c})"
+            )
+        return self
 
 
 class InstrumentUncertaintyConfig(_Base):

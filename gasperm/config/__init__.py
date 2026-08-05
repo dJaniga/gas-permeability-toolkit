@@ -487,6 +487,10 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         "pressure_calibration.outlet.reading_type": "gauge adds run.atmospheric_pressure",
         "default_flowmeter": "used when run.yaml leaves 'flowmeter' null",
         "temperature.parse_pattern": "'{value}' marks the number; null = first float",
+        "temperature.conversion_time_s": "DS18B20: 0.75 s at 12-bit, 0.19 s at 9-bit",
+        "temperature.warmup_timeout_s": "startup wait for the probe's first reading",
+        "temperature.plausible_min_c": "readings outside the band are discarded;",
+        "temperature.plausible_max_c": "excludes the DS18B20 -127 and 85 sentinels",
         "temperature.units": "C | K | F",
         "temperature.required": "refuse to start collect if the port will not open",
         "temperature.uncertainty.value": "degC",
@@ -744,6 +748,25 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
                 f"fallback_temperature_c = "
                 f"{config.hardware.temperature.fallback_temperature_c}."
             )
+
+    # -- temperature probe cadence ----------------------------------------
+    probe = config.hardware.temperature
+    sample_interval_s = 1.0 / config.hardware.daq.sample_rate_hz
+    if probe.conversion_time_s > sample_interval_s:
+        held = probe.conversion_time_s / sample_interval_s
+        warnings.append(
+            f"The temperature probe converts every {probe.conversion_time_s:g} s while "
+            f"the DAQ samples every {sample_interval_s:.3g} s, so each temperature is "
+            f"held for about {held:.0f} samples. That is expected -- temperature moves "
+            "far more slowly than the pressures -- and the run summary reports if the "
+            "probe falls further behind than that."
+        )
+    if probe.stale_after_s <= probe.conversion_time_s:
+        warnings.append(
+            f"temperature.stale_after_s ({probe.stale_after_s:g} s) is not longer than "
+            f"conversion_time_s ({probe.conversion_time_s:g} s), so every reading will "
+            "be flagged stale as a matter of course. Raise it above the conversion time."
+        )
 
     # -- geometry sanity --------------------------------------------------
     sample = config.sample

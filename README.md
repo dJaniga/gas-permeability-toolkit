@@ -255,6 +255,48 @@ degrees of freedom.
 `collect` prints the whole budget, ranked by contribution, so it is obvious
 which term to improve next.
 
+## A slow temperature probe
+
+A DS18B20 converts in 750 ms at 12-bit resolution while the DAQ samples every
+100 ms, so each temperature is **held** for about eight samples. That is
+correct, not a fault: temperature moves far more slowly than the pressures, and
+viscosity changes roughly 0.2 % per kelvin.
+
+```yaml
+temperature:
+  conversion_time_s: 0.75     # DS18B20 at 12-bit; 0.19 s at 9-bit
+  warmup_timeout_s: 5.0       # startup wait for the first reading
+  stale_after_s: 10.0
+  plausible_min_c: -20.0      # excludes the DS18B20 sentinels
+  plausible_max_c: 60.0
+```
+
+Three things follow from a probe that is slower than the sample rate:
+
+**The run waits for the first reading.** Otherwise the opening fraction of a
+second would have no temperature and would silently use
+`fallback_temperature_c` for the viscosity lookup — a wrong number, quietly
+applied. `collect` waits out one conversion instead:
+
+```
+Waiting for the temperature probe on COM4... 0.8 s
+```
+
+**A probe that opens but never speaks is fatal** when `temperature.required` is
+true. A wrong baud rate or a stopped sketch used to cost a whole run on the
+fallback; now it is caught before the DAQ is touched.
+
+**Implausible readings are discarded**, keeping the last good value. This
+matters specifically for the DS18B20, whose two failure values parse as
+perfectly ordinary numbers: `-127` means the sensor did not answer, and `85` is
+its power-on reset value. Either would otherwise go straight into the viscosity
+lookup. Widen `plausible_min_c` / `plausible_max_c` for a genuinely hot rig.
+
+Every reading records `temperature_age_s`, so the CSV shows the hold directly —
+`0.005, 0.106, 0.205 …` resetting each conversion. If the probe falls further
+behind than a few conversions, the run summary says so rather than leaving you
+to infer it.
+
 ## Gas properties
 
 Viscosity, density and compressibility come from

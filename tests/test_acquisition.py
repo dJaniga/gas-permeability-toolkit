@@ -346,6 +346,47 @@ class TestDownstreamCrossCheck:
         assert not any("disagrees" in w for w in summary.warnings)
 
 
+class TestTemperatureCadence:
+    """A probe slower than the sample rate holds its value; that is normal."""
+
+    def test_a_held_value_carries_its_age(self, base_config):
+        reading = make_processor(base_config).process(
+            index=0, elapsed_s=0.0, voltages=VOLTAGES,
+            temperature=TemperatureSample(22.0, 0.0, None, False, 0.4),
+        )
+        assert reading.temperature_age_s == pytest.approx(0.4)
+        assert reading.temperature_ok is True
+        assert reading.temperature_stale is False
+
+    def test_a_probe_keeping_up_is_not_reported(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.run.max_samples = 80
+        loop = build_loop(
+            quick_steady_config, fake_analog_source(VOLTAGES), fake_temperature_source(),
+            clock=FakeClock(step=0.05),
+        )
+        loop.run(install_signal_handler=False)
+        assert not any("fell behind" in w for w in loop.summarize().warnings)
+
+    def test_a_probe_that_falls_behind_is_reported(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """Holding across several conversions means it has stopped answering."""
+        quick_steady_config.run.max_samples = 80
+        quick_steady_config.hardware.temperature.conversion_time_s = 0.75
+        stalled = fake_temperature_source()
+        stalled.age_s = 30.0  # far past 3 x 0.75 s
+        loop = build_loop(
+            quick_steady_config, fake_analog_source(VOLTAGES), stalled,
+            clock=FakeClock(step=0.05),
+        )
+        loop.run(install_signal_handler=False)
+        warnings = loop.summarize().warnings
+        assert any("fell behind" in w for w in warnings)
+        assert any("held temperature" in w for w in warnings)
+
+
 class TestRealGasCorrection:
     def test_off_by_default(self, base_config):
         assert base_config.run.gas.real_gas_correction is False
