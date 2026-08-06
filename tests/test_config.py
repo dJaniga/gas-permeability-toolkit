@@ -21,6 +21,7 @@ from gasperm.config import (
     GaspermConfig,
     HardwareConfig,
     LinearCalibration,
+    LivePlotConfig,
     PressureChannelConfig,
     RunConfig,
     SampleConfig,
@@ -121,6 +122,23 @@ class TestValidation:
     def test_identical_pressure_channels_are_rejected(self):
         with pytest.raises(ValueError, match="must differ"):
             DaqConfig(inlet_pressure_channel="ai0", outlet_pressure_channel="ai0")
+
+    def test_an_unknown_plot_panel_is_rejected(self):
+        with pytest.raises(ValueError, match="viscosity"):
+            LivePlotConfig(panels=["flow", "viscosity"])
+
+    def test_an_empty_plot_panel_list_is_rejected(self):
+        with pytest.raises(ValueError, match="at least one"):
+            LivePlotConfig(panels=[])
+
+    def test_a_repeated_plot_panel_is_rejected(self):
+        """Each quantity gets exactly one panel -- a repeat is a typo."""
+        with pytest.raises(ValueError, match="repeats flow"):
+            LivePlotConfig(panels=["flow", "permeability", "flow"])
+
+    def test_a_non_positive_plot_window_is_rejected(self):
+        with pytest.raises(ValueError):
+            LivePlotConfig(window_s=0.0)
 
     def test_flowmeter_cannot_share_a_pressure_channel(self):
         with pytest.raises(ValueError, match="already assigned"):

@@ -23,7 +23,28 @@ __all__ = [
     "GasConfig",
     "SteadyStateConfig",
     "UncertaintyReportConfig",
+    "LivePlotConfig",
+    "PLOT_PANELS",
     "RunConfig",
+]
+
+#: Every quantity the live plot can give a panel to, in their natural order.
+#: Each gets its **own** stacked axes -- pressures are not overlaid, because
+#: the point of the live view is watching one signal settle at a time.
+PLOT_PANELS: tuple[str, ...] = (
+    "inlet_pressure",
+    "outlet_pressure",
+    "flow",
+    "temperature",
+    "permeability",
+)
+
+PlotPanel = Literal[
+    "inlet_pressure",
+    "outlet_pressure",
+    "flow",
+    "temperature",
+    "permeability",
 ]
 
 
@@ -141,6 +162,45 @@ class UncertaintyReportConfig(_Base):
     max_component_contribution: float | None = Field(default=0.25, gt=0.0)
 
 
+class LivePlotConfig(_Base):
+    """The optional ``--plot`` window.
+
+    Display only: nothing here touches a reading, a CSV or a reported result,
+    and the whole window can fail without disturbing the run.
+    """
+
+    #: One stacked panel per entry, drawn top to bottom in this order.
+    panels: list[PlotPanel] = Field(default_factory=lambda: list(PLOT_PANELS))
+    #: Trailing seconds to display. ``null`` shows the whole run from t0.
+    #: A window is what you want while waiting for a plateau; from t0 is what
+    #: you want to see how far the rig has come since pressure was applied.
+    window_s: float | None = Field(default=None, gt=0.0)
+    #: Draw the steady-state criterion bands and the fitted drift line.
+    show_criteria: bool = True
+    #: Minimum wall-clock gap between redraws. The acquisition loop only ever
+    #: appends to a buffer; this is what keeps matplotlib off its critical path.
+    redraw_interval_s: float = Field(default=0.5, gt=0.0)
+    #: Points held per series. The trailing-window view keeps every sample up
+    #: to this many; the from-t0 view decimates to stay inside it, so a
+    #: multi-hour run still spans the whole x-axis without unbounded memory.
+    max_points: int = Field(default=3600, gt=1)
+
+    @field_validator("panels")
+    @classmethod
+    def _panels_are_usable(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError(
+                "plot.panels is empty; list at least one of: " + ", ".join(PLOT_PANELS)
+            )
+        duplicates = {name for name in value if value.count(name) > 1}
+        if duplicates:
+            raise ValueError(
+                "plot.panels repeats " + ", ".join(sorted(duplicates)) + "; each "
+                "quantity gets exactly one panel."
+            )
+        return value
+
+
 class RunConfig(_Base):
     """Experiment metadata plus everything about how ``collect`` executes.
 
@@ -225,6 +285,8 @@ class RunConfig(_Base):
     display_pressure_unit: PressureUnit = "kPa"
     display_permeability_unit: str = "mD"
     display_flow_unit: str = "sccm"
+    #: The optional live window. Only consulted when ``--plot`` is passed.
+    plot: LivePlotConfig = Field(default_factory=LivePlotConfig)
 
     # -- stop conditions --------------------------------------------------
     #: ``null`` on both means run until Ctrl+C (or until steady state has held

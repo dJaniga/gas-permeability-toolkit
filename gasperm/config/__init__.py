@@ -48,7 +48,9 @@ from gasperm.config.hardware import (
     TemperatureConfig,
 )
 from gasperm.config.run import (
+    PLOT_PANELS,
     GasConfig,
+    LivePlotConfig,
     RunConfig,
     SteadyStateConfig,
     UncertaintyReportConfig,
@@ -66,6 +68,8 @@ __all__ = [
     "GasConfig",
     "SteadyStateConfig",
     "UncertaintyReportConfig",
+    "LivePlotConfig",
+    "PLOT_PANELS",
     "InstrumentUncertaintyConfig",
     "DaqConfig",
     "PressureChannelConfig",
@@ -617,6 +621,13 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "the caliper figures in sample.yaml."
         ),
         "output_dir": "Output.",
+        "plot": (
+            "The optional live window, only opened by 'collect --plot'. Each listed\n"
+            "quantity gets its own panel, stacked in this order, and the panels the\n"
+            "detector watches carry its criteria: the window mean, the scatter\n"
+            "tolerance band, and the fitted drift line. Display only -- nothing here\n"
+            "changes a reading or a reported result."
+        ),
         "duration_s": "Stop conditions.",
     }
     comments = {
@@ -642,6 +653,10 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "warn when one input is worth this fraction of k"
         ),
         "averaging_window_s": "live display only; the result uses the steady window",
+        "plot.panels": "one stacked panel each, top to bottom",
+        "plot.window_s": "trailing seconds to show; null = whole run from t0",
+        "plot.show_criteria": "draw the steady-state bands and drift line",
+        "plot.max_points": "per series; the from-t0 view decimates to fit",
         "display_pressure_unit": "console/plot only",
         "display_permeability_unit": "mD | D | uD | um2 | m2",
         "duration_s": "null = run until Ctrl+C",

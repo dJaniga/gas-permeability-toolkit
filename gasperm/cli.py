@@ -14,6 +14,7 @@ import typer
 from gasperm import __version__, units
 from gasperm.config import (
     HARDWARE_FILENAME,
+    PLOT_PANELS,
     RUN_FILENAME,
     ConfigError,
     GaspermConfig,
@@ -784,7 +785,26 @@ def collect_command(
     hardware: Optional[Path] = typer.Option(None, "--hardware", help="Override hardware.yaml."),
     sample: Optional[Path] = typer.Option(None, "--sample", help="Override sample.yaml."),
     run_file: Optional[Path] = typer.Option(None, "--run", help="Override run.yaml."),
-    plot: bool = typer.Option(False, "--plot", help="Also open a live matplotlib window."),
+    plot: bool = typer.Option(
+        False, "--plot",
+        help="Open a live window: one stacked panel per parameter, with the "
+             "steady-state criteria drawn on it.",
+    ),
+    plot_window: Optional[float] = typer.Option(
+        None, "--plot-window", metavar="SECONDS",
+        help="Live plot shows only this trailing window. Default is run.yaml's "
+             "plot.window_s. Implies --plot.",
+    ),
+    plot_from_start: bool = typer.Option(
+        False, "--plot-from-start",
+        help="Live plot spans the whole run from t0, overriding any configured "
+             "window. Implies --plot.",
+    ),
+    plot_panels: Optional[str] = typer.Option(
+        None, "--plot-panels", metavar="A,B,...",
+        help="Comma-separated panels to stack, overriding run.yaml. One of: "
+             + ", ".join(PLOT_PANELS) + ". Implies --plot.",
+    ),
     duration: Optional[float] = typer.Option(
         None, "--duration", "-d", metavar="SECONDS", help="Stop after this long."
     ),
@@ -875,6 +895,29 @@ def collect_command(
             return
         config.run.flowmeter = flowmeter
 
+    if plot_window is not None and plot_from_start:
+        _fail(
+            "--plot-window and --plot-from-start ask for opposite views. Pass one: a "
+            "trailing window, or the whole run from t0."
+        )
+        return
+    if plot_panels is not None:
+        names = [name.strip() for name in plot_panels.split(",") if name.strip()]
+        unknown = [name for name in names if name not in PLOT_PANELS]
+        if unknown:
+            _fail(
+                f"--plot-panels does not recognise {', '.join(unknown)}. Available "
+                f"panels: {', '.join(PLOT_PANELS)}."
+            )
+            return
+        try:
+            config.run.plot.panels = names
+        except ValueError as exc:
+            _fail(str(exc))
+            return
+    # Asking for any plot detail means asking for the plot.
+    plot = plot or plot_from_start or plot_window is not None or plot_panels is not None
+
     # Fail loudly and specifically BEFORE opening the DAQ.
     try:
         startup_warnings = validate_for_collect(config)
@@ -932,7 +975,9 @@ def collect_command(
         from gasperm.plotting import LivePlot, PlottingUnavailable
 
         try:
-            live_plot = LivePlot(config).open()
+            live_plot = LivePlot(
+                config, window_s=plot_window, from_start=plot_from_start
+            ).open()
         except PlottingUnavailable as exc:
             typer.secho(f"warning: live plot unavailable: {exc}", fg=typer.colors.YELLOW)
             live_plot = None
@@ -943,7 +988,10 @@ def collect_command(
         writer.write(reading)
         typer.echo(format_reading_line(reading, config))
         if live_plot is not None:
-            live_plot.add(reading)
+            # The detector's verdict is what the criterion lines are drawn
+            # from; it is already updated for this reading by the time the
+            # loop calls back.
+            live_plot.add(reading, loop.status)
             live_plot.maybe_redraw()
 
     loop = AcquisitionLoop(

@@ -5,11 +5,17 @@ Plotting is strictly additive. The console output is the primary display and
 to produce correct data.
 
 **The live plot must never slow the acquisition loop.** Points go into a
-bounded deque on the loop's thread -- an O(1) append -- and the figure is
+bounded buffer on the loop's thread -- an O(1) append -- and the figure is
 redrawn on a timer (``redraw_interval_s``), not once per sample. At 10 Hz a
 per-sample redraw would spend more time in matplotlib than in the DAQ. If the
 redraw itself fails (window closed by the operator, no display available), the
 error is swallowed and the run continues.
+
+Each monitored quantity gets its **own** stacked panel rather than sharing
+axes, and the panels the detector actually watches carry its criteria drawn on
+them: the trailing window's mean, the scatter tolerance band around it, and the
+fitted drift line. Watching a signal approach its band is the whole point of a
+live view on a rig where a plateau can take hours.
 
 matplotlib is imported lazily so the package works headless.
 """
@@ -17,22 +23,37 @@ matplotlib is imported lazily so the package works headless.
 from __future__ import annotations
 
 import logging
+import math
 import time
-from collections import deque
+from bisect import bisect_left
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple, Sequence
 
 from gasperm import units
 from gasperm.config import GaspermConfig
-from gasperm.models import KlinkenbergResult, Reading
+from gasperm.models import KlinkenbergResult, Reading, SteadyStateStatus
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["LivePlot", "plot_klinkenberg", "PlottingUnavailable"]
 
-#: How many points the live window keeps. Bounded so a multi-hour run cannot
-#: grow the figure's memory without limit.
+#: How many points the live window keeps per series. Bounded so a multi-hour
+#: run cannot grow the figure's memory without limit.
 DEFAULT_MAX_POINTS = 3600
+
+#: Steady state is only ever declared after ``required_windows`` consecutive
+#: windows, so a steady stretch is minutes long at the shipped criteria. The
+#: from-t0 view can therefore decimate its steady flags by plain sampling
+#: without any risk of dropping a span: losing one would take a run roughly
+#: ``max_points * required_windows * window_s`` long.
+_STEADY_COLOR = "tab:green"
+
+#: How far the criterion band may stretch a panel beyond its data before it is
+#: left off-screen instead. A band comfortably wider than the signal means the
+#: signal is well inside tolerance, and letting it set the y-axis would flatten
+#: the trace into a line -- which is exactly the shape the operator is watching.
+#: The numbers are still reported in the corner annotation either way.
+_MAX_BAND_ZOOM = 4.0
 
 
 class PlottingUnavailable(RuntimeError):
@@ -54,37 +75,261 @@ def _pyplot(interactive: bool):
     return plt
 
 
-class LivePlot:
-    """Live view of pressures, flow and permeability during a ``collect`` run.
+class _Trace(NamedTuple):
+    """One line on a panel."""
 
-    Usable as a context manager. Every method is safe to call when the backend
-    turns out to be unusable -- the plot degrades to a no-op rather than taking
-    the run down with it.
+    channel: str
+    label: str
+    color: str
+    linewidth: float = 1.4
+    alpha: float = 1.0
+
+
+class _Panel(NamedTuple):
+    """One stacked axes: a quantity, its unit, and how it is drawn.
+
+    ``signal`` is the steady-state detector's name for this quantity, or
+    ``None`` when the detector does not watch it -- an unwatched panel gets no
+    criterion lines, which is itself worth seeing.
+    """
+
+    key: str
+    ylabel: str
+    traces: tuple[_Trace, ...]
+    signal: str | None
+    #: Detector-internal units to display units. Affine, not merely scaled:
+    #: the detector works in kelvin so it never divides by a near-zero mean.
+    to_display: Callable[[float], float]
+
+
+def _channel_values(reading: Reading, run) -> dict[str, float]:
+    """Every plottable quantity of one reading, already in display units."""
+
+    def darcy(value: float | None) -> float:
+        # NaN rather than a dropped point: matplotlib leaves a gap, which is
+        # the honest picture of a sample that yielded no permeability.
+        if value is None:
+            return float("nan")
+        return units.darcy_to(value, run.display_permeability_unit)
+
+    return {
+        "inlet_pressure": units.from_atm(
+            reading.inlet_pressure_atm, run.display_pressure_unit
+        ),
+        "outlet_pressure": units.from_atm(
+            reading.outlet_pressure_atm, run.display_pressure_unit
+        ),
+        "downstream_pressure": units.from_atm(
+            reading.downstream_pressure_atm, run.display_pressure_unit
+        ),
+        "flow": units.flow_from_cm3_s(reading.flow_cm3_s, run.display_flow_unit),
+        "temperature": reading.temperature_c,
+        "permeability": darcy(reading.permeability_darcy),
+        "permeability_avg": darcy(reading.permeability_darcy_avg),
+    }
+
+
+def _panels_for(config: GaspermConfig) -> list[_Panel]:
+    """Build the requested panels, in the configured order."""
+    run = config.run
+    pressure = run.display_pressure_unit
+    supplied_p2 = not run.downstream_is_measured
+
+    outlet_traces = [
+        _Trace("outlet_pressure", "transducer", "tab:orange"),
+    ]
+    if supplied_p2:
+        # A declared P2 is what the equation used; the transducer is then the
+        # cross-check, so both belong on the panel and must be told apart.
+        outlet_traces.append(
+            _Trace("downstream_pressure", "P2 used (supplied)", "tab:red", 1.2, 0.9)
+        )
+
+    available = {
+        "inlet_pressure": _Panel(
+            key="inlet_pressure",
+            ylabel=f"inlet P1 ({pressure})",
+            traces=(_Trace("inlet_pressure", "P1", "tab:blue"),),
+            signal="inlet_pressure",
+            to_display=lambda atm: units.from_atm(atm, pressure),
+        ),
+        "outlet_pressure": _Panel(
+            key="outlet_pressure",
+            ylabel=f"outlet P2 ({pressure})",
+            traces=tuple(outlet_traces),
+            # The detector watches the inlet, not the outlet.
+            signal=None,
+            to_display=lambda atm: units.from_atm(atm, pressure),
+        ),
+        "flow": _Panel(
+            key="flow",
+            ylabel=f"flow ({run.display_flow_unit})",
+            traces=(_Trace("flow", "Q", "tab:green"),),
+            signal="flow",
+            to_display=lambda cm3_s: units.flow_from_cm3_s(cm3_s, run.display_flow_unit),
+        ),
+        "temperature": _Panel(
+            key="temperature",
+            ylabel="temperature (C)",
+            traces=(_Trace("temperature", "T", "tab:purple"),),
+            signal="temperature",
+            to_display=units.kelvin_to_celsius,
+        ),
+        "permeability": _Panel(
+            key="permeability",
+            ylabel=f"k ({run.display_permeability_unit})",
+            traces=(
+                # The detector tests the instantaneous value, so that is what
+                # the criterion band belongs around; the rolling mean is drawn
+                # over it because that is the number the console reports.
+                _Trace("permeability", "k (instant)", "tab:red", 0.9, 0.35),
+                _Trace("permeability_avg", "k (averaged)", "tab:red", 1.6),
+            ),
+            signal="permeability",
+            to_display=lambda d: units.darcy_to(d, run.display_permeability_unit),
+        ),
+    }
+    return [available[name] for name in run.plot.panels]
+
+
+class _History:
+    """Bounded storage for every plotted channel.
+
+    Two views, because the two display modes want different things:
+
+    ``recent``
+        Every sample, up to ``max_points``. Backs the trailing-window view,
+        which needs full detail over a short span.
+    ``archive``
+        Decimated by a stride that doubles whenever it fills. Backs the from-t0
+        view, so a multi-hour run spans the whole x-axis at fixed memory
+        instead of either exhausting it or silently starting the axis late.
+    """
+
+    def __init__(self, channels: Sequence[str], max_points: int) -> None:
+        self._channels = list(channels)
+        self.max_points = max_points
+        self.recent_times: list[float] = []
+        self.recent: dict[str, list[float]] = {name: [] for name in self._channels}
+        self.recent_steady: list[bool] = []
+        self.archive_times: list[float] = []
+        self.archive: dict[str, list[float]] = {name: [] for name in self._channels}
+        self.archive_steady: list[bool] = []
+        self._stride = 1
+        self._seen = 0
+
+    def __len__(self) -> int:
+        return self._seen
+
+    def append(self, elapsed_s: float, values: dict[str, float], steady: bool) -> None:
+        self.recent_times.append(elapsed_s)
+        for name in self._channels:
+            self.recent[name].append(values[name])
+        self.recent_steady.append(steady)
+        if len(self.recent_times) > self.max_points:
+            # Drop the oldest in one slice rather than per-append: amortised
+            # O(1) and it keeps the lists contiguous for matplotlib.
+            keep = self.max_points // 2
+            self.recent_times = self.recent_times[-keep:]
+            for name in self._channels:
+                self.recent[name] = self.recent[name][-keep:]
+            self.recent_steady = self.recent_steady[-keep:]
+
+        if self._seen % self._stride == 0:
+            self.archive_times.append(elapsed_s)
+            for name in self._channels:
+                self.archive[name].append(values[name])
+            self.archive_steady.append(steady)
+            if len(self.archive_times) > self.max_points:
+                self._decimate()
+        self._seen += 1
+
+    def _decimate(self) -> None:
+        """Halve the archive and double the stride, covering the same span."""
+        self.archive_times = self.archive_times[::2]
+        for name in self._channels:
+            self.archive[name] = self.archive[name][::2]
+        self.archive_steady = self.archive_steady[::2]
+        self._stride *= 2
+
+    def view(self, window_s: float | None) -> tuple[list[float], dict[str, list[float]], list[bool]]:
+        """The series to draw for the requested display mode.
+
+        A trailing window is served from ``recent`` when that still reaches
+        back far enough, and from the archive otherwise -- asking for a window
+        longer than the buffer holds degrades to coarser data rather than to a
+        silently truncated axis.
+        """
+        if window_s is None:
+            return self.archive_times, self.archive, self.archive_steady
+
+        covers = bool(self.recent_times) and (
+            self.recent_times[0] <= self.recent_times[-1] - window_s
+            or len(self.recent_times) == self._seen
+        )
+        times, channels, steady = (
+            (self.recent_times, self.recent, self.recent_steady)
+            if covers
+            else (self.archive_times, self.archive, self.archive_steady)
+        )
+        if not times:
+            return times, channels, steady
+        start = bisect_left(times, times[-1] - window_s)
+        return (
+            times[start:],
+            {name: series[start:] for name, series in channels.items()},
+            steady[start:],
+        )
+
+
+class LivePlot:
+    """Live per-parameter view of a ``collect`` run.
+
+    One stacked panel per configured quantity, the steady-state criteria drawn
+    on the panels the detector watches, and the confirmed steady stretch
+    shaded. Usable as a context manager. Every method is safe to call when the
+    backend turns out to be unusable -- the plot degrades to a no-op rather
+    than taking the run down with it.
     """
 
     def __init__(
         self,
         config: GaspermConfig,
         *,
-        max_points: int = DEFAULT_MAX_POINTS,
-        redraw_interval_s: float = 0.5,
+        max_points: int | None = None,
+        redraw_interval_s: float | None = None,
+        window_s: float | None = None,
+        from_start: bool = False,
     ) -> None:
         """Args:
-        config: Supplies the display units; the plot never shows CGS.
-        max_points: Bound on the deque backing each series.
-        redraw_interval_s: Minimum wall-clock gap between redraws.
+        config: Supplies the panels, display units and criteria; the plot
+            never shows CGS.
+        max_points: Override ``run.plot.max_points``.
+        redraw_interval_s: Override ``run.plot.redraw_interval_s``.
+        window_s: Trailing seconds to show, overriding ``run.plot.window_s``.
+        from_start: Force the whole-run view, overriding a configured window.
         """
+        plot_config = config.run.plot
         self.config = config
-        self.redraw_interval_s = redraw_interval_s
-        self._times: deque[float] = deque(maxlen=max_points)
-        self._inlet: deque[float] = deque(maxlen=max_points)
-        self._outlet: deque[float] = deque(maxlen=max_points)
-        self._flow: deque[float] = deque(maxlen=max_points)
-        self._permeability: deque[float] = deque(maxlen=max_points)
-        self._steady: deque[bool] = deque(maxlen=max_points)
+        self.redraw_interval_s = (
+            redraw_interval_s if redraw_interval_s is not None else plot_config.redraw_interval_s
+        )
+        if from_start:
+            self.window_s: float | None = None
+        elif window_s is not None:
+            self.window_s = window_s
+        else:
+            self.window_s = plot_config.window_s
+        self._panels = _panels_for(config)
+        channels = sorted({trace.channel for panel in self._panels for trace in panel.traces})
+        self._history = _History(
+            channels, max_points if max_points is not None else plot_config.max_points
+        )
+        self._status: SteadyStateStatus | None = None
         self._last_redraw = 0.0
         self._figure: Any = None
         self._axes: Any = None
+        self._plt: Any = None
         self._disabled = False
 
     # -- lifecycle --------------------------------------------------------
@@ -93,18 +338,25 @@ class LivePlot:
         """Create the figure. Raises :class:`PlottingUnavailable` if it cannot."""
         plt = _pyplot(interactive=True)
         plt.ion()
-        figure, axes = plt.subplots(3, 1, sharex=True, figsize=(9, 7))
-        figure.canvas.manager.set_window_title(
-            f"gasperm - {self.config.sample.id} ({self.config.gas.name})"
+        count = len(self._panels)
+        figure, axes = plt.subplots(
+            count, 1, sharex=True, figsize=(9.5, max(3.0, 1.55 * count + 1.4)), squeeze=False
         )
-        run = self.config.run
-        axes[0].set_ylabel(f"pressure ({run.display_pressure_unit})")
-        axes[1].set_ylabel(f"flow ({run.display_flow_unit})")
-        axes[2].set_ylabel(f"k ({run.display_permeability_unit})")
-        axes[2].set_xlabel("elapsed (s)")
-        for axis in axes:
+        axes = [row[0] for row in axes]
+        try:
+            figure.canvas.manager.set_window_title(
+                f"gasperm - {self.config.sample.id} ({self.config.gas.name})"
+            )
+        except Exception as exc:  # noqa: BLE001 - some backends have no manager
+            logger.debug("Could not set the window title: %s", exc)
+        for panel, axis in zip(self._panels, axes):
+            axis.set_ylabel(panel.ylabel, fontsize="small")
             axis.grid(True, alpha=0.3)
+        axes[-1].set_xlabel("elapsed (s)")
         figure.tight_layout()
+        # Reserve the strip the status line is written into. Done once, here,
+        # rather than re-running tight_layout on every redraw.
+        figure.subplots_adjust(top=1.0 - 0.62 / figure.get_figheight())
         self._figure = figure
         self._axes = axes
         self._plt = plt
@@ -134,27 +386,25 @@ class LivePlot:
 
     # -- data flow --------------------------------------------------------
 
-    def add(self, reading: Reading) -> None:
+    def add(self, reading: Reading, status: SteadyStateStatus | None = None) -> None:
         """Buffer a reading. O(1), called from the acquisition loop.
 
         This is the only method the loop calls per sample; it does no drawing.
+
+        Args:
+            reading: The sample just taken.
+            status: The detector's current verdict, which carries the per-signal
+                means and tolerances the criterion lines are drawn from.
         """
         if self._disabled:
             return
-        run = self.config.run
-        self._times.append(reading.elapsed_s)
-        self._inlet.append(units.from_atm(reading.inlet_pressure_atm, run.display_pressure_unit))
-        self._outlet.append(
-            units.from_atm(reading.outlet_pressure_atm, run.display_pressure_unit)
+        self._history.append(
+            reading.elapsed_s,
+            _channel_values(reading, self.config.run),
+            reading.steady_state,
         )
-        self._flow.append(units.flow_from_cm3_s(reading.flow_cm3_s, run.display_flow_unit))
-        value = reading.permeability_darcy_avg
-        self._permeability.append(
-            units.darcy_to(value, run.display_permeability_unit)
-            if value is not None
-            else float("nan")
-        )
-        self._steady.append(reading.steady_state)
+        if status is not None:
+            self._status = status
 
     def maybe_redraw(self, now: float | None = None) -> bool:
         """Redraw if ``redraw_interval_s`` has elapsed. Returns whether it did.
@@ -162,7 +412,7 @@ class LivePlot:
         Called from the loop after :meth:`add`; the interval check is what
         keeps plotting off the critical path.
         """
-        if self._disabled or self._figure is None or not self._times:
+        if self._disabled or self._figure is None or not len(self._history):
             return False
         moment = now if now is not None else time.monotonic()
         if moment - self._last_redraw < self.redraw_interval_s:
@@ -176,59 +426,184 @@ class LivePlot:
             return False
         return True
 
+    # -- drawing ----------------------------------------------------------
+
     def _redraw(self) -> None:
-        times = list(self._times)
-        pressure_axis, flow_axis, permeability_axis = self._axes
-        for axis in self._axes:
+        times, channels, steady = self._history.view(self.window_s)
+        if not times:
+            return
+        spans = _steady_spans(times, steady)
+
+        for panel, axis in zip(self._panels, self._axes):
             axis.clear()
             axis.grid(True, alpha=0.3)
+            axis.set_ylabel(panel.ylabel, fontsize="small")
+            for trace in panel.traces:
+                axis.plot(
+                    times,
+                    channels[trace.channel],
+                    color=trace.color,
+                    linewidth=trace.linewidth,
+                    alpha=trace.alpha,
+                    label=trace.label,
+                )
+            # The trace's own y-range, captured before the criterion lines get
+            # a vote on the autoscale.
+            data_limits = axis.get_ylim()
+            # Shade the stretch the detector has confirmed steady -- the part
+            # of the run that will actually be reported.
+            for start, end in spans:
+                axis.axvspan(start, end, color=_STEADY_COLOR, alpha=0.12, zorder=0)
+            if self.config.run.plot.show_criteria:
+                self._draw_criteria(panel, axis, data_limits)
+            if len(panel.traces) > 1:
+                axis.legend(loc="best", fontsize="x-small", framealpha=0.6)
 
-        run = self.config.run
-        pressure_axis.plot(times, list(self._inlet), label="inlet (P1)")
-        pressure_axis.plot(times, list(self._outlet), label="outlet (P2)")
-        pressure_axis.set_ylabel(f"pressure ({run.display_pressure_unit})")
-        pressure_axis.legend(loc="upper left", fontsize="small")
-
-        flow_axis.plot(times, list(self._flow), color="tab:green")
-        flow_axis.set_ylabel(f"flow ({run.display_flow_unit})")
-
-        permeability_axis.plot(times, list(self._permeability), color="tab:red")
-        permeability_axis.set_ylabel(f"k ({run.display_permeability_unit})")
-        permeability_axis.set_xlabel("elapsed (s)")
-
-        # Shade the stretch the detector has confirmed steady -- the part of
-        # the run that will actually be reported.
-        for start, end in self._steady_spans(times):
-            for axis in self._axes:
-                axis.axvspan(start, end, color="tab:green", alpha=0.12, zorder=0)
-        if any(self._steady):
-            permeability_axis.legend(
-                handles=[
-                    self._plt.Line2D(
-                        [], [], color="tab:green", alpha=0.35, linewidth=8,
-                        label="steady state (reported)",
-                    )
-                ],
-                loc="lower right",
-                fontsize="small",
-            )
-
+        self._axes[-1].set_xlabel("elapsed (s)")
+        self._axes[-1].set_xlim(*self._xlim(times))
+        self._figure.suptitle(self._title(), fontsize="medium")
         self._figure.canvas.draw_idle()
         self._figure.canvas.flush_events()
 
-    def _steady_spans(self, times: list[float]) -> list[tuple[float, float]]:
-        """Contiguous ``(start, end)`` stretches flagged steady."""
-        spans: list[tuple[float, float]] = []
-        start: float | None = None
-        for moment, steady in zip(times, self._steady):
-            if steady and start is None:
-                start = moment
-            elif not steady and start is not None:
-                spans.append((start, moment))
-                start = None
-        if start is not None and times:
-            spans.append((start, times[-1]))
-        return spans
+    def _xlim(self, times: Sequence[float]) -> tuple[float, float]:
+        """From t0, or the trailing window -- never reaching before the run.
+
+        A window wider than the run so far is clamped at t0 rather than drawing
+        empty axis at negative elapsed time, so the view grows into its window
+        and then scrolls.
+        """
+        end = max(times[-1], 1e-6)
+        if self.window_s is None:
+            return 0.0, end
+        return max(0.0, end - self.window_s), end
+
+    def _draw_criteria(
+        self, panel: _Panel, axis: Any, data_limits: tuple[float, float]
+    ) -> None:
+        """Draw what the detector is testing this signal against.
+
+        The mean of the trailing window, the scatter tolerance either side of
+        it, and the fitted drift line over the window the slope was measured
+        on. A signal creeping out of its band is the thing worth catching by
+        eye, minutes before the console says anything.
+
+        A panel the detector does not watch says so, rather than silently
+        looking like one whose criteria have not arrived yet.
+        """
+        status = self._status
+        criteria = self.config.run.steady_state
+        # Unwatched either because the quantity has no criteria at all (the
+        # outlet) or because this run's `signals` list leaves it out.
+        if panel.signal is None or panel.signal not in criteria.signals:
+            _corner_note(axis, "not a steady-state signal", "0.45")
+            return
+        if status is None:
+            return
+        report = next((s for s in status.signals if s.name == panel.signal), None)
+        if report is None or not report.sample_count or not math.isfinite(report.mean):
+            return
+
+        color = _STEADY_COLOR if report.passed else "tab:orange"
+        mean = panel.to_display(report.mean)
+        axis.axhline(mean, color=color, linewidth=1.0, alpha=0.8, zorder=1)
+
+        tolerance = criteria.relative_stddev_tolerance
+        band = [panel.to_display(report.mean * (1.0 + s * tolerance)) for s in (-1.0, 1.0)]
+        for bound in band:
+            axis.axhline(
+                bound, color=color, linewidth=0.9, linestyle="--", alpha=0.7, zorder=1
+            )
+        limits, clipped = _limits_with_band(data_limits, min(band), max(band))
+        axis.set_ylim(*limits)
+
+        # The OLS line the drift criterion is computed from, over the window it
+        # was fitted on. It passes through the window mean at the midpoint.
+        window_end = status.elapsed_s
+        window_start = window_end - criteria.window_s
+        midpoint = (window_start + window_end) / 2.0
+        axis.plot(
+            [window_start, window_end],
+            [
+                panel.to_display(report.mean + report.slope_per_s * (window_start - midpoint)),
+                panel.to_display(report.mean + report.slope_per_s * (window_end - midpoint)),
+            ],
+            color=color, linewidth=1.2, linestyle=":", alpha=0.9, zorder=2,
+        )
+
+        note = (
+            f"scatter {_percent(report.relative_stddev)}/{tolerance:.1%}   "
+            f"drift {_percent(report.relative_drift)}/{criteria.relative_drift_tolerance:.1%}"
+        )
+        if clipped:
+            # The band is off-scale by design; say so, so its absence reads as
+            # "comfortably inside tolerance" rather than "not drawn yet".
+            note += "   (band off-scale)"
+        _corner_note(axis, note, color)
+
+    def _title(self) -> str:
+        span = "from t0" if self.window_s is None else f"last {self.window_s:g} s"
+        head = f"{self.config.sample.id}   {self.config.gas.name}   [{span}]"
+        if self._status is None:
+            return head
+        # status.summary already carries the "(n/m)" progress, so it is not
+        # repeated here.
+        return f"{head}\n{self._status.summary}"
+
+
+def _corner_note(axis: Any, text: str, color: str) -> None:
+    """Bottom-right annotation, legible over whatever the trace is doing."""
+    axis.text(
+        0.995, 0.04, text,
+        transform=axis.transAxes, ha="right", va="bottom",
+        fontsize="x-small", color=color,
+        bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "none", "pad": 1.5},
+    )
+
+
+def _limits_with_band(
+    data_limits: tuple[float, float], band_low: float, band_high: float
+) -> tuple[tuple[float, float], bool]:
+    """Fit the criterion band into a panel, unless it would flatten the trace.
+
+    Including the band gives the reading context -- how much headroom is left
+    before the signal fails, which is what you want early in a run when the
+    signal is still outside it. But once settled the band is often tens of
+    times wider than the signal, and letting it drive the y-axis would compress
+    the trace into a flat line and hide the drift that matters most.
+
+    Returns the limits and whether the band was left off-scale, so the caller
+    can say so rather than leaving the operator to wonder where it went.
+    """
+    low, high = data_limits
+    data_span = high - low
+    merged = (min(low, band_low), max(high, band_high))
+    if data_span <= 0.0:
+        return merged, False
+    if (merged[1] - merged[0]) / data_span > _MAX_BAND_ZOOM:
+        return data_limits, True
+    return merged, False
+
+
+def _percent(value: float) -> str:
+    """Format a ratio that the detector may legitimately report as infinite."""
+    return "--" if not math.isfinite(value) else f"{value:.2%}"
+
+
+def _steady_spans(
+    times: Sequence[float], steady: Sequence[bool]
+) -> list[tuple[float, float]]:
+    """Contiguous ``(start, end)`` stretches flagged steady."""
+    spans: list[tuple[float, float]] = []
+    start: float | None = None
+    for moment, is_steady in zip(times, steady):
+        if is_steady and start is None:
+            start = moment
+        elif not is_steady and start is not None:
+            spans.append((start, moment))
+            start = None
+    if start is not None and times:
+        spans.append((start, times[-1]))
+    return spans
 
 
 def plot_klinkenberg(

@@ -101,6 +101,18 @@ display_pressure_unit: kPa                    # console/plot only
 display_permeability_unit: mD                 # mD | D | uD | um2 | m2
 display_flow_unit: sccm
 
+# The optional live window, only opened by 'collect --plot'. Each listed
+# quantity gets its own panel, stacked in this order, and the panels the
+# detector watches carry its criteria: the window mean, the scatter
+# tolerance band, and the fitted drift line. Display only -- nothing here
+# changes a reading or a reported result.
+plot:
+  panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability] # one stacked panel each, top to bottom
+  window_s: null                              # trailing seconds to show; null = whole run from t0
+  show_criteria: true                         # draw the steady-state bands and drift line
+  redraw_interval_s: 0.5
+  max_points: 3600                            # per series; the from-t0 view decimates to fit
+
 # Stop conditions.
 duration_s: null                              # null = run until Ctrl+C
 max_samples: null

@@ -834,6 +834,44 @@ class TestCollectFooter:
             assert banned not in text, f"footer should not coach the operator: {banned!r}"
 
 
+class TestLivePlotFlags:
+    """The plot flags are rejected before any hardware is opened.
+
+    Each of these fails on the flags alone, so none of them needs a DAQ -- the
+    point being that a mistyped plot option cannot cost an operator a run that
+    has already started.
+    """
+
+    def _collect(self, tmp_path, *flags):
+        init_config(tmp_path)
+        sample = add_sample(tmp_path / "samples", "core-041")
+        return runner.invoke(
+            app, ["collect", "-c", str(tmp_path), "--sample", str(sample), *flags]
+        )
+
+    def test_a_window_and_from_start_together_are_refused(self, tmp_path):
+        result = self._collect(tmp_path, "--plot-window", "60", "--plot-from-start")
+        assert result.exit_code == 1
+        assert "opposite views" in result.output
+
+    def test_an_unknown_panel_name_is_refused_and_lists_the_real_ones(self, tmp_path):
+        result = self._collect(tmp_path, "--plot-panels", "flow,viscosity")
+        assert result.exit_code == 1
+        assert "viscosity" in result.output
+        assert "inlet_pressure" in result.output
+
+    def test_a_repeated_panel_is_refused(self, tmp_path):
+        result = self._collect(tmp_path, "--plot-panels", "flow,flow")
+        assert result.exit_code == 1
+        assert "repeats flow" in result.output
+
+    def test_the_flags_are_documented_in_help(self):
+        result = runner.invoke(app, ["collect", "--help"])
+        assert result.exit_code == 0
+        for flag in ("--plot", "--plot-window", "--plot-from-start", "--plot-panels"):
+            assert flag in result.output
+
+
 class TestVersion:
     def test_version_prints_and_exits(self):
         result = runner.invoke(app, ["--version"])

@@ -246,6 +246,66 @@ If the rig leaves steady state the clock restarts: a hold that was interrupted
 did not last. Pair it with `steady_state.max_wait_s` so a rig that never settles
 gives up instead of running forever.
 
+### Watching it live
+
+`--plot` opens a window alongside the console output. Every quantity gets its
+**own** panel, stacked and sharing a time axis — pressures are not overlaid,
+because the point is watching one signal settle at a time.
+
+```bash
+gasperm collect --sample samples/core-041.yaml --plot
+gasperm collect --sample samples/core-041.yaml --plot-window 120   # trailing 2 min
+gasperm collect --sample samples/core-041.yaml --plot-from-start   # whole run
+gasperm collect --sample samples/core-041.yaml --plot-panels inlet_pressure,flow,permeability
+```
+
+The last three imply `--plot`. Defaults live in `run.yaml` and the flags
+override them for one run:
+
+```yaml
+plot:
+  panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability]
+  window_s: null          # null = whole run from t0; a number = trailing window
+  show_criteria: true     # the steady-state bands and the fitted drift line
+  redraw_interval_s: 0.5
+  max_points: 3600        # per series; the from-t0 view decimates to fit
+```
+
+**The two views answer different questions.** A trailing window is what you want
+while waiting for a plateau — it fills the axis with the last few minutes so
+small movements are visible. From t0 is what you want to judge how far the rig
+has come since pressure was applied, which on tight rock is the question that
+matters. Neither loses data: the from-t0 view decimates to `max_points` with a
+stride that doubles as the run grows, so a multi-hour run still spans the whole
+axis at fixed memory rather than silently starting late.
+
+**Each monitored panel carries the detector's own criteria**, so a signal
+creeping out of tolerance is visible long before the console says anything:
+
+- a solid line at the trailing window's mean;
+- dashed lines at `mean × (1 ± relative_stddev_tolerance)` — the scatter bound;
+- a dotted segment showing the OLS line the drift criterion is computed from,
+  over exactly the window it was fitted on;
+- the current scatter and drift against their tolerances, in the corner.
+
+Green means that signal is passing, amber that it is not. Once a run settles the
+band is often tens of times wider than the signal, and letting it set the y-axis
+would flatten the trace into a line and hide the drift — so it is left off-scale
+and the corner note says `(band off-scale)`. The numbers are always shown.
+
+Panels the detector does not watch say **"not a steady-state signal"** rather
+than just having no lines: the outlet transducer is never a criterion, and
+`steady_state.signals` leaves temperature out by default. The permeability panel
+draws both the instantaneous value (faint — what the detector tests) and the
+rolling mean (bold — what the console reports). The confirmed steady stretch is
+shaded green on every panel: that is the part of the run that will be reported.
+
+Plotting never blocks acquisition. Samples go into a bounded buffer with an O(1)
+append, and the figure redraws on a timer rather than once per sample. If the
+window is closed mid-run, or no display is available, the plot disables itself
+and the run carries on — the console output and the CSV are the primary record,
+and `--plot` only adds a view on top.
+
 ## Uncertainty (ISO/IEC Guide 98-3, the GUM)
 
 The measurand is
