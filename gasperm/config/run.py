@@ -23,10 +23,18 @@ __all__ = [
     "GasConfig",
     "SteadyStateConfig",
     "UncertaintyReportConfig",
+    "PulseDecayConfig",
     "LivePlotConfig",
     "PLOT_PANELS",
+    "MEASUREMENT_METHODS",
     "RunConfig",
 ]
+
+#: The two measurement methods. ``steady_state`` drives gas through the plug at
+#: a fixed differential and measures the flow; ``pulse_decay`` watches a small
+#: differential decay between two closed vessels and measures no flow at all,
+#: which is what makes it usable below about ten microdarcy.
+MEASUREMENT_METHODS: tuple[str, ...] = ("steady_state", "pulse_decay")
 
 #: Every quantity the live plot can give a panel to, in their natural order.
 #: Each gets its **own** stacked axes -- pressures are not overlaid, because
@@ -34,6 +42,8 @@ __all__ = [
 PLOT_PANELS: tuple[str, ...] = (
     "inlet_pressure",
     "outlet_pressure",
+    "delta_pressure",
+    "decay_fraction",
     "flow",
     "temperature",
     "permeability",
@@ -42,10 +52,21 @@ PLOT_PANELS: tuple[str, ...] = (
 PlotPanel = Literal[
     "inlet_pressure",
     "outlet_pressure",
+    "delta_pressure",
+    "decay_fraction",
     "flow",
     "temperature",
     "permeability",
 ]
+
+#: Panels that only make sense for one method. The live plot filters by
+#: ``run.method`` so a default panel list works for both without asking the
+#: operator to curate it per run.
+METHOD_ONLY_PANELS: dict[str, str] = {
+    "flow": "steady_state",
+    "delta_pressure": "pulse_decay",
+    "decay_fraction": "pulse_decay",
+}
 
 
 class GasConfig(_Base):
@@ -63,6 +84,10 @@ class GasConfig(_Base):
     #: typically quoted at a few tenths of a percent to ~1%; 0.01 is a safe
     #: default. Enters the GUM budget as a Type B component.
     viscosity_relative_uncertainty: float = Field(default=0.01, ge=0.0)
+    #: The same for the isothermal compressibility, which only pulse-decay runs
+    #: consume. Its own field because an EOS pressure-derivative is not as well
+    #: determined as the viscosity correlation.
+    compressibility_relative_uncertainty: float = Field(default=0.01, ge=0.0)
     #: Divide the reference-state flow by Z when pairing ``Q_ref * P_ref``.
     #: The pairing is exact for an ideal gas; at a few atm and ambient
     #: temperature Z differs from 1 by well under a percent for N2, but for
@@ -162,6 +187,130 @@ class UncertaintyReportConfig(_Base):
     max_component_contribution: float | None = Field(default=0.25, gt=0.0)
 
 
+class PulseDecayConfig(_Base):
+    """When a pulse-decay run is finished, and which part of it is the answer.
+
+    There is no ``enabled`` flag here: the mode switch is :attr:`RunConfig.method`.
+
+    The defaults are set by what the fit actually buys. Simulating the decay of
+    a 1 uD plug on this rig's vessels, the precision of alpha against how far
+    the decay was allowed to run:
+
+    =================  ==========  ========
+    stop at dP/dP0     run length  u(alpha)
+    =================  ==========  ========
+    0.9                1.5 h       7.4 %
+    0.7                5.0 h       2.1 %
+    0.5                9.7 h       0.9 %
+    0.3                16.8 h      0.5 %
+    0.05               41.8 h      0.7 %
+    =================  ==========  ========
+
+    Past about half a decade the samples are noise-dominated, so they add
+    scatter rather than information -- running to the textbook 5 % costs four
+    times the time and is slightly *worse*. Hence a fit window of 0.90 to 0.50
+    and a stop at 0.40, not 0.05.
+    """
+
+    # -- the pulse --------------------------------------------------------
+    #: Smallest differential that counts as a pulse having been applied. Below
+    #: this the monitor is still waiting, so transducer noise cannot be
+    #: mistaken for the operator opening the valve.
+    min_pulse_pressure: float = Field(default=20.0, gt=0.0)
+    pulse_pressure_unit: PressureUnit = "kPa"
+    #: Largest ``dP0/P_mean`` the small-pulse linearisation tolerates. Above
+    #: this the compressibility and viscosity are not constant across the decay
+    #: and a single exponential no longer describes it.
+    max_pulse_fraction: float = Field(default=0.10, gt=0.0, le=1.0)
+    #: End the run when ``dP/dP0`` falls below this -- the analogue of
+    #: ``run.stop_after_steady_s``. Deliberately below ``fit_end_fraction``, so
+    #: there is data past the fit window to pin the fitted offset.
+    stop_below_fraction: float = Field(default=0.40, gt=0.0, lt=1.0)
+    #: Give up after this long rather than running forever, the counterpart of
+    #: ``steady_state.max_wait_s``. ``null`` waits indefinitely.
+    max_decay_s: float | None = Field(default=None, gt=0.0)
+
+    # -- the fit ----------------------------------------------------------
+    #: Fit between these fractions of the pulse. The top is skipped because of
+    #: the valve transient AND because the single exponential is asymptotic --
+    #: higher decay modes are still dying, and including them biases alpha high.
+    fit_start_fraction: float = Field(default=0.90, gt=0.0, le=1.0)
+    fit_end_fraction: float = Field(default=0.50, gt=0.0, lt=1.0)
+    #: Bin the decay to this cadence before fitting. Consecutive DAQ samples are
+    #: not independent -- thermal drift and 1/f noise -- so an unbinned fit
+    #: reports an optimistic u(alpha) and an absurd effective dof. ``null``
+    #: fits every sample.
+    fit_bin_s: float | None = Field(default=1.0, gt=0.0)
+    #: Fit the constant offset. Two independent transducers have a zero
+    #: mismatch that a log-linear fit turns into a low alpha; leave this on.
+    fit_offset: bool = True
+    min_fit_samples: int = Field(default=20, ge=5)
+    #: Below this R^2 the decay is not a single exponential and the run is
+    #: reported as unconfirmed.
+    min_r_squared: float = Field(default=0.98, gt=0.0, le=1.0)
+    #: Warn above this lag-1 residual autocorrelation after binning: it means
+    #: the residuals still have structure and u(alpha) is understated.
+    max_residual_autocorrelation: float = Field(default=0.5, gt=0.0, lt=1.0)
+
+    # -- the model --------------------------------------------------------
+    #: ``auto`` applies the Dicker-Smits storage correction when the sample's
+    #: porosity is recorded and falls back to Brace with a warning when it is
+    #: not. ``brace`` and ``dicker_smits`` force one.
+    storage_correction: Literal["auto", "brace", "dicker_smits"] = "auto"
+    #: Warn when the pore volume exceeds this fraction of either vessel while
+    #: the zero-storage form is in use.
+    max_storage_ratio: float = Field(default=0.05, gt=0.0)
+
+    # -- planning ---------------------------------------------------------
+    #: Roughly expected permeability, used ONLY to predict the run's duration at
+    #: startup. Never enters a result.
+    expected_permeability: float | None = Field(default=None, gt=0.0)
+    expected_permeability_unit: str = "uD"
+
+    @field_validator("expected_permeability_unit")
+    @classmethod
+    def _check_expected_unit(cls, value: str) -> str:
+        units.darcy_to(1.0, value)
+        return value
+
+    @field_validator("pulse_pressure_unit")
+    @classmethod
+    def _check_pulse_unit(cls, value: str) -> str:
+        return validated_pressure_unit(value)
+
+    @model_validator(mode="after")
+    def _fit_window_is_ordered(self) -> PulseDecayConfig:
+        if self.fit_end_fraction >= self.fit_start_fraction:
+            raise ValueError(
+                f"pulse_decay.fit_end_fraction ({self.fit_end_fraction}) must be "
+                f"below fit_start_fraction ({self.fit_start_fraction}): the decay "
+                "is fitted from the higher fraction down to the lower one."
+            )
+        if self.stop_below_fraction > self.fit_end_fraction:
+            raise ValueError(
+                f"pulse_decay.stop_below_fraction ({self.stop_below_fraction}) is "
+                f"above fit_end_fraction ({self.fit_end_fraction}), so the run "
+                "would end before the fit window closed. Stop at or below the end "
+                "of the window -- ideally a little below, so there is data past it "
+                "to pin the fitted offset."
+            )
+        return self
+
+    @property
+    def min_pulse_pressure_atm(self) -> float:
+        """The pulse threshold in the internal unit."""
+        return units.to_atm(self.min_pulse_pressure, self.pulse_pressure_unit)
+
+    @property
+    def expected_permeability_darcy(self) -> float | None:
+        """The planning permeability in darcy, or ``None`` when unset."""
+        if self.expected_permeability is None:
+            return None
+        return units.darcy_from(
+            self.expected_permeability, self.expected_permeability_unit
+        )
+
+
 class LivePlotConfig(_Base):
     """The optional ``--plot`` window.
 
@@ -215,6 +364,19 @@ class RunConfig(_Base):
     notes: str = ""
 
     # -- test conditions --------------------------------------------------
+    #: How this run measures permeability.
+    #:
+    #: ``steady_state``
+    #:     Drive gas through the plug at a fixed differential and measure the
+    #:     flow: the compressible Darcy equation. Needs a flowmeter that can
+    #:     resolve the flow, which below ~10 uD it generally cannot.
+    #: ``pulse_decay``
+    #:     Apply a small pulse to a closed upstream vessel and watch the
+    #:     differential decay into a closed downstream one. **No flow is
+    #:     measured at all**, which is what makes it usable at a microdarcy.
+    #:     Requires ``downstream_pressure: measured`` and the two vessel
+    #:     volumes in ``hardware.reservoirs``.
+    method: Literal["steady_state", "pulse_decay"] = "steady_state"
     gas: GasConfig = Field(default_factory=GasConfig)
     #: Which meter in ``hardware.flowmeters`` this run uses. ``null`` takes the
     #: rig's ``default_flowmeter``. This lives here, not in hardware.yaml,
@@ -273,6 +435,8 @@ class RunConfig(_Base):
 
     # -- analysis ---------------------------------------------------------
     steady_state: SteadyStateConfig = Field(default_factory=SteadyStateConfig)
+    #: Only consulted when ``method`` is ``pulse_decay``.
+    pulse_decay: PulseDecayConfig = Field(default_factory=PulseDecayConfig)
     uncertainty: UncertaintyReportConfig = Field(default_factory=UncertaintyReportConfig)
     #: Rolling window for the live permeability display. The reported result
     #: comes from the detected steady-state window, not from this.
@@ -349,6 +513,37 @@ class RunConfig(_Base):
             raise ValueError(
                 "run.stop_after_steady_s is set but run.steady_state.enabled is false, "
                 "so steady state would never be detected and the run would never stop"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _pulse_decay_needs_a_closed_downstream(self) -> RunConfig:
+        """A declared P2 and pulse decay contradict each other.
+
+        ``downstream_pressure: <number>`` is the escape hatch for an outlet that
+        **vents** -- it asserts the downstream side is held open at a constant
+        pressure. Pulse decay measures the differential decaying into a
+        **closed** vessel, so under a declared constant P2 the differential
+        would decay to a fixed number rather than to zero, and the fitted rate
+        would describe the assumption rather than the rock.
+        """
+        if self.method == "pulse_decay" and not self.downstream_is_measured:
+            raise ValueError(
+                "run.method is 'pulse_decay' but run.downstream_pressure is the "
+                f"supplied value {self.downstream_pressure} "
+                f"{self.downstream_pressure_unit}. Pulse decay watches P1 - P2 decay "
+                "into a CLOSED downstream vessel; a declared constant P2 asserts the "
+                "outlet is open to something. Set downstream_pressure: measured."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _pulse_decay_has_no_steady_soak(self) -> RunConfig:
+        if self.method == "pulse_decay" and self.stop_after_steady_s is not None:
+            raise ValueError(
+                "run.stop_after_steady_s has no meaning in pulse decay -- there is no "
+                "steady state to soak in. Use pulse_decay.stop_below_fraction to say "
+                "how far the decay should run before the measurement ends."
             )
         return self
 

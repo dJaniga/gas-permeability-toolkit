@@ -304,6 +304,128 @@ class InstrumentUncertaintyConfig(_Base):
     notes: str = ""
 
 
+class PulseTransducerConfig(PressureChannelConfig):
+    """One of the two transducers that read a pulse-decay differential.
+
+    Carries its own analog channel, exactly as :class:`FlowmeterConfig` does,
+    because a pulse pair is usually a *different* instrument on *different*
+    inputs from the steady-state pair -- typically a lower range, so it can
+    resolve a pulse that is a fraction of a percent of a high-range unit's full
+    scale.
+    """
+
+    channel: str = "ai4"
+
+    @field_validator("channel")
+    @classmethod
+    def _bare_pulse_channel(cls, value: str) -> str:
+        channel = value.split("/")[-1].strip()
+        if not channel.startswith("ai"):
+            raise ValueError(
+                f"pulse transducer channel {value!r} should be an analog input "
+                "like 'ai4'"
+            )
+        return channel
+
+
+def _default_pulse_transducers() -> dict[str, PulseTransducerConfig]:
+    """A 0-100 bar pair on ai4/ai5 at 0-10 V, matched to a resolvable pulse."""
+    return {
+        "upstream": PulseTransducerConfig(
+            channel="ai4", volts_max=10.0, value_max=100.0, unit="bar"
+        ),
+        "downstream": PulseTransducerConfig(
+            channel="ai5", volts_max=10.0, value_max=100.0, unit="bar"
+        ),
+    }
+
+
+class PulseTransducersConfig(_Base):
+    """The dedicated pressure pair for pulse decay, if the rig has one.
+
+    Optional. When absent, a pulse-decay run falls back to the inlet/outlet
+    transducers -- which works, but on a high-range pair the pulse can be
+    smaller than the transducer's own uncertainty, so ``collect`` says so at
+    startup rather than letting it look like a measurement.
+    """
+
+    upstream: PulseTransducerConfig = Field(
+        default_factory=lambda: _default_pulse_transducers()["upstream"]
+    )
+    downstream: PulseTransducerConfig = Field(
+        default_factory=lambda: _default_pulse_transducers()["downstream"]
+    )
+    #: Correlation between the two transducers' errors. Note that a gain or
+    #: zero error common to both **cancels out of the decay rate entirely** --
+    #: alpha is a rate, so scaling dP does not change it and the fitted offset
+    #: absorbs a constant. This term therefore matters far less here than the
+    #: P1/P2 correlation does for steady-state Darcy.
+    correlation: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+
+class ReservoirConfig(_Base):
+    """One pulse-decay vessel: its **dead volume** and how well that is known.
+
+    Dead volume, not nameplate volume: the vessel plus every cm^3 of tubing,
+    transducer port and valve internal volume up to the plug face. "The vessel
+    is 400 mL" is wrong by the tubing, and since permeability is directly
+    proportional to this number, that error goes straight into the result. It
+    is the largest systematic in the method.
+    """
+
+    volume: float = Field(default=100.0, gt=0.0)
+    unit: str = "cm3"
+    #: How the volume was determined -- gas expansion against a reference
+    #: vessel, water fill, CAD. Provenance, like ``calibrated_by``.
+    method: str = ""
+    uncertainty: UncertaintySpec = Field(
+        default_factory=lambda: UncertaintySpec(
+            kind="percent_reading", value=1.0, source="vessel calibration"
+        )
+    )
+
+    @field_validator("unit")
+    @classmethod
+    def _check_volume_unit(cls, value: str) -> str:
+        units.volume_to_cm3(1.0, value)  # raises ValueError on an unknown unit
+        return value
+
+    @property
+    def volume_cm3(self) -> float:
+        """The dead volume in the internal unit."""
+        return units.volume_to_cm3(self.volume, self.unit)
+
+
+class ReservoirsConfig(_Base):
+    """The two closed vessels either side of the plug, for pulse decay.
+
+    Only read when ``run.method`` is ``pulse_decay``.
+    """
+
+    upstream: ReservoirConfig = Field(
+        default_factory=lambda: ReservoirConfig(volume=400.0)
+    )
+    downstream: ReservoirConfig = Field(
+        default_factory=lambda: ReservoirConfig(volume=75.0)
+    )
+    #: Correlation between the two volume errors -- two vessels calibrated the
+    #: same way against the same reference share a systematic. Unlike the P1/P2
+    #: case, **both** volume sensitivities are positive, so a positive
+    #: correlation *increases* the combined uncertainty, by up to sqrt(2).
+    correlation: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+    @property
+    def effective_volume_cm3(self) -> float:
+        """``V1 V2 / (V1 + V2)`` -- what actually sets the decay rate.
+
+        The harmonic combination is dominated by the *smaller* vessel, which is
+        why enlarging only the big one barely changes the run time.
+        """
+        v1 = self.upstream.volume_cm3
+        v2 = self.downstream.volume_cm3
+        return v1 * v2 / (v1 + v2)
+
+
 class HardwareConfig(_Base):
     """Everything about the physical rig.
 
@@ -323,6 +445,12 @@ class HardwareConfig(_Base):
     #: Meter used when ``run.flowmeter`` is unset. May be ``null`` when exactly
     #: one meter is defined.
     default_flowmeter: str | None = "low_range"
+    #: The two closed vessels for pulse decay, and the dedicated transducer pair
+    #: that reads the differential. Both are only consulted when a run selects
+    #: ``method: pulse_decay``; leave ``pulse_transducers`` null to reuse the
+    #: inlet/outlet pair.
+    reservoirs: ReservoirsConfig = Field(default_factory=ReservoirsConfig)
+    pulse_transducers: PulseTransducersConfig | None = None
     temperature: TemperatureConfig = Field(default_factory=TemperatureConfig)
     uncertainty: InstrumentUncertaintyConfig = Field(
         default_factory=InstrumentUncertaintyConfig
@@ -333,16 +461,31 @@ class HardwareConfig(_Base):
 
     @model_validator(mode="after")
     def _channels_do_not_collide(self) -> HardwareConfig:
-        if not self.flowmeters:
-            raise ValueError(
-                "hardware.flowmeters is empty; define at least one meter, e.g.\n"
-                "  flowmeters:\n    low_range:\n      channel: ai2\n      flow_max: 500.0"
-            )
-
+        # An empty `flowmeters` is legitimate on a pulse-decay-only rig, which
+        # reads no flowmeter at all. Whether one is *required* depends on
+        # run.method, which this model cannot see, so that check lives in
+        # GaspermConfig where both files are in scope.
         pressure_channels = {
             self.daq.inlet_pressure_channel,
             self.daq.outlet_pressure_channel,
         }
+        if self.pulse_transducers is not None:
+            pulse = self.pulse_transducers
+            if pulse.upstream.channel == pulse.downstream.channel:
+                raise ValueError(
+                    "pulse_transducers.upstream and .downstream are both on "
+                    f"{pulse.upstream.channel!r}; the differential needs two inputs"
+                )
+            for side in ("upstream", "downstream"):
+                channel = getattr(pulse, side).channel
+                if channel in pressure_channels:
+                    raise ValueError(
+                        f"pulse_transducers.{side}.channel {channel!r} is already "
+                        "assigned to a steady-state pressure transducer; the pulse "
+                        "pair needs its own analog inputs"
+                    )
+            pressure_channels |= {pulse.upstream.channel, pulse.downstream.channel}
+
         seen: dict[str, str] = {}
         for name, meter in self.flowmeters.items():
             if not name.strip():

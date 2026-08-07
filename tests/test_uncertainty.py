@@ -374,6 +374,107 @@ class TestBudget:
         assert budget.dominant_components(1)[0].symbol == "d"
 
 
+class TestBudgetSnapshot:
+    """Pin the whole budget, digit for digit, across a refactor.
+
+    The combination arithmetic -- quadrature, the covariance term, the
+    Welch-Satterthwaite effective dof and its clamp, the coverage factor -- was
+    lifted out of ``build_budget`` into :func:`combine_budget` so the
+    pulse-decay builder could share it. That is exactly the kind of move that
+    silently changes a number, so these two cases were recorded before the
+    extraction and assert the same values after it. They are deliberately
+    over-specified: any change here is either a bug or a decision worth making
+    explicitly.
+    """
+
+    #: Uncorrelated transducers, shipped defaults, the ~1-3 atm `point()`.
+    #: symbol -> (u(x)/x, relative sensitivity).
+    EXPECTED = {
+        "Q": (0.0144348537, 1.0),
+        "P1": (0.00475254692, -2.25),
+        "P2": (0.0142464143, 0.25),
+        "mu": (0.01, 1.0),
+        "L": (0.002, 1.0),
+        "d": (0.00393700787, -2.0),
+    }
+
+    def test_every_component_is_unchanged(self):
+        config = config_with()
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        actual = {c.symbol: c for c in budget.components}
+        assert set(actual) == set(self.EXPECTED)
+        for symbol, (u_rel, sensitivity) in self.EXPECTED.items():
+            component = actual[symbol]
+            assert component.relative_standard_uncertainty == pytest.approx(
+                u_rel, rel=1e-8
+            ), symbol
+            assert component.relative_sensitivity == pytest.approx(
+                sensitivity, rel=1e-8
+            ), symbol
+
+    def test_the_combined_result_is_unchanged(self):
+        config = config_with()
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        assert budget.relative_combined_standard_uncertainty == pytest.approx(
+            0.0223918584, rel=1e-8
+        )
+        assert budget.effective_degrees_of_freedom == math.inf
+        assert budget.coverage_factor == pytest.approx(1.95996398, rel=1e-8)
+        assert budget.expanded_uncertainty_darcy == pytest.approx(
+            0.00021943618, rel=1e-8
+        )
+        assert budget.correlation_relative_variance == 0.0
+
+    def test_the_correlated_case_is_unchanged(self):
+        """Exercises the covariance branch and the note it appends."""
+        config = config_with()
+        config.hardware.pressure_calibration.correlation = 0.9
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        assert budget.correlation_relative_variance == pytest.approx(
+            -6.85530866e-05, rel=1e-8
+        )
+        assert budget.relative_combined_standard_uncertainty == pytest.approx(
+            0.0208048609, rel=1e-8
+        )
+        assert sum("covariance term" in n for n in budget.notes) == 1
+
+    def test_a_finite_dof_still_produces_the_same_effective_dof(self):
+        """The Welch-Satterthwaite path, not the infinite-dof shortcut."""
+        config = config_with()
+        config.hardware.temperature.uncertainty = UncertaintySpec(
+            kind="absolute", value=0.5, degrees_of_freedom=4
+        )
+        config.flowmeter.uncertainty = UncertaintySpec(
+            kind="percent_reading", value=1.0, degrees_of_freedom=9
+        )
+        budget = build_budget(point(), geometry(), config.hardware, config.run)
+        assert budget.effective_degrees_of_freedom == pytest.approx(860.901311, rel=1e-8)
+        assert budget.coverage_factor == pytest.approx(1.96272336, rel=1e-8)
+
+    def test_the_type_a_and_temperature_branches_are_unchanged(self):
+        """The two optional components, which the default case does not add."""
+        config = config_with()
+        budget = build_budget(
+            point(),
+            geometry(),
+            config.hardware,
+            config.run,
+            type_a_relative=0.004,
+            type_a_dof=29.0,
+            viscosity_temperature_exponent=0.72,
+        )
+        by_symbol = {c.symbol: c for c in budget.components}
+        assert by_symbol["T"].relative_sensitivity == pytest.approx(0.72)
+        assert by_symbol["s/sqrt(n)"].evaluation_type == "A"
+        assert by_symbol["s/sqrt(n)"].degrees_of_freedom == 29.0
+        assert budget.relative_combined_standard_uncertainty == pytest.approx(
+            0.0227572237, rel=1e-8
+        )
+        assert budget.effective_degrees_of_freedom == pytest.approx(
+            30383.3141, rel=1e-8
+        )
+
+
 class TestCorrelation:
     def test_positive_correlation_reduces_the_combined_uncertainty(self):
         """P1 and P2 enter with opposite signs, so shared error partly cancels."""

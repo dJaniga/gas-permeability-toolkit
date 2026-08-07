@@ -225,28 +225,51 @@ class NiDaqAnalogInput:
 
 
 def build_channel_specs(config) -> list[ChannelSpec]:
-    """Channel specs for a config: the two pressure inputs plus the one flowmeter.
+    """The analog inputs this run actually reads, each with its own volt range.
 
-    The unused flowmeter input (``ai3`` when ``ai2`` is configured, or vice
-    versa) is deliberately absent -- flowmeter selection is a config-time
-    decision and ``collect`` never touches the other analog input.
+    **Steady state** opens three: the two pressure transducers and the one
+    selected flowmeter. The unused flowmeter input (``ai3`` when ``ai2`` is
+    configured, or vice versa) is deliberately absent -- meter selection is a
+    config-time decision and ``collect`` never touches the other input.
+
+    **Pulse decay** opens two, and no flow channel at all: the method measures
+    no flow, which is the whole reason it works below a microdarcy. When the rig
+    has a dedicated ``pulse_transducers`` pair those are used, typically a
+    lower-range pair on their own inputs; otherwise it falls back to the
+    steady-state inlet/outlet channels.
 
     Args:
         config: A :class:`gasperm.config.GaspermConfig`.
     """
-    calibration = config.pressure_calibration
     specs = []
-    for role, channel, channel_config in (
-        ("inlet pressure", config.daq.inlet_pressure_channel, calibration.inlet),
-        ("outlet pressure", config.daq.outlet_pressure_channel, calibration.outlet),
-    ):
+    for role, channel, channel_config in _pressure_channels(config):
         low, high = sorted((channel_config.volts_min, channel_config.volts_max))
         specs.append(ChannelSpec(channel, low, high, role=role))
 
-    flow = config.flowmeter
-    low, high = sorted((flow.volts_min, flow.volts_max))
-    specs.append(ChannelSpec(flow.channel, low, high, role="flow"))
+    if config.run.method != "pulse_decay":
+        flow = config.flowmeter
+        low, high = sorted((flow.volts_min, flow.volts_max))
+        specs.append(ChannelSpec(flow.channel, low, high, role="flow"))
     return specs
+
+
+def _pressure_channels(config):
+    """``(role, channel, calibration)`` for the pressure pair this run reads.
+
+    Shared by the DAQ task builder and the acquisition processors, so the two
+    can never disagree about which transducer a voltage came from.
+    """
+    pulse = config.hardware.pulse_transducers
+    if config.run.method == "pulse_decay" and pulse is not None:
+        return (
+            ("upstream pressure", pulse.upstream.channel, pulse.upstream),
+            ("downstream pressure", pulse.downstream.channel, pulse.downstream),
+        )
+    calibration = config.pressure_calibration
+    return (
+        ("inlet pressure", config.daq.inlet_pressure_channel, calibration.inlet),
+        ("outlet pressure", config.daq.outlet_pressure_channel, calibration.outlet),
+    )
 
 
 def open_analog_input(config) -> NiDaqAnalogInput:

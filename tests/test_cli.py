@@ -7,6 +7,7 @@ operator drives between runs -- adding plugs and choosing a meter.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,13 @@ from gasperm.config import (
 from gasperm.config.sample import SampleConfig
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Drop colour escapes so assertions see the words, not the styling."""
+    return _ANSI.sub("", text)
 
 
 def init_config(directory, *overrides: str):
@@ -866,10 +874,67 @@ class TestLivePlotFlags:
         assert "repeats flow" in result.output
 
     def test_the_flags_are_documented_in_help(self):
-        result = runner.invoke(app, ["collect", "--help"])
+        # Typer renders help through rich, which both wraps to the terminal
+        # width and interleaves colour escapes *inside* the flag names -- so a
+        # raw substring check silently becomes a test of the window size and
+        # of whether colour happens to be on. Pin the width and strip the
+        # escapes, and the assertion is about the help text again.
+        result = runner.invoke(app, ["collect", "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
+        plain = strip_ansi(result.output)
         for flag in ("--plot", "--plot-window", "--plot-from-start", "--plot-panels"):
-            assert flag in result.output
+            assert flag in plain
+
+
+class TestPulseDecayFlags:
+    """The method switch and its refusals, all before any hardware is opened."""
+
+    def _collect(self, tmp_path, *flags, **overrides):
+        init_config(tmp_path, *overrides.pop("init", ()))
+        sample = add_sample(tmp_path / "samples", "core-041")
+        return runner.invoke(
+            app, ["collect", "-c", str(tmp_path), "--sample", str(sample), *flags]
+        )
+
+    def test_an_unknown_method_is_refused_and_lists_the_real_ones(self, tmp_path):
+        result = self._collect(tmp_path, "--method", "pulse-decay")
+        assert result.exit_code == 1
+        assert "steady_state" in result.output
+        assert "pulse_decay" in result.output
+
+    def test_pulse_decay_with_a_supplied_p2_is_refused(self, tmp_path):
+        result = self._collect(
+            tmp_path, "--downstream-pressure", "101.325", "--method", "pulse_decay"
+        )
+        assert result.exit_code == 1
+        assert "CLOSED downstream vessel" in strip_ansi(result.output)
+
+    def test_the_override_order_lets_a_consistent_pair_through(self, tmp_path):
+        """--downstream-pressure measured then --method must not self-refuse."""
+        result = self._collect(
+            tmp_path,
+            "--downstream-pressure", "measured",
+            "--method", "pulse_decay",
+            "--samples", "1",
+        )
+        # It gets past config entirely and fails on the absent DAQ/serial rig,
+        # which is the point: the refusal was not a config one.
+        assert "CLOSED downstream vessel" not in strip_ansi(result.output)
+
+    def test_the_flags_are_documented_in_help(self):
+        result = runner.invoke(app, ["collect", "--help"], env={"COLUMNS": "200"})
+        plain = strip_ansi(result.output)
+        assert "--method" in plain
+        result = runner.invoke(app, ["klinkenberg", "--help"], env={"COLUMNS": "200"})
+        assert "--allow-mixed-methods" in strip_ansi(result.output)
+
+    def test_a_pulse_run_config_round_trips_through_init(self, tmp_path):
+        init_config(tmp_path, "run.method=pulse_decay")
+        sample = add_sample(tmp_path / "samples", "core-041")
+        config = load_config(tmp_path, sample=sample)
+        assert config.run.method == "pulse_decay"
+        assert config.hardware.reservoirs.upstream.volume_cm3 == pytest.approx(400.0)
+        assert config.hardware.reservoirs.downstream.volume_cm3 == pytest.approx(75.0)
 
 
 class TestVersion:

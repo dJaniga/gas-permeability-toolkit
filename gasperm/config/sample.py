@@ -54,6 +54,11 @@ class SampleConfig(_Base):
 
     # -- petrophysics (informational) -------------------------------------
     porosity_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Standard uncertainty of :attr:`porosity_fraction`, dimensionless. Only
+    #: enters a budget when the pulse-decay storage correction is in use, where
+    #: porosity is an input to the measurement rather than metadata. ``null``
+    #: omits the term with a note saying so.
+    porosity_uncertainty: float | None = Field(default=None, ge=0.0)
     #: How porosity was obtained: helium pycnometry, MICP, image analysis...
     porosity_method: str = ""
     grain_density_g_cm3: float | None = Field(default=None, gt=0.0)

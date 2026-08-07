@@ -10,6 +10,7 @@ else drives the acquisition loop through the ``AnalogInputSource`` /
 from __future__ import annotations
 
 import csv
+import math
 import sys
 import types
 from datetime import datetime
@@ -48,6 +49,78 @@ def quick_steady_config(base_config: GaspermConfig) -> GaspermConfig:
     return base_config
 
 
+@pytest.fixture
+def pulse_config(base_config: GaspermConfig) -> GaspermConfig:
+    """Defaults retuned so a short synthetic decay can be fitted.
+
+    Follows the ``quick_steady_config`` idiom: shrink the windows, never weaken
+    the criteria, so the same real fitter is exercised. The vessels are shrunk
+    too, which is what makes a synthetic decay finish in a test rather than in
+    the fourteen hours the shipped 400/75 cm3 pair would take at a microdarcy.
+    """
+    base_config.run.method = "pulse_decay"
+    base_config.hardware.daq.sample_rate_hz = 1000.0
+    base_config.hardware.reservoirs.upstream.volume = 8.0
+    base_config.hardware.reservoirs.downstream.volume = 8.0
+    base_config.sample.porosity_fraction = 0.10
+    base_config.run.pulse_decay.fit_bin_s = None
+    base_config.run.pulse_decay.min_fit_samples = 10
+    return base_config
+
+
+def decay_voltages(
+    config: GaspermConfig,
+    *,
+    decay_rate_per_s: float,
+    mean_pressure_atm: float = 10.0,
+    pulse_atm: float = 0.5,
+    offset_atm: float = 0.0,
+    pulse_at_s: float = 1.0,
+    duration_s: float = 30.0,
+    step_s: float = 0.1,
+) -> list[dict[str, float]]:
+    """A scripted decay as raw volts, through the configured calibration.
+
+    Inverts the real ``PressureChannelConfig`` rather than fabricating volts, so
+    a test that replays these drives the same calibration path a rig would --
+    otherwise it would be asserting that a number survives being multiplied by
+    one.
+    """
+    from gasperm import units
+    from gasperm.hardware.daq import _pressure_channels
+
+    (_, up_channel, up_config), (_, down_channel, down_config) = _pressure_channels(
+        config
+    )
+    frames: list[dict[str, float]] = []
+    steps = max(int(duration_s / step_s), 1)
+    for index in range(steps):
+        elapsed = index * step_s
+        delta = (
+            offset_atm
+            if elapsed < pulse_at_s
+            else pulse_atm * math.exp(-decay_rate_per_s * (elapsed - pulse_at_s))
+            + offset_atm
+        )
+        frames.append(
+            {
+                up_channel: up_config.invert(
+                    units.from_atm(mean_pressure_atm + delta / 2.0, up_config.unit)
+                ),
+                down_channel: down_config.invert(
+                    units.from_atm(mean_pressure_atm - delta / 2.0, down_config.unit)
+                ),
+            }
+        )
+    return frames
+
+
+@pytest.fixture
+def pulse_voltages():
+    """Factory for :func:`decay_voltages`."""
+    return decay_voltages
+
+
 def write_fake_run(
     runs_dir,
     sample_id: str,
@@ -61,6 +134,8 @@ def write_fake_run(
     flowmeter: str = "low_range",
     downstream_pressure: float | str = "measured",
     mean_flow_cm3_s: float | None = None,
+    method: str = "steady_state",
+    pulse_decay: dict | None = None,
 ) -> Path:
     """Write a run directory without driving the acquisition loop.
 
@@ -111,6 +186,7 @@ def write_fake_run(
             "config": {
                 "sample": {"id": sample_id},
                 "run": {
+                    "method": method,
                     "downstream_pressure": downstream_pressure,
                     "downstream_pressure_unit": "kPa",
                 },
@@ -119,7 +195,9 @@ def write_fake_run(
         if steady:
             payload["summary"] = {
                 "sample_id": sample_id,
-                "steady_state_reached": True,
+                "method": method,
+                "steady_state_reached": method == "steady_state",
+                "measurement_confirmed": True,
                 "mean_pressure_atm": mean_pressure_atm,
                 "permeability_darcy": permeability_darcy,
                 "uncertainty": (
@@ -130,6 +208,8 @@ def write_fake_run(
             }
             if mean_flow_cm3_s is not None:
                 payload["summary"]["mean_flow_cm3_s"] = mean_flow_cm3_s
+            if pulse_decay is not None:
+                payload["summary"]["pulse_decay"] = pulse_decay
         (directory / METADATA_FILENAME).write_text(
             yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
         )

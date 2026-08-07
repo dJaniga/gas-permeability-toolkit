@@ -1,0 +1,602 @@
+"""Pulse decay wired end to end: DAQ, loop, budget, storage, Klinkenberg.
+
+The physics is covered in ``test_pulse_decay.py``. What is checked here is that
+the pieces are connected correctly -- that a run reads two channels and not
+three, that a fitted decay survives a round trip through the sidecar, and that
+the regression refuses to mix methods. Every synthetic decay is driven through
+the real calibration, so nothing here is a tautology.
+"""
+
+from __future__ import annotations
+
+import math
+from datetime import datetime, timezone
+
+import pytest
+
+from gasperm.acquisition import (
+    PulseDecayLoop,
+    PulseProcessor,
+    format_pulse_reading_line,
+    pulse_console_header,
+    summarize_pulse_decay_run,
+)
+from gasperm.config import GaspermConfig
+from gasperm.hardware.daq import build_channel_specs
+from gasperm.klinkenberg import fit_klinkenberg
+from gasperm.models import KlinkenbergPoint
+from gasperm.pulse_decay import dicker_smits_decay_rate_per_s
+from gasperm.storage import (
+    READING_COLUMNS,
+    RunWriter,
+    describe_method,
+    point_from_run,
+    read_readings_csv,
+    run_method,
+)
+
+from conftest import decay_voltages
+
+
+def true_decay_rate(config: GaspermConfig, permeability_darcy: float, mean_atm: float):
+    """The rate this plug and these vessels would actually produce."""
+    geometry = config.geometry()
+    return dicker_smits_decay_rate_per_s(
+        permeability_darcy=permeability_darcy,
+        viscosity_cp=0.0178,
+        gas_compressibility_per_atm=1.0 / mean_atm,
+        length_cm=geometry.length_cm,
+        area_cm2=geometry.area_cm2,
+        porosity_fraction=config.sample.porosity_fraction,
+        upstream_volume_cm3=config.hardware.reservoirs.upstream.volume_cm3,
+        downstream_volume_cm3=config.hardware.reservoirs.downstream.volume_cm3,
+    )
+
+
+class _Clock:
+    """A clock tied to the sample index, not to how often it is asked.
+
+    The loop reads its clock more than once per sample, so a per-call tick would
+    make the recorded elapsed time run at twice the rate the synthesised decay
+    does -- and the fit would come back at exactly half the true alpha.
+    """
+
+    def __init__(self, source, step_s: float) -> None:
+        self._source = source
+        self._step = step_s
+
+    def __call__(self) -> float:
+        return self._source.read_count * self._step
+
+
+def run_decay(config, fake_analog_source, fake_temperature_source, *, rate, **kwargs):
+    """Drive a full pulse-decay run over a synthesised decay."""
+    step_s = kwargs.pop("step_s", 0.1)
+    frames = decay_voltages(config, decay_rate_per_s=rate, step_s=step_s, **kwargs)
+    source = fake_analog_source(frames)
+    config.run.max_samples = len(frames)
+    processor = PulseProcessor(config, _fixed_provider())
+    loop = PulseDecayLoop(
+        config,
+        processor,
+        source,
+        fake_temperature_source(),
+        clock=_Clock(source, step_s),
+        sleep=lambda _: None,
+    )
+    loop.run(install_signal_handler=False)
+    return loop
+
+
+def _fixed_provider():
+    from gasperm.gas_properties import FixedPropertyProvider
+
+    return FixedPropertyProvider("Nitrogen", 0.0178, reason="test fixture")
+
+
+class TestChannelSelection:
+    def test_pulse_mode_opens_two_channels_and_no_flowmeter(self, pulse_config):
+        """Requirement: pulse decay reads no flow, so it opens no flow input."""
+        specs = build_channel_specs(pulse_config)
+        assert len(specs) == 2
+        assert [spec.role for spec in specs] == ["inlet pressure", "outlet pressure"]
+
+    def test_steady_state_still_opens_three(self, base_config):
+        specs = build_channel_specs(base_config)
+        assert len(specs) == 3
+        assert specs[-1].role == "flow"
+
+    def test_a_dedicated_pulse_pair_is_used_when_present(self, pulse_config):
+        from gasperm.config import PulseTransducersConfig
+
+        pulse_config.hardware.pulse_transducers = PulseTransducersConfig()
+        specs = build_channel_specs(pulse_config)
+        assert [spec.name for spec in specs] == ["ai4", "ai5"]
+        # 0-10 V, unlike the 0-5 V steady-state pair: per-channel ranges matter.
+        assert specs[0].max_volts == pytest.approx(10.0)
+
+    def test_the_pulse_pair_may_not_collide_with_the_steady_pair(self, base_config):
+        from gasperm.config import HardwareConfig, PulseTransducerConfig
+        from gasperm.config.hardware import PulseTransducersConfig
+
+        with pytest.raises(ValueError, match="already assigned"):
+            HardwareConfig(
+                pulse_transducers=PulseTransducersConfig(
+                    upstream=PulseTransducerConfig(channel="ai0")
+                )
+            )
+
+
+class TestRunEndToEnd:
+    def test_a_synthesised_decay_recovers_its_permeability(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The whole path: volts -> calibration -> monitor -> fit -> k."""
+        k_true = 5.0e-4
+        rate = true_decay_rate(pulse_config, k_true, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        summary = loop.summarize()
+        assert summary.method == "pulse_decay"
+        assert summary.measurement_confirmed
+        assert summary.permeability_darcy == pytest.approx(k_true, rel=0.01)
+
+    def test_a_transducer_zero_mismatch_is_fitted_out(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The reason the fit is nonlinear, exercised through the real loop."""
+        k_true = 5.0e-4
+        rate = true_decay_rate(pulse_config, k_true, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0, offset_atm=0.002,
+        )
+        summary = loop.summarize()
+        assert summary.pulse_decay.fitted_offset_atm == pytest.approx(0.002, rel=0.05)
+        assert summary.permeability_darcy == pytest.approx(k_true, rel=0.02)
+
+    def test_the_storage_correction_is_applied_and_recorded(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        result = loop.summarize().pulse_decay
+        assert result.storage_correction == "dicker_smits"
+        assert result.storage_root is not None
+        assert result.upstream_storage_ratio == pytest.approx(
+            pulse_config.geometry().area_cm2 * 5.0 * 0.10 / 8.0, rel=1e-6
+        )
+
+    def test_brace_is_used_when_porosity_is_unrecorded(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        pulse_config.sample.porosity_fraction = None
+        rate = 0.2
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        result = loop.summarize().pulse_decay
+        assert result.storage_correction == "brace"
+        assert result.storage_root is None
+
+    def test_no_flow_is_recorded_at_all(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """None, not zero: no meter was read, and a zero would claim one was."""
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        assert all(r.flow_cm3_s is None for r in loop.readings)
+        assert all(r.flow_voltage is None for r in loop.readings)
+        assert loop.summarize().mean_flow_cm3_s is None
+
+    def test_the_run_stops_at_the_configured_fraction(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=120.0,
+        )
+        assert "decay reached" in loop.stop_reason
+        assert loop.status.decay_fraction <= pulse_config.run.pulse_decay.stop_below_fraction
+
+    def test_a_run_with_no_pulse_says_so_and_is_not_confirmed(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=0.2, duration_s=10.0, pulse_atm=1e-6,
+        )
+        summary = loop.summarize()
+        assert not summary.measurement_confirmed
+        assert any("No pulse was ever detected" in w for w in summary.warnings)
+
+    def test_the_console_line_and_header_render(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=20.0,
+        )
+        line = format_pulse_reading_line(loop.readings[-1], loop.status, pulse_config)
+        assert "dP" in line
+        assert "dP/dP0" in pulse_console_header(pulse_config)
+
+
+class TestBudget:
+    def test_the_measurand_names_the_method(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        budget = loop.summarize().uncertainty
+        assert budget.measurand == "apparent gas permeability (pulse decay)"
+
+    def test_the_decay_rate_is_the_type_a_term(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        budget = loop.summarize().uncertainty
+        alpha = next(c for c in budget.components if c.symbol == "alpha")
+        assert alpha.evaluation_type == "A"
+        assert alpha.relative_sensitivity == pytest.approx(1.0)
+
+    def test_no_flow_term_appears(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The whole point of the method: the flowmeter is not an input."""
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        symbols = {c.symbol for c in loop.summarize().uncertainty.components}
+        assert "Q" not in symbols
+        assert {"alpha", "mu", "c_g", "P_mean", "V1", "V2", "L", "d"} <= symbols
+
+    def test_the_pressure_enters_only_through_the_compressibility(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        budget = loop.summarize().uncertainty
+        pressure = next(c for c in budget.components if c.symbol == "P_mean")
+        assert pressure.relative_sensitivity == pytest.approx(-1.0, abs=0.03)
+        assert any("measures a RATE" in note for note in budget.notes)
+
+    def test_brace_volume_sensitivities_sum_to_one(self, pulse_config):
+        """Exact in the zero-storage form; the numeric branch is covered above."""
+        from gasperm.models import SampleGeometry
+        from gasperm.uncertainty import PulseDecayPoint, build_pulse_decay_budget
+
+        point = PulseDecayPoint(
+            permeability_darcy=1e-5,
+            decay_rate_per_s=0.01,
+            mean_pressure_atm=10.0,
+            viscosity_cp=0.0178,
+            gas_compressibility_per_atm=0.1,
+            temperature_c=22.0,
+            upstream_volume_cm3=400.0,
+            downstream_volume_cm3=75.0,
+        )
+        budget = build_pulse_decay_budget(
+            point,
+            SampleGeometry(sample_id="x", length_cm=5.0, diameter_cm=3.81),
+            pulse_config.hardware,
+            pulse_config.run,
+            decay_rate_relative_uncertainty=0.01,
+        )
+        by_symbol = {c.symbol: c for c in budget.components}
+        total = (
+            by_symbol["V1"].relative_sensitivity + by_symbol["V2"].relative_sensitivity
+        )
+        assert total == pytest.approx(1.0)
+        assert by_symbol["L"].relative_sensitivity == pytest.approx(1.0)
+        assert by_symbol["d"].relative_sensitivity == pytest.approx(-2.0)
+
+    def test_correlated_vessels_increase_the_uncertainty(self, pulse_config):
+        """Unlike P1/P2: both volumes enter with the same sign."""
+        from gasperm.models import SampleGeometry
+        from gasperm.uncertainty import PulseDecayPoint, build_pulse_decay_budget
+
+        point = PulseDecayPoint(
+            permeability_darcy=1e-5,
+            decay_rate_per_s=0.01,
+            mean_pressure_atm=10.0,
+            viscosity_cp=0.0178,
+            gas_compressibility_per_atm=0.1,
+            temperature_c=22.0,
+            upstream_volume_cm3=100.0,
+            downstream_volume_cm3=100.0,
+        )
+        geometry = SampleGeometry(sample_id="x", length_cm=5.0, diameter_cm=3.81)
+        independent = build_pulse_decay_budget(
+            point, geometry, pulse_config.hardware, pulse_config.run,
+            decay_rate_relative_uncertainty=0.0,
+        )
+        pulse_config.hardware.reservoirs.correlation = 1.0
+        correlated = build_pulse_decay_budget(
+            point, geometry, pulse_config.hardware, pulse_config.run,
+            decay_rate_relative_uncertainty=0.0,
+        )
+        assert correlated.correlation_relative_variance > 0.0
+        assert (
+            correlated.relative_combined_standard_uncertainty
+            > independent.relative_combined_standard_uncertainty
+        )
+
+
+class TestStorageRoundTrip:
+    def test_a_pulse_run_survives_the_sidecar(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        pulse_config.run.output_dir = str(tmp_path)
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        writer = RunWriter(pulse_config)
+        writer.open()
+        for reading in loop.readings:
+            writer.write(reading)
+        writer.close()
+        summary = loop.summarize(csv_path=str(writer.readings_path))
+        writer.write_metadata(summary)
+
+        point = point_from_run(writer.directory)
+        assert point.method == "pulse_decay"
+        assert point.apparent_permeability_darcy == pytest.approx(
+            summary.permeability_darcy, rel=1e-9
+        )
+        assert point.standard_uncertainty_darcy > 0.0
+
+    def test_the_differential_is_stored_in_its_own_column(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        pulse_config.run.output_dir = str(tmp_path)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=0.2, duration_s=20.0,
+        )
+        writer = RunWriter(pulse_config)
+        writer.open()
+        for reading in loop.readings:
+            writer.write(reading)
+        writer.close()
+
+        assert "delta_pressure_atm" in READING_COLUMNS
+        assert "decay_fraction" in READING_COLUMNS
+        rows = read_readings_csv(writer.readings_path)
+        assert rows[-1]["delta_pressure_atm"] > 0.0
+        assert rows[-1]["decay_fraction"] is not None
+        # No meter was read, so the flow column is blank rather than zero.
+        assert rows[-1]["flow_cm3_s"] is None
+
+    def test_run_method_reads_the_block_not_the_key(self):
+        """An old sidecar was steady-state by definition, not 'unknown'."""
+        assert run_method({"run": {}}) == "steady_state"
+        assert run_method({"run": {"method": "pulse_decay"}}) == "pulse_decay"
+        assert run_method({}) is None
+        assert run_method({"sample": {"id": "x"}}) is None
+
+    def test_a_pulse_run_without_a_fit_is_refused_clearly(
+        self, tmp_path, fake_run_writer
+    ):
+        """Not 'never reached steady state', which would be nonsense here."""
+        directory = fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 1, 9, tzinfo=timezone.utc),
+            steady=False, method="pulse_decay",
+        )
+        with pytest.raises(ValueError, match="pulse-decay run with no recorded"):
+            point_from_run(directory)
+
+    def test_an_old_sidecar_still_short_circuits(self, tmp_path, fake_run_writer):
+        """measurement_confirmed falls back to steady_state_reached."""
+        directory = fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 1, 9, tzinfo=timezone.utc)
+        )
+        assert point_from_run(directory).method == "steady_state"
+
+
+class TestKlinkenbergMixing:
+    def points(self, method: str):
+        return [
+            KlinkenbergPoint(
+                mean_pressure_atm=p,
+                apparent_permeability_darcy=5e-4 * (1.0 + 4.0 / p),
+                sample_id="core-001",
+                method=method,
+                label=f"{method}-{p}",
+            )
+            for p in (5.0, 10.0, 20.0)
+        ]
+
+    def test_a_pulse_series_recovers_a_planted_k_l(self):
+        result = fit_klinkenberg(self.points("pulse_decay"))
+        assert result.liquid_permeability_darcy == pytest.approx(5e-4, rel=1e-9)
+        assert result.slippage_factor_atm == pytest.approx(4.0, rel=1e-9)
+
+    def test_mixing_methods_is_refused(self):
+        mixed = self.points("pulse_decay")[:2] + self.points("steady_state")[2:]
+        with pytest.raises(ValueError, match="same measurement method"):
+            fit_klinkenberg(mixed)
+
+    def test_the_refusal_explains_why(self):
+        mixed = self.points("pulse_decay")[:2] + self.points("steady_state")[2:]
+        with pytest.raises(ValueError, match="masquerade as slippage"):
+            fit_klinkenberg(mixed)
+
+    def test_mixing_can_be_allowed_and_then_warns(self):
+        mixed = self.points("pulse_decay")[:2] + self.points("steady_state")[2:]
+        result = fit_klinkenberg(mixed, allow_mixed_methods=True)
+        assert any("different measurement methods" in w for w in result.warnings)
+
+    def test_points_without_a_method_do_not_trigger_it(self):
+        """CSV-loaded points carry no method; that is not a mixed set."""
+        result = fit_klinkenberg(
+            [
+                KlinkenbergPoint(mean_pressure_atm=p, apparent_permeability_darcy=k)
+                for p, k in ((5.0, 9e-4), (10.0, 7e-4), (20.0, 6e-4))
+            ]
+        )
+        assert result.liquid_permeability_darcy > 0.0
+
+    def test_describe_method_is_readable(self):
+        assert describe_method("pulse_decay") == "pulse decay"
+        assert describe_method(None) == "unknown"
+
+
+class TestSummariseWithoutALoop:
+    def test_summarize_is_usable_standalone(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """So a stored run can be re-reduced without re-running the rig."""
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        direct = summarize_pulse_decay_run(
+            loop.readings, pulse_config, fit=loop.fit(), processor=loop.processor
+        )
+        assert direct.permeability_darcy == pytest.approx(
+            loop.summarize().permeability_darcy
+        )
+
+    def test_an_empty_run_is_refused(self, pulse_config):
+        with pytest.raises(ValueError, match="No samples"):
+            summarize_pulse_decay_run([], pulse_config, fit=None)
+
+
+class TestLivePlotPanels:
+    def test_pulse_panels_replace_the_flow_panel(self, pulse_config):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from gasperm.plotting import _panels_for
+
+        keys = [panel.key for panel in _panels_for(pulse_config)]
+        assert "flow" not in keys
+        assert "delta_pressure" in keys
+        assert "decay_fraction" in keys
+
+    def test_steady_state_keeps_flow_and_drops_the_decay_panels(self, base_config):
+        from gasperm.plotting import _panels_for
+
+        keys = [panel.key for panel in _panels_for(base_config)]
+        assert "flow" in keys
+        assert "delta_pressure" not in keys
+
+    def test_the_decay_fraction_panel_is_logarithmic(self, pulse_config):
+        """An exponential decay reads as a straight line, which is the check."""
+        from gasperm.plotting import _panels_for
+
+        panel = next(p for p in _panels_for(pulse_config) if p.key == "decay_fraction")
+        assert panel.yscale == "log"
+
+    def test_the_decay_plot_is_written(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from gasperm.plotting import plot_pulse_decay
+
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        summary = loop.summarize()
+        saved = plot_pulse_decay(
+            summary.pulse_decay, loop.readings, path=tmp_path / "decay_fit.png"
+        )
+        assert saved.is_file()
+        assert saved.stat().st_size > 0
+
+
+class TestConfigRefusals:
+    def test_a_supplied_p2_and_pulse_decay_cannot_coexist(self):
+        from gasperm.config import RunConfig
+
+        with pytest.raises(ValueError, match="CLOSED downstream vessel"):
+            RunConfig(method="pulse_decay", downstream_pressure=101.325)
+
+    def test_a_meterless_rig_loads_for_pulse_decay(self):
+        from gasperm.config import HardwareConfig, RunConfig
+
+        config = GaspermConfig(
+            hardware=HardwareConfig(flowmeters={}, default_flowmeter=None),
+            run=RunConfig(method="pulse_decay"),
+        )
+        # experiment_metadata is on the pulse path twice and must not need one.
+        from gasperm.config import experiment_metadata
+
+        assert experiment_metadata(config).flowmeter == ""
+
+    def test_the_effective_volume_is_the_harmonic_combination(self):
+        """It is the SMALLER vessel that sets the decay rate."""
+        config = GaspermConfig()
+        reservoirs = config.hardware.reservoirs
+        assert reservoirs.effective_volume_cm3 == pytest.approx(
+            400.0 * 75.0 / 475.0, rel=1e-9
+        )
+        assert reservoirs.effective_volume_cm3 < 75.0
+
+    def test_the_predicted_duration_is_reported_at_startup(self):
+        from gasperm.config import validate_for_collect
+
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        config.hardware.temperature.required = False
+        config.sample.porosity_fraction = 0.10
+        config.run.pulse_decay.expected_permeability = 1.0
+        warnings = validate_for_collect(config)
+        timing = [w for w in warnings if "time constant" in w]
+        assert len(timing) == 1
+        # 13.9 h at 10 atm on this rig's 400/75 cm3 vessels.
+        assert "13.9 h" in timing[0]
+
+    def test_a_pulse_below_the_transducer_resolution_is_flagged(self):
+        from gasperm.config import validate_for_collect
+
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        config.hardware.temperature.required = False
+        warnings = validate_for_collect(config)
+        assert any("standard uncertainty of" in w for w in warnings)
+
+
+def test_the_module_imports_no_hardware():
+    """The physics must stay testable with no device attached."""
+    import gasperm.pulse_decay as module
+
+    source = (
+        module.__file__.replace("pulse_decay.py", "pulse_decay.py")
+    )
+    with open(source, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "import nidaqmx" not in text
+    assert "import serial" not in text
+    assert math.isfinite(1.0)

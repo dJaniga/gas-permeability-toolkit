@@ -33,6 +33,7 @@ __all__ = [
     "dynamic_viscosity_pa_s",
     "density_kg_m3",
     "compressibility_factor",
+    "isothermal_compressibility_per_pa",
     "validate_gas_name",
     "GasPropertyProvider",
     "CoolPropProvider",
@@ -69,6 +70,23 @@ def dynamic_viscosity_pa_s(gas_name: str, temperature_k: float, pressure_pa: flo
 def density_kg_m3(gas_name: str, temperature_k: float, pressure_pa: float) -> float:
     """Mass density (kg/m^3) of ``gas_name`` at the given T, P."""
     return float(_props_si()("D", "T", temperature_k, "P", pressure_pa, gas_name))
+
+
+def isothermal_compressibility_per_pa(
+    gas_name: str, temperature_k: float, pressure_pa: float
+) -> float:
+    """Isothermal compressibility (1/Pa) of ``gas_name`` at the given T, P.
+
+    ``c = -1/V (dV/dP)_T``. This is the quantity the pulse-decay equation needs,
+    and it is *not* the dimensionless Z factor returned by
+    :func:`compressibility_factor`. For a near-ideal gas it is close to ``1/P``,
+    which is why it cannot be treated as a constant across a pressure series.
+    """
+    return float(
+        _props_si()(
+            "ISOTHERMAL_COMPRESSIBILITY", "T", temperature_k, "P", pressure_pa, gas_name
+        )
+    )
 
 
 def compressibility_factor(gas_name: str, temperature_k: float, pressure_pa: float) -> float:
@@ -118,6 +136,7 @@ class GasPropertyProvider:
         temperature_tolerance_k: float = 0.05,
         pressure_tolerance_frac: float = 0.002,
         relative_uncertainty: float = 0.0,
+        relative_compressibility_uncertainty: float = 0.0,
     ) -> None:
         """Args:
         gas_name: CoolProp fluid name (or a label, for the fixed provider).
@@ -129,11 +148,14 @@ class GasPropertyProvider:
             near ambient, so 0.2% is conservative.
         relative_uncertainty: Relative standard uncertainty of the viscosity
             model, carried on every state for the GUM budget.
+        relative_compressibility_uncertainty: The same for the isothermal
+            compressibility, which only pulse-decay runs consume.
         """
         self.gas_name = gas_name
         self.temperature_tolerance_k = temperature_tolerance_k
         self.pressure_tolerance_frac = pressure_tolerance_frac
         self.relative_uncertainty = relative_uncertainty
+        self.relative_compressibility_uncertainty = relative_compressibility_uncertainty
         self._cached: GasState | None = None
         self.lookup_count = 0
         self.cache_hits = 0
@@ -159,6 +181,58 @@ class GasPropertyProvider:
     def viscosity_cp_at(self, temperature_k: float, pressure_pa: float) -> float:
         """Convenience: dynamic viscosity in **cP**, ready for the Darcy equation."""
         return self.state_at(temperature_k, pressure_pa).viscosity_cp
+
+    def compressibility_per_atm_at(
+        self, temperature_k: float, pressure_pa: float
+    ) -> float:
+        """Isothermal compressibility in **1/atm**, for the pulse-decay equation.
+
+        Falls back to the ideal-gas ``c = 1/P`` when the provider did not supply
+        one -- correct to a few tenths of a percent for the light gases used
+        here, and far better than refusing to produce a result.
+
+        Raises:
+            ValueError: the pressure is non-positive, so ``1/P`` is undefined.
+        """
+        if pressure_pa <= 0.0:
+            raise ValueError(
+                f"compressibility is undefined at P = {pressure_pa} Pa; the "
+                "pressure must be absolute and positive."
+            )
+        state = self.state_at(temperature_k, pressure_pa)
+        if state.isothermal_compressibility_per_atm is not None:
+            return state.isothermal_compressibility_per_atm
+        return units.per_pa_to_per_atm(1.0 / pressure_pa)
+
+    def compressibility_pressure_exponent(
+        self, temperature_k: float, pressure_pa: float, *, delta_frac: float = 0.01
+    ) -> float:
+        """``d ln c / d ln P`` by central difference -- close to -1 for a gas.
+
+        The sensitivity of permeability to the mean pore pressure runs entirely
+        through the compressibility, so this is the exponent the GUM budget
+        needs for the P_mean term. Mirrors
+        :meth:`viscosity_temperature_exponent`, including restoring the cache so
+        probing never disturbs the acquisition loop's cached state.
+        """
+        if pressure_pa <= 0.0:
+            return -1.0
+        cached = self._cached
+        try:
+            low = self._lookup(temperature_k, pressure_pa * (1.0 - delta_frac))
+            high = self._lookup(temperature_k, pressure_pa * (1.0 + delta_frac))
+        except (ValueError, CoolPropUnavailable):
+            return -1.0
+        finally:
+            self._cached = cached
+
+        c_low = low.isothermal_compressibility_per_atm
+        c_high = high.isothermal_compressibility_per_atm
+        if not c_low or not c_high or c_low <= 0.0 or c_high <= 0.0:
+            return -1.0
+        return math.log(c_high / c_low) / math.log(
+            (1.0 + delta_frac) / (1.0 - delta_frac)
+        )
 
     def state_at_cgs(self, temperature_c: float, pressure_atm: float) -> GasState:
         """Same as :meth:`state_at` but taking the internal CGS-ish units.
@@ -242,6 +316,15 @@ class CoolPropProvider(GasPropertyProvider):
                 if self.include_derived
                 else None
             )
+            compressibility = (
+                units.per_pa_to_per_atm(
+                    isothermal_compressibility_per_pa(
+                        self.gas_name, temperature_k, pressure_pa
+                    )
+                )
+                if self.include_derived
+                else None
+            )
         except CoolPropUnavailable:
             raise
         except (ValueError, RuntimeError) as exc:
@@ -257,8 +340,10 @@ class CoolPropProvider(GasPropertyProvider):
             viscosity_cp=units.pa_s_to_cp(viscosity_pa_s),
             density_kg_m3=density,
             compressibility_z=z_factor,
+            isothermal_compressibility_per_atm=compressibility,
             source="coolprop",
             relative_viscosity_uncertainty=self.relative_uncertainty,
+            relative_compressibility_uncertainty=self.relative_compressibility_uncertainty,
         )
 
 
@@ -277,8 +362,13 @@ class FixedPropertyProvider(GasPropertyProvider):
         *,
         reason: str = "",
         relative_uncertainty: float = 0.0,
+        relative_compressibility_uncertainty: float = 0.0,
     ) -> None:
-        super().__init__(gas_name, relative_uncertainty=relative_uncertainty)
+        super().__init__(
+            gas_name,
+            relative_uncertainty=relative_uncertainty,
+            relative_compressibility_uncertainty=relative_compressibility_uncertainty,
+        )
         if viscosity_cp <= 0.0:
             raise ValueError(f"fixed viscosity must be positive, got {viscosity_cp}")
         self.viscosity_cp = viscosity_cp
@@ -292,13 +382,23 @@ class FixedPropertyProvider(GasPropertyProvider):
         )
 
     def _lookup(self, temperature_k: float, pressure_pa: float) -> GasState:
+        # Compressibility is NOT frozen alongside the viscosity. c ~ 1/P varies
+        # sixfold across a 5-30 atm Klinkenberg series, and a constant would put
+        # a smooth sixfold error into the series -- which would still fit a
+        # convincing straight line and give an entirely wrong k_L. So the ideal
+        # relation is evaluated at the requested pressure even here.
+        compressibility = (
+            units.per_pa_to_per_atm(1.0 / pressure_pa) if pressure_pa > 0.0 else None
+        )
         return GasState(
             gas_name=self.gas_name,
             temperature_k=temperature_k,
             pressure_pa=pressure_pa,
             viscosity_cp=self.viscosity_cp,
+            isothermal_compressibility_per_atm=compressibility,
             source="fixed",
             relative_viscosity_uncertainty=self.relative_uncertainty,
+            relative_compressibility_uncertainty=self.relative_compressibility_uncertainty,
         )
 
     def _within_tolerance(self, cached, temperature_k, pressure_pa) -> bool:
@@ -323,8 +423,14 @@ def build_provider(gas_config) -> GasPropertyProvider:
             gas_config.fixed_viscosity_cp,
             reason=gas_config.fixed_reason,
             relative_uncertainty=gas_config.viscosity_relative_uncertainty,
+            relative_compressibility_uncertainty=(
+                gas_config.compressibility_relative_uncertainty
+            ),
         )
     return CoolPropProvider(
         gas_config.name,
         relative_uncertainty=gas_config.viscosity_relative_uncertainty,
+        relative_compressibility_uncertainty=(
+            gas_config.compressibility_relative_uncertainty
+        ),
     )

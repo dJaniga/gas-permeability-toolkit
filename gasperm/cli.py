@@ -14,6 +14,7 @@ import typer
 from gasperm import __version__, units
 from gasperm.config import (
     HARDWARE_FILENAME,
+    MEASUREMENT_METHODS,
     PLOT_PANELS,
     RUN_FILENAME,
     ConfigError,
@@ -785,6 +786,11 @@ def collect_command(
     hardware: Optional[Path] = typer.Option(None, "--hardware", help="Override hardware.yaml."),
     sample: Optional[Path] = typer.Option(None, "--sample", help="Override sample.yaml."),
     run_file: Optional[Path] = typer.Option(None, "--run", help="Override run.yaml."),
+    method: Optional[str] = typer.Option(
+        None, "--method", "-m", metavar="steady_state|pulse_decay",
+        help="Measurement method for this run. pulse_decay reads no flowmeter "
+             "and requires a closed downstream vessel.",
+    ),
     plot: bool = typer.Option(
         False, "--plot",
         help="Open a live window: one stacked panel per parameter, with the "
@@ -844,9 +850,13 @@ def collect_command(
     """
     from gasperm.acquisition import (
         AcquisitionLoop,
+        PulseDecayLoop,
+        PulseProcessor,
         SampleProcessor,
         console_header,
+        format_pulse_reading_line,
         format_reading_line,
+        pulse_console_header,
     )
     from gasperm.gas_properties import build_provider
     from gasperm.hardware.daq import DaqError, open_analog_input
@@ -885,6 +895,23 @@ def collect_command(
             except Exception as exc:  # noqa: BLE001 - pydantic rejects non-positive
                 _fail(str(exc))
                 return
+
+    # Applied AFTER --downstream-pressure, deliberately. With validate_assignment
+    # on, switching to pulse_decay while a supplied P2 is still set raises at the
+    # assignment -- correct, but it would reject a command line that sets both
+    # and is perfectly consistent once both have landed.
+    if method is not None:
+        if method not in MEASUREMENT_METHODS:
+            _fail(
+                f"--method {method!r} is not a measurement method. Available: "
+                f"{', '.join(MEASUREMENT_METHODS)}."
+            )
+            return
+        try:
+            config.run.method = method
+        except Exception as exc:  # noqa: BLE001 - pydantic enforces the pairing
+            _fail(str(exc))
+            return
 
     if flowmeter is not None:
         if flowmeter not in config.hardware.flowmeters:
@@ -982,26 +1009,40 @@ def collect_command(
             typer.secho(f"warning: live plot unavailable: {exc}", fg=typer.colors.YELLOW)
             live_plot = None
 
-    processor = SampleProcessor(config, gas_provider)
+    pulse_mode = config.run.method == "pulse_decay"
+    processor = (
+        PulseProcessor(config, gas_provider)
+        if pulse_mode
+        else SampleProcessor(config, gas_provider)
+    )
 
     def on_reading(reading) -> None:
         writer.write(reading)
-        typer.echo(format_reading_line(reading, config))
+        if pulse_mode:
+            typer.echo(format_pulse_reading_line(reading, loop.status, config))
+        else:
+            typer.echo(format_reading_line(reading, config))
         if live_plot is not None:
             # The detector's verdict is what the criterion lines are drawn
             # from; it is already updated for this reading by the time the
-            # loop calls back.
-            live_plot.add(reading, loop.status)
+            # loop calls back. A pulse run has no steady-state status, so the
+            # plot draws no criteria -- which its own panels already reflect.
+            live_plot.add(reading, None if pulse_mode else loop.status)
             live_plot.maybe_redraw()
 
-    loop = AcquisitionLoop(
+    loop_class = PulseDecayLoop if pulse_mode else AcquisitionLoop
+    loop = loop_class(
         config, processor, analog_source, temperature_source, on_reading=on_reading
     )
 
     typer.secho(f"\nRecording to {writer.directory}   (Ctrl+C to stop)", fg=typer.colors.CYAN)
+    meter_text = (
+        "no flowmeter (pulse decay measures no flow)"
+        if pulse_mode
+        else f"flowmeter {config.flowmeter_name} ({config.flowmeter.summary})"
+    )
     typer.secho(
-        f"Sample {config.sample.id}   gas {config.run.gas.name}   "
-        f"flowmeter {config.flowmeter_name} ({config.flowmeter.summary})",
+        f"Sample {config.sample.id}   gas {config.run.gas.name}   {meter_text}",
         fg=typer.colors.CYAN,
     )
     if not config.run.downstream_is_measured:
@@ -1010,7 +1051,9 @@ def collect_command(
             f"{config.run.downstream_pressure_unit}, not the outlet transducer.",
             fg=typer.colors.YELLOW,
         )
-    if config.run.steady_state.enabled:
+    if pulse_mode:
+        _print_pulse_criteria(config, processor)
+    elif config.run.steady_state.enabled:
         criteria = config.run.steady_state
         typer.secho(
             f"Steady state: {criteria.required_windows} x {criteria.window_s:g} s windows, "
@@ -1026,7 +1069,7 @@ def collect_command(
             fg=typer.colors.YELLOW,
         )
     typer.echo("")
-    typer.echo(console_header(config))
+    typer.echo(pulse_console_header(config) if pulse_mode else console_header(config))
 
     exit_code = 0
     try:
@@ -1054,6 +1097,24 @@ def collect_command(
         typer.secho(f"\n{exc}", fg=typer.colors.YELLOW)
     writer.write_metadata(summary)
 
+    if summary is not None and summary.pulse_decay is not None:
+        # Free at the end of a multi-hour run, and the single most diagnostic
+        # artefact it produces: a leak or a thermal ramp shows as structure in
+        # the residuals long before it shows in R^2.
+        try:
+            from gasperm.plotting import plot_pulse_decay
+
+            saved = plot_pulse_decay(
+                summary.pulse_decay,
+                loop.readings,
+                path=writer.directory / "decay_fit.png",
+                pressure_unit=config.run.display_pressure_unit,
+            )
+            if saved is not None:
+                typer.secho(f"Decay fit plotted to {saved}", fg=typer.colors.CYAN)
+        except Exception as exc:  # noqa: BLE001 - a plot must never fail a run
+            logger.debug("Could not plot the decay fit: %s", exc)
+
     typer.echo("")
     if summary is not None:
         _print_run_summary(summary, config)
@@ -1070,10 +1131,13 @@ def collect_command(
         _print_collect_next_steps(config, writer, config_dir, output_dir is not None)
     except OSError as exc:
         # A convenience footer must never turn a good run into a traceback, nor
-        # swallow the exit code that says steady state was not reached.
+        # swallow the exit code that says the run produced no measurement.
         logger.debug("Could not summarise sibling runs: %s", exc)
 
-    if summary is not None and not summary.steady_state_reached:
+    # Exit 2 keeps its meaning across both methods -- "this run did not produce a
+    # confirmed measurement" -- which is a confirmed steady window for one and an
+    # accepted decay fit for the other.
+    if summary is not None and not summary.measurement_confirmed:
         exit_code = exit_code or 2
     if exit_code:
         raise typer.Exit(code=exit_code)
@@ -1124,6 +1188,98 @@ def _print_collect_next_steps(
     )
 
 
+def _print_pulse_criteria(config: GaspermConfig, processor) -> None:
+    """Startup banner for a pulse-decay run: vessels, criteria, expected length."""
+    pulse = config.run.pulse_decay
+    reservoirs = config.hardware.reservoirs
+    typer.secho(
+        f"Pulse decay: V1 = {reservoirs.upstream.volume_cm3:g} cm3, "
+        f"V2 = {reservoirs.downstream.volume_cm3:g} cm3 "
+        f"(effective {reservoirs.effective_volume_cm3:.4g} cm3), "
+        f"{processor.storage_correction.replace('_', '-')} model",
+        fg=typer.colors.CYAN,
+    )
+    typer.secho(
+        f"Apply a pulse of at least {pulse.min_pulse_pressure:g} "
+        f"{pulse.pulse_pressure_unit}; the run ends at dP/dP0 = "
+        f"{pulse.stop_below_fraction:g}, fitting "
+        f"{pulse.fit_start_fraction:g} down to {pulse.fit_end_fraction:g}.",
+        fg=typer.colors.CYAN,
+    )
+
+
+def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
+    """The decay-specific block of a pulse-decay run summary."""
+    result = summary.pulse_decay
+    unit = config.run.display_pressure_unit
+    if result is None:
+        typer.secho(
+            "  decay fit           REJECTED -- no decay could be fitted, so this run "
+            "did not measure the sample",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        return
+
+    correction = result.storage_correction.replace("_", " & ").title()
+    typer.echo(f"  method              pulse decay -- {correction} model")
+    amplitude = units.from_atm(result.pulse_amplitude_atm, unit)
+    fraction = (
+        result.pulse_amplitude_atm / summary.mean_pressure_atm
+        if summary.mean_pressure_atm
+        else 0.0
+    )
+    typer.echo(
+        f"  pulse               dP0 = {amplitude:.4g} {unit} at "
+        f"t = {result.pulse_at_elapsed_s:.1f} s   ({fraction:.2%} of P_mean)"
+    )
+    typer.secho(
+        f"  decay fit           "
+        f"{'ACCEPTED' if summary.measurement_confirmed else 'REJECTED'}   "
+        f"{result.fit_start_elapsed_s:.1f}-{result.fit_end_elapsed_s:.1f} s, "
+        f"{result.fit_sample_count} pts",
+        fg=typer.colors.GREEN if summary.measurement_confirmed else typer.colors.RED,
+        bold=not summary.measurement_confirmed,
+    )
+    relative = result.relative_standard_uncertainty
+    relative_text = f" +/- {relative:.2%}" if relative is not None else ""
+    typer.echo(
+        f"                      alpha = {result.decay_rate_per_s:.4e} 1/s"
+        f"{relative_text},  tau = {result.time_constant_s:.0f} s"
+    )
+    offset_text = (
+        f",  offset = {units.from_atm(result.fitted_offset_atm, unit):+.4g} {unit}"
+        if result.fitted_offset_atm is not None
+        else ""
+    )
+    autocorrelation = (
+        f",  rho_1 = {result.residual_autocorrelation:.2f}"
+        if result.residual_autocorrelation is not None
+        else ""
+    )
+    typer.echo(
+        f"                      R^2 = {result.r_squared:.6f}{offset_text}{autocorrelation}"
+        f"  [{result.fit_model}]"
+    )
+    vessels = (
+        f"  vessels             V1 = {result.upstream_volume_cm3:g} cm3, "
+        f"V2 = {result.downstream_volume_cm3:g} cm3"
+    )
+    if result.upstream_storage_ratio is not None:
+        vessels += (
+            f"    a1 = {result.upstream_storage_ratio:.3f}, "
+            f"a2 = {result.downstream_storage_ratio:.3f}"
+        )
+    typer.echo(vessels)
+    if result.storage_root is not None:
+        ratios = result.upstream_storage_ratio + result.downstream_storage_ratio
+        understated = ratios / result.storage_root**2
+        typer.echo(
+            f"                      theta_1 = {result.storage_root:.4f}   "
+            f"(the zero-storage form would read {1.0 - 1.0 / understated:.1%} low)"
+        )
+
+
 def _print_run_summary(summary, config: GaspermConfig) -> None:
     run = config.run
     pressure_unit = run.display_pressure_unit
@@ -1152,7 +1308,9 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
         f"  duration            {summary.duration_s:.1f} s over {summary.sample_count} samples"
     )
 
-    if summary.steady_state_reached and summary.steady_state_window is not None:
+    if summary.method == "pulse_decay":
+        _print_pulse_decay_result(summary, config)
+    elif summary.steady_state_reached and summary.steady_state_window is not None:
         window = summary.steady_state_window
         typer.secho(
             f"  steady state        CONFIRMED, {window.start_elapsed_s:.1f}-"
@@ -1169,12 +1327,14 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
 
     typer.echo(f"  mean pressure       {p_display:.4g} {pressure_unit}")
     typer.echo(f"  mean temperature    {summary.mean_temperature_c:.2f} C")
-    typer.echo(
-        f"  mean flow           "
-        f"{units.flow_from_cm3_s(summary.mean_flow_cm3_s, run.display_flow_unit):.4g} "
-        f"{run.display_flow_unit}"
-    )
+    if summary.mean_flow_cm3_s is not None:
+        typer.echo(
+            f"  mean flow           "
+            f"{units.flow_from_cm3_s(summary.mean_flow_cm3_s, run.display_flow_unit):.4g} "
+            f"{run.display_flow_unit}"
+        )
 
+    good = bool(summary.measurement_confirmed)
     budget = summary.uncertainty
     if budget is not None:
         expanded = units.darcy_to(budget.expanded_uncertainty_darcy, permeability_unit)
@@ -1182,7 +1342,7 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
             f"  apparent k_g        {k_display:.5g} +/- {expanded:.3g} {permeability_unit}"
             f"  ({budget.relative_expanded_uncertainty:.2%}, k = {budget.coverage_factor:.2f},"
             f" {budget.coverage_probability:.0%})",
-            fg=typer.colors.GREEN if summary.steady_state_reached else typer.colors.YELLOW,
+            fg=typer.colors.GREEN if good else typer.colors.YELLOW,
             bold=True,
         )
         _print_budget(budget)
@@ -1190,7 +1350,7 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
         stddev = units.darcy_to(summary.permeability_stddev_darcy, permeability_unit)
         typer.secho(
             f"  apparent k_g        {k_display:.5g} +/- {stddev:.3g} {permeability_unit} (1 sd)",
-            fg=typer.colors.GREEN if summary.steady_state_reached else typer.colors.YELLOW,
+            fg=typer.colors.GREEN if good else typer.colors.YELLOW,
             bold=True,
         )
 
@@ -1410,6 +1570,10 @@ def klinkenberg_command(
         False, "--allow-mixed-conditions",
         help="Permit runs that obtained P2 differently (measured vs supplied).",
     ),
+    allow_mixed_methods: bool = typer.Option(
+        False, "--allow-mixed-methods",
+        help="Permit steady-state and pulse-decay runs in the same regression.",
+    ),
     coverage: float = typer.Option(
         0.95, "--coverage", help="Level of confidence for the uncertainty on k_L."
     ),
@@ -1512,6 +1676,7 @@ def klinkenberg_command(
             coverage_probability=coverage,
             allow_mixed_samples=allow_mixed_samples,
             allow_mixed_conditions=allow_mixed_conditions,
+            allow_mixed_methods=allow_mixed_methods,
         )
     except ValueError as exc:
         _fail(str(exc))

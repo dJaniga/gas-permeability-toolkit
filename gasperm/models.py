@@ -16,7 +16,7 @@ import math
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SampleGeometry(BaseModel):
@@ -74,11 +74,21 @@ class GasState(BaseModel):
     viscosity_cp: float
     density_kg_m3: float | None = None
     compressibility_z: float | None = None
+    #: Isothermal compressibility ``-1/V (dV/dP)_T``, in **1/atm**. Distinct
+    #: from :attr:`compressibility_z`, which is the dimensionless real-gas
+    #: factor. Pulse decay measures permeability through this quantity, so it
+    #: must track the pore pressure -- near-ideal gases give ``c ~ 1/P``, which
+    #: changes sixfold across a 5-30 atm Klinkenberg series.
+    isothermal_compressibility_per_atm: float | None = None
     #: ``"coolprop"`` for a live lookup, ``"fixed"`` when the config bypassed it.
     source: Literal["coolprop", "fixed"] = "coolprop"
     #: Relative standard uncertainty of the viscosity model itself, from
     #: config. Feeds the GUM budget as a Type B component.
     relative_viscosity_uncertainty: float = 0.0
+    #: Relative standard uncertainty of the compressibility. Its own field
+    #: because an EOS pressure-derivative is not as well determined as the
+    #: viscosity correlation it sits beside.
+    relative_compressibility_uncertainty: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +159,94 @@ class SteadyStateWindow(BaseModel):
     def duration_s(self) -> float:
         """Length of the steady window, seconds."""
         return self.end_elapsed_s - self.start_elapsed_s
+
+
+# --------------------------------------------------------------------------
+# Pulse decay
+# --------------------------------------------------------------------------
+
+
+class DecayFit(BaseModel):
+    """The fitted differential-pressure decay: everything the fit determined.
+
+    ``dP(t) = amplitude * exp(-decay_rate * (t - start)) + offset``. The decay
+    rate is the measurand's whole content -- permeability follows from it by a
+    closed-form expression -- so the quality diagnostics beside it are not
+    decoration: they are how an operator knows whether the number is real.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: alpha, 1/s. Permeability is proportional to it.
+    decay_rate_per_s: float
+    #: u(alpha) from the fit, which becomes the budget's Type A term. ``None``
+    #: when the covariance could not be estimated.
+    decay_rate_standard_uncertainty_per_s: float | None = None
+    degrees_of_freedom: float = float("inf")
+    #: dP extrapolated back to the fit window's start, atm.
+    amplitude_atm: float
+    #: The fitted constant, atm: two independent transducers have a zero
+    #: mismatch, and leaving it out biases a log-linear fit low. ``None`` when
+    #: the offset was not fitted.
+    offset_atm: float | None = None
+    #: Coefficient of determination on dP itself (not log dP), so the two fit
+    #: models are directly comparable.
+    r_squared: float
+    start_elapsed_s: float
+    end_elapsed_s: float
+    #: Points actually fitted, after binning.
+    sample_count: int
+    #: Points before binning, so the reduction is visible.
+    raw_sample_count: int
+    model: Literal["exponential_offset", "log_linear"] = "exponential_offset"
+    #: Lag-1 autocorrelation of the residuals. Consecutive DAQ samples are not
+    #: independent; a high value after binning means u(alpha) is optimistic.
+    residual_autocorrelation: float | None = None
+    #: Correlation between the fitted amplitude and offset. When the decay does
+    #: not get far, the two trade off and u(alpha) inflates.
+    amplitude_offset_correlation: float | None = None
+
+    @property
+    def time_constant_s(self) -> float:
+        """1/alpha, the time to fall to 1/e of the pulse."""
+        return math.inf if self.decay_rate_per_s == 0.0 else 1.0 / self.decay_rate_per_s
+
+    @property
+    def relative_standard_uncertainty(self) -> float | None:
+        """u(alpha)/alpha, the fit's own precision."""
+        u = self.decay_rate_standard_uncertainty_per_s
+        if u is None or self.decay_rate_per_s == 0.0:
+            return None
+        return abs(u / self.decay_rate_per_s)
+
+
+class PulseDecayStatus(BaseModel):
+    """Live view of a decay in progress -- the analogue of a steady-state status.
+
+    A pulse-decay run takes hours, so the operator needs to see where it is and
+    when it will finish, not just whether it has.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: ``waiting`` before the pulse, ``transient`` while it is still rising,
+    #: ``decaying`` once past the peak, ``complete`` at the stop fraction.
+    phase: Literal["waiting", "transient", "decaying", "complete"] = "waiting"
+    elapsed_s: float = 0.0
+    delta_pressure_atm: float = 0.0
+    pulse_at_elapsed_s: float | None = None
+    pulse_amplitude_atm: float | None = None
+    #: dP/dP0 -- how far the decay has gone.
+    decay_fraction: float | None = None
+    #: Running log-linear estimate, refined by the one-shot fit at the end.
+    decay_rate_per_s: float | None = None
+    time_constant_s: float | None = None
+    projected_complete_elapsed_s: float | None = None
+    fit_sample_count: int = 0
+    #: dP rose again after the peak: a leak, a reopened valve, or a thermal
+    #: ramp. Otherwise silent, and it invalidates the fit.
+    reversed_since_peak: bool = False
+    summary: str = "waiting for the pulse"
 
 
 # --------------------------------------------------------------------------
@@ -260,7 +358,12 @@ class Reading(BaseModel):
     # --- raw hardware ---
     inlet_voltage: float
     outlet_voltage: float
-    flow_voltage: float
+    #: ``None`` in a pulse-decay run, where no flowmeter is read at all. It is
+    #: deliberately not 0.0 and not NaN: a zero draws a flat trace that reads
+    #: as a dead meter, and NaN slips past the ``f is None or f <= 0`` guards
+    #: downstream (``NaN <= 0`` is False) and makes the flowmeter-offset
+    #: warning fire on a run that had no flowmeter.
+    flow_voltage: float | None = None
     #: Raw serial line as received, kept verbatim when parsing failed.
     temperature_raw: str | None = None
 
@@ -278,12 +381,12 @@ class Reading(BaseModel):
     #: Mean pore pressure, (P1 + P2) / 2, absolute -- computed from P2 as used.
     mean_pressure_atm: float
     #: Flow rate as measured, converted to cm^3/s but still at the meter's
-    #: own reference state.
-    flow_cm3_s: float
+    #: own reference state. ``None`` in pulse decay -- see :attr:`flow_voltage`.
+    flow_cm3_s: float | None = None
     #: Flow rate paired with :attr:`flow_reference_pressure_atm` for the Darcy
     #: equation; the product ``flow * reference pressure`` is the invariant.
-    flow_reference_cm3_s: float
-    flow_reference_pressure_atm: float
+    flow_reference_cm3_s: float | None = None
+    flow_reference_pressure_atm: float | None = None
 
     temperature_c: float
     #: False when the serial link produced no fresh value for this sample.
@@ -307,12 +410,20 @@ class Reading(BaseModel):
     steady_state: bool = False
     #: Consecutive passing windows at the time of this sample.
     steady_state_passes: int = 0
+    #: ``dP/dP0`` for the current pulse. ``None`` outside a pulse-decay run, and
+    #: before the pulse has been applied.
+    decay_fraction: float | None = None
     #: Populated when a sample could not yield a permeability.
     note: str | None = None
 
     @property
     def delta_pressure_atm(self) -> float:
-        """P1 - P2 (absolute), atm, using P2 as it entered the equation."""
+        """P1 - P2 (absolute), atm, using P2 as it entered the equation.
+
+        In a pulse-decay run this **is** the measured signal: the mode requires
+        ``downstream_pressure: measured``, so P2 is the downstream transducer
+        and this property is exactly the differential whose decay is fitted.
+        """
         return self.inlet_pressure_atm - self.downstream_pressure_atm
 
 
@@ -359,12 +470,63 @@ class ExperimentMetadata(BaseModel):
     flowmeter_range: str = ""
 
 
+class PulseDecayResult(BaseModel):
+    """What a pulse-decay run determined, beyond the permeability itself.
+
+    Nested rather than flattened into :class:`RunSummary`, following the
+    ``uncertainty`` precedent: eighteen mode-specific fields do not belong in a
+    summary that also describes steady-state runs.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # -- the fit ----------------------------------------------------------
+    decay_rate_per_s: float
+    decay_rate_standard_uncertainty_per_s: float | None = None
+    degrees_of_freedom: float = float("inf")
+    pulse_amplitude_atm: float
+    pulse_at_elapsed_s: float
+    fitted_offset_atm: float | None = None
+    r_squared: float
+    fit_start_elapsed_s: float
+    fit_end_elapsed_s: float
+    fit_sample_count: int
+    fit_model: Literal["exponential_offset", "log_linear"] = "exponential_offset"
+    residual_autocorrelation: float | None = None
+
+    # -- the rig it was measured on ---------------------------------------
+    upstream_volume_cm3: float
+    downstream_volume_cm3: float
+    #: ``V_pore / V1`` and ``V_pore / V2``. ``None`` when porosity is unrecorded
+    #: and the zero-storage form was used.
+    upstream_storage_ratio: float | None = None
+    downstream_storage_ratio: float | None = None
+    #: ``theta_1``, the first root of the storage equation.
+    storage_root: float | None = None
+    storage_correction: Literal["brace", "dicker_smits"] = "brace"
+    gas_compressibility_per_atm: float
+
+    @property
+    def time_constant_s(self) -> float:
+        """1/alpha -- how long the decay takes to fall to 1/e."""
+        return math.inf if self.decay_rate_per_s == 0.0 else 1.0 / self.decay_rate_per_s
+
+    @property
+    def relative_standard_uncertainty(self) -> float | None:
+        """u(alpha)/alpha, which is the measurement's own precision."""
+        u = self.decay_rate_standard_uncertainty_per_s
+        if u is None or self.decay_rate_per_s == 0.0:
+            return None
+        return abs(u / self.decay_rate_per_s)
+
+
 class RunSummary(BaseModel):
     """Aggregate result of a completed ``collect`` run.
 
-    A result is only representative when :attr:`steady_state_reached` is true:
-    permeability measured while the rig is still equilibrating reflects the
-    transient, not the sample.
+    A result is only representative when :attr:`measurement_confirmed` is true:
+    a steady-state permeability measured while the rig is still equilibrating
+    reflects the transient rather than the sample, and a pulse-decay run whose
+    fit was rejected has not measured anything either.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -375,21 +537,34 @@ class RunSummary(BaseModel):
     ended_at: datetime
     duration_s: float
     sample_count: int
+    #: Which method produced this result.
+    method: Literal["steady_state", "pulse_decay"] = "steady_state"
 
     #: True when the detector confirmed stationarity at some point in the run.
+    #: Always False for a pulse-decay run -- there is no steady state to reach,
+    #: and saying otherwise in a field with this name would be a lie.
     steady_state_reached: bool
     #: The span the result was taken over. ``None`` when steady state was
-    #: never reached.
+    #: never reached, and always ``None`` in pulse decay.
     steady_state_window: SteadyStateWindow | None = None
+    #: Whether the run met its **own** method's criterion for a usable
+    #: measurement: a confirmed steady window, or an accepted decay fit.
+    #: Defaulted from :attr:`steady_state_reached` when absent, so sidecars
+    #: written before pulse decay existed still read correctly.
+    measurement_confirmed: bool | None = None
 
-    #: Steady-state means. Only meaningful when ``steady_state_reached``.
+    #: Steady-state means. Only meaningful when the measurement was confirmed.
     mean_pressure_atm: float
     permeability_darcy: float
     permeability_stddev_darcy: float
     mean_temperature_c: float
-    mean_flow_cm3_s: float
+    #: ``None`` in pulse decay, where no flowmeter is read.
+    mean_flow_cm3_s: float | None = None
     #: How many samples the steady-state means were taken over.
     averaged_samples: int
+
+    #: The decay and the vessels behind it. ``None`` for a steady-state run.
+    pulse_decay: PulseDecayResult | None = None
 
     uncertainty: UncertaintyBudget | None = None
     metadata: ExperimentMetadata | None = None
@@ -397,10 +572,18 @@ class RunSummary(BaseModel):
     #: Non-fatal problems seen during the run (serial dropouts, bad samples).
     warnings: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _default_measurement_confirmed(self) -> RunSummary:
+        if self.measurement_confirmed is None:
+            object.__setattr__(
+                self, "measurement_confirmed", self.steady_state_reached
+            )
+        return self
+
     @property
     def is_representative(self) -> bool:
         """Whether this run may be used as a measurement of the sample."""
-        return self.steady_state_reached and self.permeability_darcy > 0.0
+        return bool(self.measurement_confirmed) and self.permeability_darcy > 0.0
 
 
 #: Historical/alternate name for :class:`RunSummary`.
@@ -438,6 +621,11 @@ class KlinkenbergPoint(BaseModel):
     #: Regressing runs that disagree mixes two different x-axes, since mean
     #: pressure is computed from P2.
     downstream_convention: str | None = None
+    #: Which method produced this point. A sibling of
+    #: :attr:`downstream_convention` rather than a value of it: a pulse-decay
+    #: run's honest answer to "how was P2 obtained" is "measured", so folding
+    #: the method into that field would produce a nonsense refusal message.
+    method: str | None = None
 
     @property
     def inverse_mean_pressure(self) -> float:

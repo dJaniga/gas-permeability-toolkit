@@ -20,6 +20,7 @@ before it is fully wired up.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -45,12 +46,18 @@ from gasperm.config.hardware import (
     InstrumentUncertaintyConfig,
     PressureCalibrationConfig,
     PressureChannelConfig,
+    PulseTransducerConfig,
+    PulseTransducersConfig,
+    ReservoirConfig,
+    ReservoirsConfig,
     TemperatureConfig,
 )
 from gasperm.config.run import (
+    MEASUREMENT_METHODS,
     PLOT_PANELS,
     GasConfig,
     LivePlotConfig,
+    PulseDecayConfig,
     RunConfig,
     SteadyStateConfig,
     UncertaintyReportConfig,
@@ -69,10 +76,16 @@ __all__ = [
     "SteadyStateConfig",
     "UncertaintyReportConfig",
     "LivePlotConfig",
+    "PulseDecayConfig",
     "PLOT_PANELS",
+    "MEASUREMENT_METHODS",
     "InstrumentUncertaintyConfig",
     "DaqConfig",
     "PressureChannelConfig",
+    "PulseTransducerConfig",
+    "PulseTransducersConfig",
+    "ReservoirConfig",
+    "ReservoirsConfig",
     "PressureCalibrationConfig",
     "FlowmeterConfig",
     "TemperatureConfig",
@@ -137,7 +150,22 @@ class GaspermConfig(_Base):
 
     @model_validator(mode="after")
     def _selected_flowmeter_exists(self) -> GaspermConfig:
-        """Catch a bad meter name at load, not three minutes into a run."""
+        """Catch a bad meter name at load, not three minutes into a run.
+
+        Skipped entirely for a pulse-decay run: no meter is read, and a rig
+        built only for pulse decay legitimately has none defined. Whether a
+        meter is required depends on ``run.method``, which is why this check
+        lives here rather than on ``HardwareConfig``.
+        """
+        if self.run.method == "pulse_decay":
+            return self
+        if not self.hardware.flowmeters:
+            raise ValueError(
+                "hardware.flowmeters is empty and run.method is 'steady_state', "
+                "which measures flow. Define at least one meter, e.g.\n"
+                "  flowmeters:\n    low_range:\n      channel: ai2\n      flow_max: 500.0\n"
+                "or switch the run to method: pulse_decay, which reads no meter."
+            )
         self.hardware.resolve_flowmeter(self.run.flowmeter)
         return self
 
@@ -395,11 +423,21 @@ def experiment_metadata(config: GaspermConfig) -> ExperimentMetadata:
     """Flatten the metadata every run should be traceable by."""
     sample = config.sample
     run = config.run
-    meter_name, meter = config.hardware.resolve_flowmeter(run.flowmeter)
+    # A pulse-decay rig may have no meter at all, and this function is on that
+    # path twice -- from summarize_run and from RunWriter.write_metadata -- so
+    # it must not be the thing that fails the run.
+    meter_name, meter_channel, meter_range = "", "", ""
+    if run.method != "pulse_decay":
+        try:
+            meter_name, meter = config.hardware.resolve_flowmeter(run.flowmeter)
+            meter_channel = meter.channel
+            meter_range = f"{meter.flow_min:g}-{meter.flow_max:g} {meter.unit}"
+        except ValueError:
+            pass
     return ExperimentMetadata(
         flowmeter=meter_name,
-        flowmeter_channel=meter.channel,
-        flowmeter_range=f"{meter.flow_min:g}-{meter.flow_max:g} {meter.unit}",
+        flowmeter_channel=meter_channel,
+        flowmeter_range=meter_range,
         operator=run.operator,
         institution=run.institution,
         project=run.project,
@@ -431,6 +469,7 @@ def experiment_metadata(config: GaspermConfig) -> ExperimentMetadata:
 # --------------------------------------------------------------------------
 
 _SUPPORTED_PRESSURE = ", ".join(sorted(units.SUPPORTED_PRESSURE_UNITS))
+_SUPPORTED_VOLUME = ", ".join(sorted(units.SUPPORTED_VOLUME_UNITS))
 
 
 def render_hardware_yaml(config: GaspermConfig) -> str:
@@ -451,6 +490,31 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         "pressure_calibration": (
             "Each channel is added to the DAQ task with its own min_val/max_val, so\n"
             "the 0-5 V transducers and the 0-10 V flowmeter never share a range."
+        ),
+        "reservoirs": (
+            "The two CLOSED vessels either side of the plug. Only read when a run\n"
+            "sets method: pulse_decay.\n"
+            "DEAD volume, not nameplate volume: the vessel plus every cm3 of tubing,\n"
+            "transducer port and valve internal volume up to the plug face.\n"
+            "Permeability is directly proportional to this number, so the tubing you\n"
+            "leave out goes straight into the result -- it is the largest systematic\n"
+            "in the method. Measure it by gas expansion against a reference vessel.\n"
+            "The decay rate is set by V1*V2/(V1+V2), which the SMALLER vessel\n"
+            "dominates, so enlarging only the big one barely changes the run time."
+        ),
+        "reservoirs.correlation": (
+            "Two vessels calibrated the same way share a systematic error. Unlike\n"
+            "the P1/P2 case, BOTH volume sensitivities are positive, so a positive\n"
+            "correlation INCREASES the combined uncertainty."
+        ),
+        "pulse_transducers": (
+            "Dedicated pressure pair for pulse decay, on their own analog inputs.\n"
+            "null reuses the inlet/outlet pair -- which works, but a pulse is often\n"
+            "smaller than a high-range transducer's own uncertainty, and 'collect'\n"
+            "will say so at startup. A gain or zero error common to both cancels out\n"
+            "of the decay rate entirely (alpha is a rate, and the fit absorbs a\n"
+            "constant offset); what matters is their short-term NOISE, which sets\n"
+            "the scatter of the fit."
         ),
         "pressure_calibration.inlet.uncertainty": (
             "Type B uncertainty (GUM 4.3). 'a' is the specification limit; the\n"
@@ -490,6 +554,12 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         "pressure_calibration.outlet.unit": "independent of inlet: may be 'bar' here",
         "pressure_calibration.outlet.reading_type": "gauge adds run.atmospheric_pressure",
         "default_flowmeter": "used when run.yaml leaves 'flowmeter' null",
+        "reservoirs.upstream.volume": "DEAD volume: vessel + tubing + ports + valves",
+        "reservoirs.upstream.unit": f"one of: {_SUPPORTED_VOLUME}",
+        "reservoirs.upstream.method": "gas expansion | water fill | CAD",
+        "reservoirs.downstream.volume": "the smaller vessel dominates the decay rate",
+        "reservoirs.downstream.unit": f"one of: {_SUPPORTED_VOLUME}",
+        "reservoirs.downstream.method": "gas expansion | water fill | CAD",
         "temperature.parse_pattern": "'{value}' marks the number; null = first float",
         "temperature.conversion_time_s": "DS18B20: 0.75 s at 12-bit, 0.19 s at 9-bit",
         "temperature.warmup_timeout_s": "startup wait for the probe's first reading",
@@ -620,7 +690,31 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "the steady-state window; Type B from the specs in hardware.yaml and\n"
             "the caliper figures in sample.yaml."
         ),
+        "method": (
+            "How this run measures permeability.\n"
+            "  steady_state -- drive gas through the plug and measure the flow\n"
+            "                  (the compressible Darcy equation).\n"
+            "  pulse_decay  -- apply a small pulse to a closed upstream vessel and\n"
+            "                  watch P1-P2 decay into a closed downstream one. NO\n"
+            "                  flow is measured, which is what makes it usable below\n"
+            "                  about ten microdarcy where a flowmeter sized for a\n"
+            "                  normal plug reports only its own zero offset.\n"
+            "Pulse decay requires downstream_pressure: measured, reads no flowmeter,\n"
+            "and takes its vessel volumes from hardware.reservoirs."
+        ),
         "output_dir": "Output.",
+        "pulse_decay": (
+            "Only read when method is pulse_decay.\n"
+            "The fit runs from fit_start_fraction down to fit_end_fraction of the\n"
+            "pulse. The top is skipped for two independent reasons: the valve\n"
+            "transient, and the fact that a single exponential is asymptotic rather\n"
+            "than exact -- with finite sample storage the higher decay modes are\n"
+            "still dying, and including them biases the rate high. The bottom is\n"
+            "skipped because late samples are noise-dominated: on this rig, running\n"
+            "to dP/dP0 = 0.05 takes four times as long as 0.5 and is slightly WORSE.\n"
+            "The run continues a little past the window (stop_below_fraction) so\n"
+            "there is data below it to pin the fitted offset."
+        ),
         "plot": (
             "The optional live window, only opened by 'collect --plot'. Each listed\n"
             "quantity gets its own panel, stacked in this order, and the panels the\n"
@@ -652,6 +746,18 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "uncertainty.max_component_contribution": (
             "warn when one input is worth this fraction of k"
         ),
+        "method": "steady_state | pulse_decay",
+        "pulse_decay.min_pulse_pressure": "smallest differential that counts as a pulse",
+        "pulse_decay.max_pulse_fraction": "largest dP0/P_mean the linearisation allows",
+        "pulse_decay.stop_below_fraction": "end the run at this dP/dP0",
+        "pulse_decay.max_decay_s": "null = wait indefinitely",
+        "pulse_decay.fit_start_fraction": "fit from this fraction of dP0 ...",
+        "pulse_decay.fit_end_fraction": "... down to this one",
+        "pulse_decay.fit_bin_s": "bin before fitting; null = every sample",
+        "pulse_decay.fit_offset": "two transducers have a zero mismatch; keep this on",
+        "pulse_decay.storage_correction": "auto | brace | dicker_smits",
+        "pulse_decay.max_storage_ratio": "warn above this V_pore/V on the Brace form",
+        "pulse_decay.expected_permeability": "planning only; never enters a result",
         "averaging_window_s": "live display only; the result uses the steady window",
         "plot.panels": "one stacked panel each, top to bottom",
         "plot.window_s": "trailing seconds to show; null = whole run from t0",
@@ -822,12 +928,22 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
             "differential. Check the value and its unit."
         )
 
+    pulse_decay = config.run.method == "pulse_decay"
+
     # The active meter, for the checks below. Which one is in use is reported
-    # prominently by ``collect`` itself, so it needs no warning here.
-    _, meter = config.hardware.resolve_flowmeter(config.run.flowmeter)
+    # prominently by ``collect`` itself, so it needs no warning here. A
+    # pulse-decay rig may have no meter at all.
+    meter = None
+    if not pulse_decay:
+        _, meter = config.hardware.resolve_flowmeter(config.run.flowmeter)
+    else:
+        problems.extend(_pulse_decay_problems(config))
+        warnings.extend(_pulse_decay_warnings(config))
 
     # -- analysis settings ------------------------------------------------
-    if not config.run.steady_state.enabled:
+    if pulse_decay:
+        pass  # the pulse criteria are checked above; steady state does not apply
+    elif not config.run.steady_state.enabled:
         warnings.append(
             "run.steady_state.enabled is false. Permeability will be reported from the "
             "trailing averaging window without any check that the rig had equilibrated, "
@@ -848,8 +964,9 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
         specs = [
             config.hardware.pressure_calibration.inlet.uncertainty,
             config.hardware.pressure_calibration.outlet.uncertainty,
-            meter.uncertainty,
         ]
+        if meter is not None:
+            specs.append(meter.uncertainty)
         if all(spec.kind == "none" or spec.value == 0.0 for spec in specs):
             warnings.append(
                 "Every instrument uncertainty in hardware.yaml is zero, so the GUM "
@@ -863,3 +980,177 @@ def validate_for_collect(config: GaspermConfig) -> list[str]:
             + "\n".join(f"  - {p}" for p in problems)
         )
     return warnings
+
+
+#: Vessel dead volumes outside this range are almost certainly a unit slip.
+_PLAUSIBLE_VOLUME_CM3 = (0.1, 1.0e5)
+
+
+def _pulse_decay_problems(config: GaspermConfig) -> list[str]:
+    """Fatal pulse-decay configuration errors."""
+    problems: list[str] = []
+    pulse = config.run.pulse_decay
+    reservoirs = config.hardware.reservoirs
+
+    for side in ("upstream", "downstream"):
+        vessel = getattr(reservoirs, side)
+        volume = vessel.volume_cm3
+        if not math.isfinite(volume) or volume <= 0.0:
+            problems.append(
+                f"hardware.reservoirs.{side}.volume is not a usable dead volume "
+                f"({vessel.volume} {vessel.unit})."
+            )
+
+    if pulse.storage_correction == "dicker_smits" and (
+        config.sample.porosity_fraction is None
+    ):
+        problems.append(
+            "run.pulse_decay.storage_correction is 'dicker_smits' but "
+            f"sample.porosity_fraction is unrecorded for {config.sample.id!r}. The "
+            "correction depends on the plug's pore volume, so it cannot be evaluated. "
+            "Record the porosity, or set storage_correction: auto to fall back to the "
+            "zero-storage form with a warning."
+        )
+    return problems
+
+
+def _pulse_decay_warnings(config: GaspermConfig) -> list[str]:
+    """Non-fatal pulse-decay advice, including how long the run will take."""
+    from gasperm import pulse_decay as pulse_physics
+
+    warnings: list[str] = []
+    pulse = config.run.pulse_decay
+    reservoirs = config.hardware.reservoirs
+    geometry = config.geometry()
+
+    # -- the vessels ------------------------------------------------------
+    for side in ("upstream", "downstream"):
+        volume = getattr(reservoirs, side).volume_cm3
+        low, high = _PLAUSIBLE_VOLUME_CM3
+        if volume < low or volume > high:
+            warnings.append(
+                f"hardware.reservoirs.{side}.volume is {volume:g} cm3, which is "
+                f"outside the plausible {low:g}-{high:g} cm3 range; check "
+                f"reservoirs.{side}.unit."
+            )
+
+    # -- the storage correction -------------------------------------------
+    porosity = config.sample.porosity_fraction
+    if pulse.storage_correction != "dicker_smits" and porosity is not None:
+        pore = pulse_physics.pore_volume_cm3(
+            area_cm2=geometry.area_cm2,
+            length_cm=geometry.length_cm,
+            porosity_fraction=porosity,
+        )
+        a1, a2 = pulse_physics.storage_ratios(
+            pore_volume_cm3=pore,
+            upstream_volume_cm3=reservoirs.upstream.volume_cm3,
+            downstream_volume_cm3=reservoirs.downstream.volume_cm3,
+        )
+        if pulse.storage_correction == "brace" and max(a1, a2) > pulse.max_storage_ratio:
+            theta = pulse_physics.first_storage_root(a1, a2)
+            understated = (a1 + a2) / theta**2
+            warnings.append(
+                f"The plug's pore volume is {pore:.2f} cm3, which is "
+                f"{max(a1, a2):.1%} of the smaller vessel, but "
+                "run.pulse_decay.storage_correction is 'brace'. The zero-storage form "
+                f"will read about {understated - 1.0:.1%} low. Use 'auto' or "
+                "'dicker_smits'."
+            )
+    elif pulse.storage_correction == "auto" and porosity is None:
+        warnings.append(
+            f"sample.porosity_fraction is unrecorded for {config.sample.id!r}, so the "
+            "Dicker-Smits storage correction cannot be applied and the zero-storage "
+            "form will be used. On small vessels that reads several percent low, and "
+            "the error is systematic across the whole Klinkenberg series."
+        )
+
+    # -- can the transducers even see the pulse? --------------------------
+    if config.hardware.pulse_transducers is not None:
+        channel = config.hardware.pulse_transducers.upstream
+        source = "hardware.pulse_transducers.upstream"
+    else:
+        channel = config.hardware.pressure_calibration.inlet
+        source = "pressure_calibration.inlet"
+        warnings.append(
+            "hardware.pulse_transducers is null, so the pulse will be read by the "
+            "steady-state inlet/outlet pair. That works, but check the resolution "
+            "warning below -- a pair sized for the pore pressure is often far too "
+            "coarse for the pulse."
+        )
+    u_channel_atm = units.to_atm(
+        channel.uncertainty.standard_uncertainty(channel.value_max, channel.full_scale),
+        channel.unit,
+    )
+    pulse_atm = pulse.min_pulse_pressure_atm
+    if u_channel_atm > 0.0 and pulse_atm < 5.0 * u_channel_atm:
+        warnings.append(
+            f"A {pulse.min_pulse_pressure:g} {pulse.pulse_pressure_unit} pulse is "
+            f"{pulse_atm / u_channel_atm:.1f}x the standard uncertainty of {source} "
+            f"({units.from_atm(u_channel_atm, pulse.pulse_pressure_unit):.3g} "
+            f"{pulse.pulse_pressure_unit} on a "
+            f"{channel.value_max:g} {channel.unit} full scale). A constant gain or "
+            "zero error cancels out of the decay rate, but the transducer's NOISE "
+            "sets the fit scatter -- expect u(alpha) to dominate the budget. A "
+            "lower-range or differential transducer is the fix."
+        )
+
+    # -- how long is this going to take? ----------------------------------
+    expected = pulse.expected_permeability_darcy
+    if expected is not None:
+        warnings.extend(_predicted_decay_notes(config, expected))
+    return warnings
+
+
+def _predicted_decay_notes(config: GaspermConfig, expected_darcy: float) -> list[str]:
+    """Say how long the run will take before it is started, not after."""
+    from gasperm import pulse_decay as pulse_physics
+
+    reservoirs = config.hardware.reservoirs
+    geometry = config.geometry()
+    porosity = config.sample.porosity_fraction
+    # A representative state: the mean pore pressure is not known until the rig
+    # is charged, so use the ambient reference and the ideal-gas relation. This
+    # only ever sizes an expectation, never a result.
+    viscosity_cp = 0.0178
+    compressibility_per_atm = 1.0 / max(config.run.atmospheric_pressure_atm, 1e-9)
+
+    shared = dict(
+        permeability_darcy=expected_darcy,
+        viscosity_cp=viscosity_cp,
+        gas_compressibility_per_atm=compressibility_per_atm,
+        length_cm=geometry.length_cm,
+        area_cm2=geometry.area_cm2,
+        upstream_volume_cm3=reservoirs.upstream.volume_cm3,
+        downstream_volume_cm3=reservoirs.downstream.volume_cm3,
+    )
+    try:
+        if porosity is not None and config.run.pulse_decay.storage_correction != "brace":
+            alpha = pulse_physics.dicker_smits_decay_rate_per_s(
+                porosity_fraction=porosity, **shared
+            )
+        else:
+            alpha = pulse_physics.brace_decay_rate_per_s(**shared)
+    except pulse_physics.PulseDecayInputError:
+        return []
+    if alpha <= 0.0:
+        return []
+
+    # Reported per atm of mean pore pressure. The gas compressibility is very
+    # nearly 1/P, so the whole decay scales as 1/P_mean exactly -- quoting one
+    # number at an assumed pressure would be a guess, while quoting the scaling
+    # is exact and lets the operator divide by whatever they actually charge to.
+    reference_atm = config.run.atmospheric_pressure_atm
+    tau_h = 1.0 / alpha / 3600.0 * reference_atm
+    stop = config.run.pulse_decay.stop_below_fraction
+    run_h = math.log(1.0 / stop) / alpha / 3600.0 * reference_atm
+    return [
+        f"At the expected {config.run.pulse_decay.expected_permeability:g} "
+        f"{config.run.pulse_decay.expected_permeability_unit} with V1 = "
+        f"{reservoirs.upstream.volume_cm3:g} cm3 and V2 = "
+        f"{reservoirs.downstream.volume_cm3:g} cm3, the decay time constant is about "
+        f"{tau_h:.1f} h / P_mean[atm] and the run reaches dP/dP0 = {stop:g} after "
+        f"about {run_h:.1f} h / P_mean[atm]. So at 10 atm mean pore pressure, "
+        f"roughly {tau_h / 10.0:.1f} h and {run_h / 10.0:.1f} h. The decay scales as "
+        "1/P_mean, so charging higher is the cheapest way to shorten it."
+    ]

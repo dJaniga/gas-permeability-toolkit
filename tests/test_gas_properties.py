@@ -21,6 +21,7 @@ from gasperm.gas_properties import (
     compressibility_factor,
     density_kg_m3,
     dynamic_viscosity_pa_s,
+    isothermal_compressibility_per_pa,
     validate_gas_name,
 )
 
@@ -163,6 +164,67 @@ class TestViscosityTemperatureSensitivity:
     def test_a_fixed_provider_has_no_temperature_sensitivity(self):
         provider = FixedPropertyProvider("Nitrogen", 0.0178)
         assert provider.viscosity_temperature_exponent(STP_K, STP_PA) == 0.0
+
+
+class TestIsothermalCompressibility:
+    """The quantity pulse decay measures permeability through.
+
+    Not the Z factor: this is ``-1/V (dV/dP)_T``, in 1/Pa from CoolProp. For a
+    near-ideal gas it is ``1/P``, which is the check that catches a unit slip --
+    a wrong factor here would be off by 1e5, not by a percent.
+    """
+
+    def test_nitrogen_at_stp_is_one_over_the_pressure(self):
+        c = isothermal_compressibility_per_pa("Nitrogen", 298.15, 101_325.0)
+        assert c == pytest.approx(1.0 / 101_325.0, rel=0.01)
+
+    @pytest.mark.parametrize("pressure_atm", [1.0, 5.0, 10.0, 30.0])
+    def test_it_tracks_one_over_p_across_the_klinkenberg_range(self, pressure_atm: float):
+        """It varies sixfold from 5 to 30 atm, so it cannot be a constant."""
+        pressure_pa = pressure_atm * units.ATM_IN_PA
+        c_per_atm = units.per_pa_to_per_atm(
+            isothermal_compressibility_per_pa("Nitrogen", 295.15, pressure_pa)
+        )
+        assert c_per_atm == pytest.approx(1.0 / pressure_atm, rel=0.01)
+
+    def test_the_provider_reports_it_in_per_atm(self):
+        provider = CoolPropProvider("Nitrogen")
+        state = provider.state_at(295.15, 10.0 * units.ATM_IN_PA)
+        assert state.isothermal_compressibility_per_atm == pytest.approx(0.1, rel=0.01)
+
+    def test_the_convenience_accessor_agrees(self):
+        provider = CoolPropProvider("Nitrogen")
+        assert provider.compressibility_per_atm_at(
+            295.15, 10.0 * units.ATM_IN_PA
+        ) == pytest.approx(0.1, rel=0.01)
+
+    def test_a_non_positive_pressure_is_refused(self):
+        provider = CoolPropProvider("Nitrogen")
+        with pytest.raises(ValueError, match="absolute and positive"):
+            provider.compressibility_per_atm_at(295.15, 0.0)
+
+    def test_the_pressure_exponent_is_about_minus_one(self):
+        """d ln c / d ln P, the sensitivity of k to the mean pore pressure."""
+        provider = CoolPropProvider("Nitrogen")
+        exponent = provider.compressibility_pressure_exponent(
+            295.15, 10.0 * units.ATM_IN_PA
+        )
+        assert exponent == pytest.approx(-1.0, abs=0.02)
+
+    def test_probing_the_exponent_does_not_disturb_the_cache(self):
+        provider = CoolPropProvider("Nitrogen")
+        before = provider.state_at(295.15, 10.0 * units.ATM_IN_PA)
+        provider.compressibility_pressure_exponent(295.15, 10.0 * units.ATM_IN_PA)
+        assert provider.state_at(295.15, 10.0 * units.ATM_IN_PA) is before
+
+    def test_the_fixed_provider_uses_the_ideal_relation_at_the_asked_pressure(self):
+        """A frozen c would be a smooth 6x error across a pressure series."""
+        provider = FixedPropertyProvider("Nitrogen", 0.0178)
+        for pressure_atm in (5.0, 30.0):
+            state = provider.state_at(295.15, pressure_atm * units.ATM_IN_PA)
+            assert state.isothermal_compressibility_per_atm == pytest.approx(
+                1.0 / pressure_atm, rel=1e-12
+            )
 
 
 class TestUncertaintyPassthrough:

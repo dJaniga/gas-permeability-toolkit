@@ -119,6 +119,102 @@ class TestLengthAndArea:
             units.circle_area_cm2(0.0)
 
 
+class TestVolume:
+    """Pulse-decay reservoir volumes. Internal unit is cm^3."""
+
+    @pytest.mark.parametrize(
+        "unit,expected_cm3",
+        [("cm3", 1.0), ("mL", 1.0), ("L", 1000.0), ("m3", 1.0e6), ("in3", 16.387_064)],
+    )
+    def test_volume_factors(self, unit: str, expected_cm3: float):
+        assert units.volume_to_cm3(1.0, unit) == pytest.approx(expected_cm3, rel=1e-12)
+
+    def test_a_millilitre_is_a_cubic_centimetre(self):
+        """Exact since the 1964 redefinition of the litre, not an approximation."""
+        assert units.volume_to_cm3(1.0, "mL") == units.volume_to_cm3(1.0, "cm3")
+
+    def test_a_cubic_inch_is_two_point_five_four_cubed(self):
+        assert units.volume_to_cm3(1.0, "in3") == pytest.approx(2.54**3, rel=1e-15)
+
+    @pytest.mark.parametrize("unit", sorted(units.SUPPORTED_VOLUME_UNITS))
+    def test_round_trip(self, unit: str):
+        value = 76.5
+        assert units.volume_from_cm3(
+            units.volume_to_cm3(value, unit), unit
+        ) == pytest.approx(value, rel=1e-12)
+
+    @pytest.mark.parametrize("alias", ["cc", "CM3", "cm^3", "litre", "in^3"])
+    def test_aliases_are_accepted(self, alias: str):
+        assert units.volume_to_cm3(1.0, alias) > 0.0
+
+    def test_unknown_unit_is_rejected(self):
+        with pytest.raises(ValueError, match="gallon"):
+            units.volume_to_cm3(1.0, "gallon")
+
+    def test_the_rig_vessels_convert(self):
+        """400 cm3 upstream and 75 cm3 downstream, however they are written."""
+        assert units.volume_to_cm3(0.4, "L") == pytest.approx(400.0)
+        assert units.volume_to_cm3(75.0, "mL") == pytest.approx(75.0)
+
+
+class TestCompressibility:
+    """Reciprocal pressure. Internal unit is 1/atm."""
+
+    def test_per_pa_to_per_atm_is_the_atm_in_pa_factor(self):
+        # c = 1e-5 /Pa is 1e-5 * 101325 = 1.01325 /atm.
+        assert units.per_pa_to_per_atm(1e-5) == pytest.approx(1.013_25, rel=1e-12)
+
+    def test_per_atm_is_the_identity(self):
+        assert units.compressibility_to_per_atm(0.1, "1/atm") == pytest.approx(0.1)
+
+    @pytest.mark.parametrize(
+        "unit,expected_per_atm",
+        [
+            ("1/Pa", 101_325.0),
+            ("1/kPa", 101.325),
+            ("1/MPa", 0.101_325),
+            ("1/bar", 1.013_25),
+            ("1/atm", 1.0),
+        ],
+    )
+    def test_factors(self, unit: str, expected_per_atm: float):
+        assert units.compressibility_to_per_atm(1.0, unit) == pytest.approx(
+            expected_per_atm, rel=1e-12
+        )
+
+    @pytest.mark.parametrize("unit", sorted(units.SUPPORTED_COMPRESSIBILITY_UNITS))
+    def test_round_trip(self, unit: str):
+        value = 0.0975
+        assert units.compressibility_from_per_atm(
+            units.compressibility_to_per_atm(value, unit), unit
+        ) == pytest.approx(value, rel=1e-12)
+
+    @pytest.mark.parametrize("spelling", ["1/kPa", "kPa^-1", "kPa-1", "per_kPa", "1/KPA"])
+    def test_spellings_agree(self, spelling: str):
+        assert units.compressibility_to_per_atm(1.0, spelling) == pytest.approx(101.325)
+
+    def test_a_bare_pressure_unit_is_rejected(self):
+        """'atm' and '1/atm' differ by 1e5 at a typical pore pressure."""
+        with pytest.raises(ValueError, match="reciprocal pressure"):
+            units.compressibility_to_per_atm(1.0, "atm")
+
+    def test_unknown_unit_is_rejected(self):
+        with pytest.raises(ValueError, match="torr"):
+            units.compressibility_to_per_atm(1.0, "1/torr")
+
+    def test_the_family_tracks_the_pressure_units(self):
+        """No second constant table: adding a pressure unit extends this one."""
+        assert units.SUPPORTED_COMPRESSIBILITY_UNITS == {
+            f"1/{unit}" for unit in units.SUPPORTED_PRESSURE_UNITS
+        }
+
+    def test_ideal_gas_compressibility_at_ten_atm(self):
+        """c = 1/P for an ideal gas: 10 atm -> 0.1 /atm, however written."""
+        assert units.compressibility_to_per_atm(
+            1.0 / units.to_pa(10.0, "atm"), "1/Pa"
+        ) == pytest.approx(0.1, rel=1e-12)
+
+
 class TestViscosity:
     def test_pa_s_to_cp(self):
         # Water at 20 C is ~1.002e-3 Pa*s, i.e. ~1.002 cP -- the definition of

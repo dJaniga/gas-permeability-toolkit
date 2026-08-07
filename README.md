@@ -410,12 +410,213 @@ Three guards, all after the fact, all reported in the run summary or the fit:
   makes already-recorded runs self-diagnosing: re-run `gasperm klinkenberg
   --sample <id>` and it will say so.
 
-### What it does not do
+### The real fix is a different method
 
-The outlet vents to atmosphere, so `P̄ ≈ P1/2` — mean pressure cannot be varied
-independently of the differential without a back-pressure regulator. And below
-about 10 µD the standard method is pulse decay, which is a different acquisition
-path entirely. Neither is implemented here.
+Those guards tell you the steady-state measurement is not a measurement. They
+cannot make it one — below about 10 µD no flowmeter sized for a normal plug can
+resolve the flow. **Use pulse decay instead**, which measures no flow at all.
+
+One caveat that remains in steady-state mode: the outlet vents to atmosphere, so
+`P̄ ≈ P1/2` — mean pressure cannot be varied independently of the differential
+without a back-pressure regulator. Pulse decay does not have this problem, since
+both vessels sit at the same mean pressure.
+
+## Pulse decay
+
+```bash
+gasperm collect --sample samples/core-041.yaml --method pulse_decay
+```
+
+A core plug between two **closed** vessels, upstream `V1` and downstream `V2`,
+both at pore pressure `P̄`. A small pulse `dP0` is applied to `V1`; the
+differential decays through the plug, and permeability comes from the decay
+*rate*. **No flow is measured**, which is what makes it work at a microdarcy.
+
+Set `method: pulse_decay` in `run.yaml` to make it the default for a rig.
+
+### The physics
+
+Two models, both implemented and both exact in the package's CGS-Darcy units —
+`k` in darcy, `A` in cm², `µ` in cP, `L` in cm, `V` in cm³ and gas
+compressibility in **1/atm** give `alpha` in 1/s with no conversion constant at
+all.
+
+**Zero storage (Brace et al. 1968)**, when the plug's pore volume is small
+against the vessels:
+
+```
+alpha = k*A / (mu*c_g*L) * (1/V1 + 1/V2)
+```
+
+**Sample storage (Dicker & Smits 1988)**, when it is not — which is the usual
+case once the vessels are small enough to give a workable run time. With
+`V_p = phi*A*L`, `a1 = V_p/V1`, `a2 = V_p/V2` and `theta_1` the first root of
+the storage equation:
+
+```
+alpha = theta_1^2 * k / (phi*mu*c_g*L^2)
+```
+
+Applied automatically whenever `sample.porosity_fraction` is recorded
+(`storage_correction: auto`). Without it the zero-storage form reads **low** —
+by 1.8 % on the shipped 400/75 cm³ vessels, and by 20 % on 5 cm³ ones.
+
+### How long a run takes
+
+`k` and `tau` are inversely proportional, and `tau` also scales as `1/P̄`. For a
+38.1 × 50 mm plug at 10 % porosity in nitrogen at 10 atm, on 400/75 cm³ vessels:
+
+| k | time constant | run to dP/dP₀ = 0.4 |
+|---|---|---|
+| 1 µD | 13.9 h | 12.8 h |
+| 3 µD | 4.6 h | 4.3 h |
+| 10 µD | 1.4 h | 1.3 h |
+
+`collect` prints this prediction at startup when
+`pulse_decay.expected_permeability` is set — nobody should discover a
+fourteen-hour run by starting one. Two levers shorten it: **charge to a higher
+pore pressure** (exactly proportional), and **shrink the vessels**. Note the
+decay rate is set by `V1·V2/(V1+V2)`, which the *smaller* vessel dominates —
+enlarging only the big one changes almost nothing.
+
+**Running the decay to 5 % is wasted time, and slightly worse.** Simulated fits
+at 1 µD, treating the full 0.25 % FS accuracy spec as scatter:
+
+| stop at dP/dP₀ | run length | σ(α)/α | bias |
+|---|---|---|---|
+| 0.9 | 1.5 h | 7.4 % | +2.1 % |
+| 0.7 | 5.0 h | 2.1 % | +0.1 % |
+| **0.5** | **9.7 h** | **0.9 %** | −0.1 % |
+| 0.3 | 16.8 h | 0.5 % | +0.1 % |
+| 0.05 | 41.8 h | 0.7 % | +3.2 % |
+
+Late samples are noise-dominated, so they add scatter rather than information.
+Hence the shipped fit window of 0.90 → 0.50 and a stop at 0.40, not the
+textbook 0.05.
+
+### Configuration
+
+The vessels and the transducers are bench hardware, so they live in
+`hardware.yaml`:
+
+```yaml
+reservoirs:
+  upstream:
+    volume: 400.0     # DEAD volume: vessel + tubing + ports + valves
+    unit: cm3
+    method: gas expansion
+  downstream:
+    volume: 75.0
+    unit: cm3
+  correlation: 0.0    # both sensitivities are POSITIVE, unlike P1/P2
+
+pulse_transducers:    # null reuses the inlet/outlet pair
+  upstream:
+    channel: ai4
+    volts_max: 10.0
+    value_max: 100.0
+    unit: bar
+  downstream:
+    channel: ai5
+    volts_max: 10.0
+    value_max: 100.0
+    unit: bar
+```
+
+**Dead volume, not nameplate volume**: the vessel plus every cm³ of tubing,
+transducer port and valve internal volume up to the plug face. Permeability is
+directly proportional to it, so the tubing you leave out goes straight into the
+result. It is the largest systematic in the method — measure it by gas expansion
+against a reference vessel.
+
+The run-level knobs live in `run.yaml`:
+
+```yaml
+method: pulse_decay
+pulse_decay:
+  min_pulse_pressure: 20.0
+  pulse_pressure_unit: kPa
+  max_pulse_fraction: 0.10     # largest dP0/P_mean the linearisation allows
+  stop_below_fraction: 0.40    # end the run here
+  fit_start_fraction: 0.90     # fit from here ...
+  fit_end_fraction: 0.50       # ... down to here
+  fit_bin_s: 1.0               # bin before fitting; null = every sample
+  fit_offset: true
+  storage_correction: auto     # auto | brace | dicker_smits
+  expected_permeability: 1.0
+  expected_permeability_unit: uD
+```
+
+Pulse decay requires `downstream_pressure: measured` — a declared constant P2
+asserts the outlet is open to something, which contradicts a closed vessel.
+`collect` refuses the combination at config load, not three minutes in.
+
+### Sizing the transducers
+
+This is the decisive question, and it is the same trap as the flowmeter wearing
+different clothes. At 10 atm mean with a 101 kPa pulse:
+
+| | u(P) | as a fraction of the pulse |
+|---|---|---|
+| 0–68.95 MPa at 0.25 % FS | 99.5 kPa | **139 %** |
+| 0–100 bar at 0.25 % FS | 14.4 kPa | 20 % |
+
+`collect` warns at startup when the pulse is small against the transducer's
+specification. But note **what does and does not matter**: `alpha` is a *rate*,
+so a constant gain error leaves it unchanged and the fitted offset absorbs a
+constant zero error exactly. Transducer gain and zero — most of a datasheet
+accuracy figure — cancel out of this measurement. What does not cancel is their
+**noise**, which sets the scatter of the fit and appears directly as the Type A
+`u(alpha)` in the budget. A low-range or differential pair is the fix.
+
+### Reading the result
+
+```
+  method              pulse decay -- Dicker & Smits model
+  pulse               dP0 = 50.73 kPa at t = 1.0 s   (5.01% of P_mean)
+  decay fit           ACCEPTED   1.5-4.5 s, 590 pts
+                      alpha = 1.9991e-01 1/s +/- 0.31%,  tau = 5 s
+                      R^2 = 1.000000,  offset = +0.08093 kPa,  rho_1 = 0.11
+  vessels             V1 = 8 cm3, V2 = 8 cm3    a1 = 0.713, a2 = 0.713
+                      theta_1 = 1.1273   (the zero-storage form would read 10.8% low)
+```
+
+The fitted **offset** is the two transducers' zero mismatch; leaving it out of
+the model biases `alpha` low, by 5 % for a 0.5 kPa offset on a 50 kPa pulse and
+by 33 % for 5 kPa. `rho_1` is the lag-1 residual autocorrelation: consecutive
+DAQ samples are not independent, so the decay is binned before fitting and a
+`rho_1` still above `max_residual_autocorrelation` means `u(alpha)` is
+understated. Every run also writes `decay_fit.png` — the decay on a log axis
+with the fit over it, and the residuals below, where a leak or a thermal ramp
+shows as structure long before it shows in R².
+
+Pulse-decay runs feed `gasperm klinkenberg` exactly like steady-state ones, one
+run per mean pressure. Mixing the two methods in one regression is **refused**
+unless you pass `--allow-mixed-methods`: steady-state `k_g` is averaged over a
+large P1→P2 span while pulse-decay `k_g` is at essentially a single pressure, so
+a systematic offset between the methods would masquerade as slippage and land
+in `b`.
+
+### Before trusting any of it: the leak test
+
+Blank or bypass the plug, pressurise both vessels to `P̄`, close everything, and
+record for at least 3τ. Any decay in that configuration is the system's
+leak-plus-thermal rate, and it must be **under 5 %** of the rate you later
+attribute to the sample. Without this the whole measurement is a leak
+measurement — it is the pulse-decay counterpart of checking the flowmeter's zero
+with the inlet closed.
+
+Two more checks worth running once: three pulses at one `P̄` should agree within
+their combined `u(alpha)` (a monotone walk means the plug is still equilibrating
+from the previous step), and the observed `tau` should match the one predicted
+from the recovered `k`. Much shorter means a leak; much longer means a blocked
+line or a closed valve.
+
+A 0.1 K room swing moves a closed vessel by `dP/P = dT/T` — 0.34 kPa at 10 atm,
+drifting over hours, which looks exactly like a slow exponential. The fitted
+offset absorbs a constant thermal bias but not a ramp, so `collect` compares the
+temperature drift across the fit window against the fit's own residuals and says
+so when they are comparable.
 
 ## A slow temperature probe
 

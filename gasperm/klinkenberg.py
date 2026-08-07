@@ -158,6 +158,7 @@ def fit_klinkenberg(
     coverage_probability: float = 0.95,
     allow_mixed_samples: bool = False,
     allow_mixed_conditions: bool = False,
+    allow_mixed_methods: bool = False,
 ) -> KlinkenbergResult:
     """Regress ``k_g`` against ``1 / P_mean`` and recover ``k_L`` and ``b``.
 
@@ -225,6 +226,27 @@ def fit_klinkenberg(
             "pressure is this regression's own x-axis -- so mixing conventions "
             "regresses points that are not on comparable axes. Use runs measured the "
             "same way, or pass --allow-mixed-conditions if you genuinely mean to."
+        )
+
+    methods = {p.method for p in points if p.method}
+    if len(methods) > 1 and not allow_mixed_methods:
+        from gasperm.storage import describe_method
+
+        listing = "\n".join(
+            f"  {p.label or 'unlabelled'}: {describe_method(p.method)}"
+            for p in points
+            if p.method
+        )
+        raise ValueError(
+            "These runs did not all use the same measurement method:\n"
+            f"{listing}\n"
+            "Steady-state k_g is averaged over a large P1-to-P2 span while pulse-decay "
+            "k_g is at essentially a single pressure with dP -> 0, so 'mean pressure' "
+            "does not mean quite the same thing on the two x-axes. Worse, any "
+            "systematic offset between the methods -- exactly what you would want to "
+            "detect -- would masquerade as slippage and land in b. Regress each method "
+            "separately and compare the two k_L values, or pass --allow-mixed-methods "
+            "if you genuinely mean to combine them."
         )
 
     inverse_pressure = np.array([p.inverse_mean_pressure for p in points], dtype=float)
@@ -336,6 +358,16 @@ def fit_klinkenberg(
             + ", ".join(sorted(describe_convention(c) for c in conventions))
             + "), which was explicitly allowed. Mean pressure is computed from P2, so "
             "these points are not on strictly comparable axes."
+        )
+    if len(methods) > 1:
+        from gasperm.storage import describe_method
+
+        warnings.append(
+            "The runs used different measurement methods ("
+            + ", ".join(sorted(describe_method(m) for m in methods))
+            + "), which was explicitly allowed. Any systematic offset between the "
+            "methods will appear here as slippage rather than as the disagreement it "
+            "is, so b in particular should not be trusted."
         )
 
     # b = slope / intercept. Guard the division rather than emitting inf.

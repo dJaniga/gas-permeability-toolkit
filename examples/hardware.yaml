@@ -111,6 +111,52 @@ flowmeters:
       source: mass flowmeter datasheet
 default_flowmeter: low_range                  # used when run.yaml leaves 'flowmeter' null
 
+# The two CLOSED vessels either side of the plug. Only read when a run
+# sets method: pulse_decay.
+# DEAD volume, not nameplate volume: the vessel plus every cm3 of tubing,
+# transducer port and valve internal volume up to the plug face.
+# Permeability is directly proportional to this number, so the tubing you
+# leave out goes straight into the result -- it is the largest systematic
+# in the method. Measure it by gas expansion against a reference vessel.
+# The decay rate is set by V1*V2/(V1+V2), which the SMALLER vessel
+# dominates, so enlarging only the big one barely changes the run time.
+reservoirs:
+  upstream:
+    volume: 400.0                             # DEAD volume: vessel + tubing + ports + valves
+    unit: cm3                                 # one of: L, cm3, in3, m3, mL
+    method: ''                                # gas expansion | water fill | CAD
+    uncertainty:
+      kind: percent_reading
+      value: 1.0
+      distribution: rectangular
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: vessel calibration
+  downstream:
+    volume: 75.0                              # the smaller vessel dominates the decay rate
+    unit: cm3                                 # one of: L, cm3, in3, m3, mL
+    method: ''                                # gas expansion | water fill | CAD
+    uncertainty:
+      kind: percent_reading
+      value: 1.0
+      distribution: rectangular
+      coverage_factor: 2.0
+      degrees_of_freedom: null
+      source: vessel calibration
+  # Two vessels calibrated the same way share a systematic error. Unlike
+  # the P1/P2 case, BOTH volume sensitivities are positive, so a positive
+  # correlation INCREASES the combined uncertainty.
+  correlation: 0.0
+
+# Dedicated pressure pair for pulse decay, on their own analog inputs.
+# null reuses the inlet/outlet pair -- which works, but a pulse is often
+# smaller than a high-range transducer's own uncertainty, and 'collect'
+# will say so at startup. A gain or zero error common to both cancels out
+# of the decay rate entirely (alpha is a rate, and the fit absorbs a
+# constant offset); what matters is their short-term NOISE, which sets
+# the scatter of the fit.
+pulse_transducers: null
+
 # Separate device from the DAQ; a dropout degrades the run, never aborts it.
 temperature:
   port: COM4

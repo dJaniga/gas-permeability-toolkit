@@ -23,6 +23,7 @@ from gasperm.config import (
     LinearCalibration,
     LivePlotConfig,
     PressureChannelConfig,
+    PulseDecayConfig,
     RunConfig,
     SampleConfig,
     SteadyStateConfig,
@@ -122,6 +123,52 @@ class TestValidation:
     def test_identical_pressure_channels_are_rejected(self):
         with pytest.raises(ValueError, match="must differ"):
             DaqConfig(inlet_pressure_channel="ai0", outlet_pressure_channel="ai0")
+
+    def test_pulse_decay_refuses_a_supplied_downstream_pressure(self):
+        """The two settings contradict: a declared P2 asserts an open outlet."""
+        with pytest.raises(ValueError, match="CLOSED downstream vessel"):
+            RunConfig(method="pulse_decay", downstream_pressure=101.325)
+
+    def test_pulse_decay_accepts_a_measured_downstream_pressure(self):
+        assert RunConfig(method="pulse_decay").downstream_is_measured
+
+    def test_pulse_decay_refuses_a_steady_state_soak(self):
+        with pytest.raises(ValueError, match="no meaning in pulse decay"):
+            RunConfig(method="pulse_decay", stop_after_steady_s=120.0)
+
+    def test_an_unknown_method_is_rejected(self):
+        with pytest.raises(ValueError):
+            RunConfig(method="transient_pulse")
+
+    def test_the_fit_window_must_run_downwards(self):
+        with pytest.raises(ValueError, match="fit_start_fraction"):
+            PulseDecayConfig(fit_start_fraction=0.4, fit_end_fraction=0.9)
+
+    def test_the_run_must_not_stop_before_the_fit_window_closes(self):
+        with pytest.raises(ValueError, match="before the fit window closed"):
+            PulseDecayConfig(fit_end_fraction=0.5, stop_below_fraction=0.8)
+
+    def test_the_shipped_fit_window_leaves_data_past_it(self):
+        """Data below the window is what pins the fitted offset."""
+        config = PulseDecayConfig()
+        assert config.stop_below_fraction < config.fit_end_fraction
+        assert config.fit_end_fraction < config.fit_start_fraction
+
+    def test_the_pulse_threshold_converts_to_the_internal_unit(self):
+        config = PulseDecayConfig(min_pulse_pressure=20.0, pulse_pressure_unit="kPa")
+        assert config.min_pulse_pressure_atm == pytest.approx(
+            units.to_atm(20.0, "kPa")
+        )
+
+    def test_the_planning_permeability_converts(self):
+        config = PulseDecayConfig(
+            expected_permeability=1.0, expected_permeability_unit="uD"
+        )
+        assert config.expected_permeability_darcy == pytest.approx(1e-6)
+
+    def test_a_bad_planning_unit_is_rejected(self):
+        with pytest.raises(ValueError, match="furlong"):
+            PulseDecayConfig(expected_permeability_unit="furlongs")
 
     def test_an_unknown_plot_panel_is_rejected(self):
         with pytest.raises(ValueError, match="viscosity"):
@@ -238,9 +285,25 @@ class TestFlowmeterSelection:
                 default_flowmeter="a",
             )
 
-    def test_an_empty_meter_set_is_rejected(self):
-        with pytest.raises(ValueError, match="define at least one meter"):
-            HardwareConfig(flowmeters={}, default_flowmeter=None)
+    def test_an_empty_meter_set_is_rejected_for_a_steady_state_run(self):
+        """The check lives on GaspermConfig, because it depends on run.method.
+
+        A rig with no flowmeter is legitimate -- for pulse decay, which reads
+        none -- so ``HardwareConfig`` alone cannot decide, and the two files
+        have to be in scope together.
+        """
+        with pytest.raises(ValueError, match="[Dd]efine at least one meter"):
+            GaspermConfig(
+                hardware=HardwareConfig(flowmeters={}, default_flowmeter=None)
+            )
+
+    def test_a_meterless_rig_is_accepted_for_pulse_decay(self):
+        config = GaspermConfig(
+            hardware=HardwareConfig(flowmeters={}, default_flowmeter=None),
+            run=RunConfig(method="pulse_decay"),
+        )
+        assert config.run.method == "pulse_decay"
+        assert config.hardware.flowmeters == {}
 
     def test_a_bad_default_is_rejected(self):
         with pytest.raises(ValueError, match="not a defined meter"):

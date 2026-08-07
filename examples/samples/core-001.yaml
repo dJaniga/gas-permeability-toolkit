@@ -27,6 +27,7 @@ diameter_uncertainty: 0.1                     # standard uncertainty, mm -- coun
 
 # Petrophysics. Informational; not used by the Darcy calc.
 porosity_fraction: null
+porosity_uncertainty: null
 porosity_method: ''                           # helium pycnometry, MICP, image analysis, ...
 grain_density_g_cm3: null
 bulk_density_g_cm3: null

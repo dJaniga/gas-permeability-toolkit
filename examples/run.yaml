@@ -12,6 +12,18 @@ project: ''
 experiment_id: ''
 notes: ''
 
+# How this run measures permeability.
+#   steady_state -- drive gas through the plug and measure the flow
+#                   (the compressible Darcy equation).
+#   pulse_decay  -- apply a small pulse to a closed upstream vessel and
+#                   watch P1-P2 decay into a closed downstream one. NO
+#                   flow is measured, which is what makes it usable below
+#                   about ten microdarcy where a flowmeter sized for a
+#                   normal plug reports only its own zero offset.
+# Pulse decay requires downstream_pressure: measured, reads no flowmeter,
+# and takes its vessel volumes from hardware.reservoirs.
+method: steady_state                          # steady_state | pulse_decay
+
 # Working gas and where its properties come from.
 gas:
   name: Nitrogen                              # any CoolProp fluid: Air, CarbonDioxide, Methane, ...
@@ -19,6 +31,7 @@ gas:
   fixed_viscosity_cp: null                    # only when properties_source == fixed
   fixed_reason: ''
   viscosity_relative_uncertainty: 0.01        # relative, for the GUM budget
+  compressibility_relative_uncertainty: 0.01
   real_gas_correction: false                  # divide reference flow by Z
 
 # Which meter from hardware.yaml this run uses. Defined meters:
@@ -84,6 +97,34 @@ steady_state:
   max_wait_s: null                            # null = wait indefinitely
   equilibration_factor: 1.0                   # warn if the window is shorter than this x phi.mu.L^2/(k.P)
 
+# Only read when method is pulse_decay.
+# The fit runs from fit_start_fraction down to fit_end_fraction of the
+# pulse. The top is skipped for two independent reasons: the valve
+# transient, and the fact that a single exponential is asymptotic rather
+# than exact -- with finite sample storage the higher decay modes are
+# still dying, and including them biases the rate high. The bottom is
+# skipped because late samples are noise-dominated: on this rig, running
+# to dP/dP0 = 0.05 takes four times as long as 0.5 and is slightly WORSE.
+# The run continues a little past the window (stop_below_fraction) so
+# there is data below it to pin the fitted offset.
+pulse_decay:
+  min_pulse_pressure: 20.0                    # smallest differential that counts as a pulse
+  pulse_pressure_unit: kPa
+  max_pulse_fraction: 0.1                     # largest dP0/P_mean the linearisation allows
+  stop_below_fraction: 0.4                    # end the run at this dP/dP0
+  max_decay_s: null                           # null = wait indefinitely
+  fit_start_fraction: 0.9                     # fit from this fraction of dP0 ...
+  fit_end_fraction: 0.5                       # ... down to this one
+  fit_bin_s: 1.0                              # bin before fitting; null = every sample
+  fit_offset: true                            # two transducers have a zero mismatch; keep this on
+  min_fit_samples: 20
+  min_r_squared: 0.98
+  max_residual_autocorrelation: 0.5
+  storage_correction: auto                    # auto | brace | dicker_smits
+  max_storage_ratio: 0.05                     # warn above this V_pore/V on the Brace form
+  expected_permeability: null                 # planning only; never enters a result
+  expected_permeability_unit: uD
+
 # ISO/IEC Guide 98-3 (GUM) evaluation. Type A comes from the scatter of
 # the steady-state window; Type B from the specs in hardware.yaml and
 # the caliper figures in sample.yaml.
@@ -107,7 +148,8 @@ display_flow_unit: sccm
 # tolerance band, and the fitted drift line. Display only -- nothing here
 # changes a reading or a reported result.
 plot:
-  panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability] # one stacked panel each, top to bottom
+  panels: [inlet_pressure, outlet_pressure, delta_pressure, decay_fraction, flow, temperature,
+  permeability] # one stacked panel each, top to bottom
   window_s: null                              # trailing seconds to show; null = whole run from t0
   show_criteria: true                         # draw the steady-state bands and drift line
   redraw_interval_s: 0.5

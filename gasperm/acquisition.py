@@ -30,12 +30,15 @@ from typing import Callable, Sequence
 
 from gasperm import units
 from gasperm.config import GaspermConfig, experiment_metadata
-from gasperm.gas_properties import GasPropertyProvider
-from gasperm.hardware.daq import AnalogInputSource
+from gasperm.gas_properties import GasPropertyProvider, build_provider
+from gasperm.hardware.daq import AnalogInputSource, _pressure_channels
 from gasperm.hardware.flowmeter import FlowChannel
 from gasperm.hardware.pressure import PressureChannel
 from gasperm.hardware.temperature import TemperatureSample, TemperatureSource
 from gasperm.models import (
+    DecayFit,
+    PulseDecayResult,
+    PulseDecayStatus,
     Reading,
     RunSummary,
     SteadyStateStatus,
@@ -47,8 +50,25 @@ from gasperm.permeability import (
     compute_gas_permeability,
     mean_pressure,
 )
+from gasperm.pulse_decay import (
+    PulseDecayInputError,
+    PulseDecayMonitor,
+    brace_permeability_darcy,
+    dicker_smits_permeability_darcy,
+    find_pulse,
+    first_storage_root,
+    fit_decay_rate,
+    fit_window,
+    pore_volume_cm3,
+    storage_ratios,
+)
 from gasperm.steady_state import SteadyStateDetector, signals_from_reading
-from gasperm.uncertainty import MeasurementPoint, build_budget
+from gasperm.uncertainty import (
+    MeasurementPoint,
+    PulseDecayPoint,
+    build_budget,
+    build_pulse_decay_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +91,13 @@ LOW_POROSITY_BOUND = 0.05
 __all__ = [
     "RollingWindow",
     "SampleProcessor",
+    "PulseProcessor",
     "AcquisitionLoop",
+    "PulseDecayLoop",
     "summarize_run",
+    "summarize_pulse_decay_run",
+    "format_pulse_reading_line",
+    "pulse_console_header",
     "trailing_window_mean",
     "steady_state_stats",
     "format_reading_line",
@@ -169,8 +194,14 @@ def _mean_stddev(values: Sequence[float]) -> tuple[float, float]:
 # --------------------------------------------------------------------------
 
 
-class SampleProcessor:
-    """Turns raw voltages plus a temperature into a :class:`Reading`."""
+class _ChannelProcessor:
+    """What both measurement methods do identically to one raw sample.
+
+    Pressure calibration, plug geometry, the temperature fallback and the gas
+    state lookup are the same work whether the run measures flow through the
+    plug or watches a differential decay across it. Only what is *derived* from
+    them differs, so only that is left to the subclasses.
+    """
 
     def __init__(self, config: GaspermConfig, gas_provider: GasPropertyProvider) -> None:
         self.config = config
@@ -178,25 +209,71 @@ class SampleProcessor:
 
         atmospheric_atm = config.run.atmospheric_pressure_atm
         self.atmospheric_pressure_atm = atmospheric_atm
-        calibration = config.hardware.pressure_calibration
+        # Which physical channels this run reads is a DAQ-layer decision -- a
+        # pulse-decay run on a rig with a dedicated transducer pair reads
+        # different inputs entirely -- so take it from the same helper the task
+        # builder uses rather than deriving it twice.
+        (_, upstream_channel, upstream_config), (
+            _,
+            downstream_channel,
+            downstream_config,
+        ) = _pressure_channels(config)
         self.inlet = PressureChannel.from_config(
-            "inlet", config.hardware.daq.inlet_pressure_channel, calibration.inlet, atmospheric_atm
+            "inlet", upstream_channel, upstream_config, atmospheric_atm
         )
         self.outlet = PressureChannel.from_config(
-            "outlet",
-            config.hardware.daq.outlet_pressure_channel,
-            calibration.outlet,
-            atmospheric_atm,
+            "outlet", downstream_channel, downstream_config, atmospheric_atm
         )
-        # The one meter this run selected; the others are never read.
-        self.flowmeter_name = config.flowmeter_name
-        self.flow = FlowChannel.from_config(config.flowmeter)
 
         geometry = config.geometry()
         self.geometry = geometry
         self.length_cm = geometry.length_cm
         self.area_cm2 = geometry.area_cm2
 
+    def read_pressures(self, voltages: dict[str, float]) -> tuple[float, float, float, float]:
+        """``(inlet_volts, outlet_volts, inlet_atm, outlet_atm)``, absolute."""
+        inlet_volts = self._require(voltages, self.inlet.channel, "inlet pressure")
+        outlet_volts = self._require(voltages, self.outlet.channel, "outlet pressure")
+        return (
+            inlet_volts,
+            outlet_volts,
+            self.inlet.volts_to_absolute_atm(inlet_volts),
+            self.outlet.volts_to_absolute_atm(outlet_volts),
+        )
+
+    def resolve_temperature(self, temperature: TemperatureSample) -> tuple[float, bool]:
+        """``(temperature_c, ok)`` -- the fallback applied when the probe is mute."""
+        ok = temperature.temperature_c is not None
+        value = (
+            temperature.temperature_c
+            if ok
+            else self.config.hardware.temperature.fallback_temperature_c
+        )
+        return value, ok
+
+    @staticmethod
+    def _require(voltages: dict[str, float], channel: str, role: str) -> float:
+        try:
+            return voltages[channel]
+        except KeyError as exc:
+            raise KeyError(
+                f"no voltage for the {role} channel {channel!r}; the DAQ task "
+                f"returned {sorted(voltages)}"
+            ) from exc
+
+
+class SampleProcessor(_ChannelProcessor):
+    """Turns raw voltages plus a temperature into a :class:`Reading`.
+
+    The steady-state path: flow through the plug at a fixed differential, into
+    the compressible Darcy equation.
+    """
+
+    def __init__(self, config: GaspermConfig, gas_provider: GasPropertyProvider) -> None:
+        super().__init__(config, gas_provider)
+        # The one meter this run selected; the others are never read.
+        self.flowmeter_name = config.flowmeter_name
+        self.flow = FlowChannel.from_config(config.flowmeter)
         self._window = RollingWindow(config.run.averaging_window_s)
 
     # -- helpers ----------------------------------------------------------
@@ -254,12 +331,9 @@ class SampleProcessor:
         Raises:
             KeyError: a configured channel is missing from ``voltages``.
         """
-        inlet_volts = self._require(voltages, self.inlet.channel, "inlet pressure")
-        outlet_volts = self._require(voltages, self.outlet.channel, "outlet pressure")
+        inlet_volts, outlet_volts, inlet_atm, outlet_atm = self.read_pressures(voltages)
         flow_volts = self._require(voltages, self.flow.channel, "flow")
 
-        inlet_atm = self.inlet.volts_to_absolute_atm(inlet_volts)
-        outlet_atm = self.outlet.volts_to_absolute_atm(outlet_volts)
         # P2 is the transducer unless the run supplies a value. Both are kept:
         # the measured one is the only evidence that a declared downstream
         # pressure matches what the rig is actually doing.
@@ -277,10 +351,7 @@ class SampleProcessor:
             atmospheric_atm=self.atmospheric_pressure_atm,
         )
 
-        temperature_c = temperature.temperature_c
-        temperature_ok = temperature_c is not None
-        if temperature_c is None:
-            temperature_c = self.config.hardware.temperature.fallback_temperature_c
+        temperature_c, temperature_ok = self.resolve_temperature(temperature)
 
         # Viscosity is evaluated per reading at the mean pore pressure and the
         # current temperature -- both drift during a run, especially before the
@@ -341,15 +412,115 @@ class SampleProcessor:
             note=note,
         )
 
-    @staticmethod
-    def _require(voltages: dict[str, float], channel: str, role: str) -> float:
+class PulseProcessor(_ChannelProcessor):
+    """Turns raw voltages into a :class:`Reading` for a pulse-decay run.
+
+    No flowmeter is read at all -- the flow fields stay ``None``, which is the
+    honest record of an instrument that was not part of the measurement. The
+    permeability written per sample is a *running* estimate from the live
+    monitor's log-linear slope; the reported result comes from the one-shot
+    nonlinear fit at the end, exactly as the steady-state rolling mean relates
+    to the final steady window.
+    """
+
+    def __init__(self, config: GaspermConfig, gas_provider: GasPropertyProvider) -> None:
+        super().__init__(config, gas_provider)
+        pulse_config = config.run.pulse_decay
+        self.monitor = PulseDecayMonitor(
+            pulse_config, min_pulse_atm=pulse_config.min_pulse_pressure_atm
+        )
+        reservoirs = config.hardware.reservoirs
+        self.upstream_volume_cm3 = reservoirs.upstream.volume_cm3
+        self.downstream_volume_cm3 = reservoirs.downstream.volume_cm3
+        self.porosity_fraction = config.sample.porosity_fraction
+        self.storage_correction = self._resolve_storage_correction()
+
+    def _resolve_storage_correction(self) -> str:
+        """Which model this run will use, decided once at startup."""
+        requested = self.config.run.pulse_decay.storage_correction
+        if requested == "dicker_smits":
+            return "dicker_smits"
+        if requested == "brace":
+            return "brace"
+        # auto: apply the correction whenever the plug's porosity is known.
+        return "dicker_smits" if self.porosity_fraction else "brace"
+
+    def permeability_from_rate(self, decay_rate_per_s: float, gas_state) -> float | None:
+        """Permeability for a decay rate, by whichever model this run uses.
+
+        Returns ``None`` rather than raising when the inputs are not yet
+        physical -- early in a run the running rate is noise, and a failed
+        sample must not abort a measurement that takes hours.
+        """
+        compressibility = gas_state.isothermal_compressibility_per_atm
+        if not decay_rate_per_s or not compressibility:
+            return None
+        shared = dict(
+            decay_rate_per_s=decay_rate_per_s,
+            viscosity_cp=gas_state.viscosity_cp,
+            gas_compressibility_per_atm=compressibility,
+            length_cm=self.length_cm,
+            area_cm2=self.area_cm2,
+            upstream_volume_cm3=self.upstream_volume_cm3,
+            downstream_volume_cm3=self.downstream_volume_cm3,
+        )
         try:
-            return voltages[channel]
-        except KeyError as exc:
-            raise KeyError(
-                f"No voltage for the {role} channel {channel!r}; the DAQ returned "
-                f"{sorted(voltages)}."
-            ) from exc
+            if self.storage_correction == "dicker_smits" and self.porosity_fraction:
+                return dicker_smits_permeability_darcy(
+                    porosity_fraction=self.porosity_fraction, **shared
+                )
+            return brace_permeability_darcy(**shared)
+        except PulseDecayInputError:
+            return None
+
+    def process(
+        self,
+        *,
+        index: int,
+        elapsed_s: float,
+        voltages: dict[str, float],
+        temperature: TemperatureSample,
+        timestamp: datetime | None = None,
+    ) -> Reading:
+        """Compute one pulse-decay :class:`Reading` and advance the monitor.
+
+        Raises:
+            KeyError: a configured channel is missing from ``voltages``.
+        """
+        inlet_volts, outlet_volts, inlet_atm, outlet_atm = self.read_pressures(voltages)
+        # Pulse decay requires downstream_pressure: measured (enforced at config
+        # load), so P2 is the transducer and delta_pressure_atm IS the signal.
+        mean_atm = mean_pressure(inlet_atm, outlet_atm)
+        delta_atm = inlet_atm - outlet_atm
+
+        temperature_c, temperature_ok = self.resolve_temperature(temperature)
+        gas_state = self.gas_provider.state_at_cgs(temperature_c, max(mean_atm, 1e-9))
+
+        status = self.monitor.update(elapsed_s, delta_atm)
+        permeability = self.permeability_from_rate(status.decay_rate_per_s, gas_state)
+
+        return Reading(
+            index=index,
+            timestamp=timestamp or datetime.now(timezone.utc),
+            elapsed_s=elapsed_s,
+            inlet_voltage=inlet_volts,
+            outlet_voltage=outlet_volts,
+            temperature_raw=temperature.raw_line,
+            inlet_pressure_atm=inlet_atm,
+            outlet_pressure_atm=outlet_atm,
+            downstream_pressure_atm=outlet_atm,
+            mean_pressure_atm=mean_atm,
+            temperature_c=temperature_c,
+            temperature_ok=temperature_ok,
+            temperature_stale=temperature.stale,
+            temperature_age_s=temperature.age_s,
+            viscosity_cp=gas_state.viscosity_cp,
+            compressibility_z=gas_state.compressibility_z,
+            permeability_darcy=permeability,
+            permeability_darcy_avg=permeability,
+            decay_fraction=status.decay_fraction,
+            note=None if status.phase != "waiting" else "waiting for the pulse",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -357,8 +528,136 @@ class SampleProcessor:
 # --------------------------------------------------------------------------
 
 
-class AcquisitionLoop:
-    """Drives sampling at ``daq.sample_rate_hz`` until stopped.
+class _LoopBase:
+    """Sampling plumbing that has nothing to do with which method is running.
+
+    Timing, the sources and their disposal, the interrupt handler, the warning
+    log and the reading callback are identical whether the run is measuring
+    steady flow or a decaying differential. The stop conditions are **not** --
+    ``stop_after_steady_s`` has no meaning in pulse decay and
+    ``stop_below_fraction`` none in steady state -- so each subclass owns its
+    own ``run()`` rather than sharing a parameterised one that would have to
+    understand both.
+    """
+
+    def __init__(
+        self,
+        config: GaspermConfig,
+        analog_source: AnalogInputSource,
+        temperature_source: TemperatureSource,
+        *,
+        on_reading: Callable[[Reading], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.config = config
+        self.analog_source = analog_source
+        self.temperature_source = temperature_source
+        self.on_reading = on_reading
+        self._clock = clock
+        self._sleep = sleep
+
+        self.readings: list[Reading] = []
+        self.warnings: list[str] = []
+        self._stop_requested = False
+        self._stop_reason = ""
+        self.started_at: datetime | None = None
+        self.ended_at: datetime | None = None
+
+    # -- control ----------------------------------------------------------
+
+    def request_stop(self, reason: str = "requested") -> None:
+        """Ask the loop to finish after the current sample."""
+        self._stop_requested = True
+        self._stop_reason = reason
+
+    @property
+    def stop_reason(self) -> str:
+        """Why the loop ended."""
+        return self._stop_reason
+
+    # -- sources ----------------------------------------------------------
+
+    def _read_sources(self, index: int) -> tuple[dict[str, float], TemperatureSample]:
+        """Read the DAQ and the probe, warning about the probe but not the DAQ.
+
+        A serial dropout degrades to a held temperature; a DAQ failure leaves
+        nothing to record at all, so it is logged and re-raised.
+        """
+        try:
+            voltages = self.analog_source.read()
+        except Exception as exc:  # noqa: BLE001 - DaqError or a driver error
+            self._record_warning(f"DAQ read failed at sample {index}: {exc}")
+            raise
+
+        temperature = self.temperature_source.latest()
+        if temperature.temperature_c is None:
+            self._record_warning_once(
+                "temperature-missing",
+                "No temperature reading available; using "
+                f"temperature.fallback_temperature_c = "
+                f"{self.config.hardware.temperature.fallback_temperature_c} degC for "
+                "viscosity.",
+            )
+        elif temperature.stale:
+            self._record_warning_once(
+                "temperature-stale",
+                f"Temperature probe has gone quiet; reusing the last value "
+                f"({temperature.temperature_c:.2f} degC).",
+            )
+        return voltages, temperature
+
+    def _emit(self, reading: Reading) -> None:
+        if self.on_reading is None:
+            return
+        try:
+            self.on_reading(reading)
+        except Exception as exc:  # noqa: BLE001 - display must never kill a run
+            logger.warning("Reading handler failed at sample %d: %s", reading.index, exc)
+
+    def _install_sigint(self):
+        def handler(signum, frame):  # noqa: ANN001, ARG001
+            logger.info("Stop requested; finishing the current sample.")
+            self.request_stop("interrupted")
+
+        try:
+            return signal.signal(signal.SIGINT, handler)
+        except ValueError:
+            # Not on the main thread; the caller can still use request_stop().
+            return None
+
+    def close(self) -> None:
+        """Close both sources, reporting but not re-raising failures."""
+        for name, source in (
+            ("temperature source", self.temperature_source),
+            ("analog source", self.analog_source),
+        ):
+            try:
+                source.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error closing the %s: %s", name, exc)
+
+    # -- warnings ---------------------------------------------------------
+
+    def _record_warning(self, message: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.warnings.append(f"[{stamp}] {message}")
+        logger.warning("%s", message)
+
+    def _record_warning_once(self, key: str, message: str) -> None:
+        """Log a recurring condition once, so a long run's log stays readable."""
+        seen = getattr(self, "_warned_keys", None)
+        if seen is None:
+            seen = set()
+            self._warned_keys = seen
+        if key in seen:
+            return
+        seen.add(key)
+        self._record_warning(message)
+
+
+class AcquisitionLoop(_LoopBase):
+    """Drives steady-state sampling at ``daq.sample_rate_hz`` until stopped.
 
     Stops on Ctrl+C, on ``run.duration_s``, on ``run.max_samples``, on
     ``run.stop_after_steady_s`` once steady state has held that long, or on
@@ -377,16 +676,15 @@ class AcquisitionLoop:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.config = config
+        super().__init__(
+            config,
+            analog_source,
+            temperature_source,
+            on_reading=on_reading,
+            clock=clock,
+            sleep=sleep,
+        )
         self.processor = processor
-        self.analog_source = analog_source
-        self.temperature_source = temperature_source
-        self.on_reading = on_reading
-        self._clock = clock
-        self._sleep = sleep
-
-        self.readings: list[Reading] = []
-        self.warnings: list[str] = []
         self.detector = SteadyStateDetector(config.run.steady_state)
         self.status: SteadyStateStatus = self.detector.status
         #: Bounds of the last confirmed steady stretch, preserved even if the
@@ -400,21 +698,6 @@ class AcquisitionLoop:
         #: time is measured from. Cleared if the rig leaves steady state.
         self.steady_confirmed_at_s: float | None = None
         self.ended_unsteady = False
-
-        self._stop_requested = False
-        self._stop_reason = ""
-        self.started_at: datetime | None = None
-        self.ended_at: datetime | None = None
-
-    def request_stop(self, reason: str = "requested") -> None:
-        """Ask the loop to finish after the current sample."""
-        self._stop_requested = True
-        self._stop_reason = reason
-
-    @property
-    def stop_reason(self) -> str:
-        """Why the loop ended."""
-        return self._stop_reason
 
     @property
     def steady_state_reached(self) -> bool:
@@ -499,29 +782,7 @@ class AcquisitionLoop:
 
     def _sample_once(self, index: int, elapsed: float) -> Reading | None:
         """One acquisition step. Returns ``None`` if the sample was unusable."""
-        try:
-            voltages = self.analog_source.read()
-        except Exception as exc:  # noqa: BLE001 - DaqError or a driver error
-            # A DAQ failure is fatal in a way a serial dropout is not: without
-            # pressures and flow there is nothing to record.
-            self._record_warning(f"DAQ read failed at sample {index}: {exc}")
-            raise
-
-        temperature = self.temperature_source.latest()
-        if temperature.temperature_c is None:
-            self._record_warning_once(
-                "temperature-missing",
-                "No temperature reading available; using "
-                f"temperature.fallback_temperature_c = "
-                f"{self.config.hardware.temperature.fallback_temperature_c} degC for "
-                "viscosity.",
-            )
-        elif temperature.stale:
-            self._record_warning_once(
-                "temperature-stale",
-                f"Temperature probe has gone quiet; reusing the last value "
-                f"({temperature.temperature_c:.2f} degC).",
-            )
+        voltages, temperature = self._read_sources(index)
 
         # Compute the reading first, then let the detector see it, then stamp
         # the resulting verdict onto the reading. One pass, no double work.
@@ -555,54 +816,6 @@ class AcquisitionLoop:
                 "steady_state_passes": self.status.consecutive_passes,
             }
         )
-
-    def _emit(self, reading: Reading) -> None:
-        if self.on_reading is None:
-            return
-        try:
-            self.on_reading(reading)
-        except Exception as exc:  # noqa: BLE001 - display must never kill a run
-            logger.warning("Reading handler failed at sample %d: %s", reading.index, exc)
-
-    def _install_sigint(self):
-        def handler(signum, frame):  # noqa: ANN001, ARG001
-            logger.info("Stop requested; finishing the current sample.")
-            self.request_stop("interrupted")
-
-        try:
-            return signal.signal(signal.SIGINT, handler)
-        except ValueError:
-            # Not on the main thread; the caller can still use request_stop().
-            return None
-
-    def close(self) -> None:
-        """Close both sources, reporting but not re-raising failures."""
-        for name, source in (
-            ("temperature source", self.temperature_source),
-            ("analog source", self.analog_source),
-        ):
-            try:
-                source.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Error closing the %s: %s", name, exc)
-
-    # -- warnings ---------------------------------------------------------
-
-    def _record_warning(self, message: str) -> None:
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self.warnings.append(f"[{stamp}] {message}")
-        logger.warning("%s", message)
-
-    def _record_warning_once(self, key: str, message: str) -> None:
-        """Log a recurring condition once, so a long run's log stays readable."""
-        seen = getattr(self, "_warned_keys", None)
-        if seen is None:
-            seen = set()
-            self._warned_keys = seen
-        if key in seen:
-            return
-        seen.add(key)
-        self._record_warning(message)
 
     # -- summary ----------------------------------------------------------
 
@@ -640,9 +853,221 @@ class AcquisitionLoop:
         )
 
 
+class PulseDecayLoop(_LoopBase):
+    """Drives a pulse-decay run: wait for the pulse, then watch it decay.
+
+    Stops on Ctrl+C, on ``run.duration_s``, on ``run.max_samples``, on
+    ``pulse_decay.max_decay_s``, or -- normally -- once the differential has
+    fallen below ``pulse_decay.stop_below_fraction`` of the pulse. Always
+    closes its sources.
+    """
+
+    def __init__(
+        self,
+        config: GaspermConfig,
+        processor: PulseProcessor,
+        analog_source: AnalogInputSource,
+        temperature_source: TemperatureSource,
+        *,
+        on_reading: Callable[[Reading], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__(
+            config,
+            analog_source,
+            temperature_source,
+            on_reading=on_reading,
+            clock=clock,
+            sleep=sleep,
+        )
+        self.processor = processor
+        self.status: PulseDecayStatus = processor.monitor.status
+
+    @property
+    def monitor(self) -> PulseDecayMonitor:
+        """The live decay monitor, for the console and the plot."""
+        return self.processor.monitor
+
+    @property
+    def pulse_seen(self) -> bool:
+        """Whether a pulse was ever applied."""
+        return self.status.pulse_at_elapsed_s is not None
+
+    def run(self, *, install_signal_handler: bool = True) -> list[Reading]:
+        """Sample until the decay completes or a stop condition is met."""
+        interval_s = 1.0 / self.config.hardware.daq.sample_rate_hz
+        run_config = self.config.run
+        pulse_config = run_config.pulse_decay
+        duration_s = run_config.duration_s
+        max_samples = run_config.max_samples
+        max_decay_s = pulse_config.max_decay_s
+
+        previous_handler = self._install_sigint() if install_signal_handler else None
+        self.started_at = datetime.now(timezone.utc)
+        start = self._clock()
+        index = 0
+
+        try:
+            while not self._stop_requested:
+                elapsed = self._clock() - start
+
+                if max_samples is not None and index >= max_samples:
+                    self._stop_reason = f"reached max_samples ({max_samples})"
+                    break
+                if duration_s is not None and elapsed >= duration_s:
+                    self._stop_reason = f"reached duration_s ({duration_s} s)"
+                    break
+                # The pulse clock, not the run clock: waiting for the operator
+                # to open the valve must not count against the decay's budget.
+                pulse_at = self.status.pulse_at_elapsed_s
+                if (
+                    max_decay_s is not None
+                    and pulse_at is not None
+                    and elapsed - pulse_at >= max_decay_s
+                ):
+                    self._record_warning(
+                        f"The decay did not reach dP/dP0 = "
+                        f"{pulse_config.stop_below_fraction:g} within "
+                        f"pulse_decay.max_decay_s ({max_decay_s:g} s); it reached "
+                        f"{self.status.decay_fraction:.3f}. A longer run, a smaller "
+                        "vessel or a higher pore pressure would finish it."
+                    )
+                    self._stop_reason = "timed out waiting for the decay"
+                    break
+
+                reading = self._sample_once(index, elapsed)
+                if reading is not None:
+                    self.readings.append(reading)
+                    self._emit(reading)
+
+                if self.monitor.is_complete:
+                    self._stop_reason = (
+                        f"decay reached dP/dP0 = {self.status.decay_fraction:.3f}"
+                    )
+                    break
+
+                index += 1
+                target = start + index * interval_s
+                remaining = (target + interval_s) - self._clock()
+                if remaining > 0:
+                    self._sleep(remaining)
+        finally:
+            self.ended_at = datetime.now(timezone.utc)
+            if previous_handler is not None:
+                signal.signal(signal.SIGINT, previous_handler)
+            self.close()
+
+        if not self.pulse_seen:
+            self._record_warning(
+                "No pulse was ever detected: the differential never reached "
+                f"pulse_decay.min_pulse_pressure "
+                f"({pulse_config.min_pulse_pressure:g} "
+                f"{pulse_config.pulse_pressure_unit}). Check that the valve was "
+                "opened, and that the threshold is not above the pulse you applied."
+            )
+        elif self.status.reversed_since_peak:
+            self._record_warning(
+                "The differential rose again after the pulse peaked. That is a leak, "
+                "a reopened valve, or a thermal ramp -- not a decay through the plug. "
+                "The fitted rate below describes whichever of those it was."
+            )
+        return self.readings
+
+    def _sample_once(self, index: int, elapsed: float) -> Reading | None:
+        voltages, temperature = self._read_sources(index)
+        reading = self.processor.process(
+            index=index,
+            elapsed_s=elapsed,
+            voltages=voltages,
+            temperature=temperature,
+        )
+        self.status = self.monitor.status
+        return reading
+
+    def fit(self) -> DecayFit | None:
+        """Fit the recorded decay over the configured window.
+
+        Returns ``None`` when there was no pulse, or too little of a decay to
+        fit -- both of which are reported as warnings rather than exceptions,
+        because a run that has already cost hours should still produce its CSV.
+        """
+        pulse_config = self.config.run.pulse_decay
+        if len(self.readings) < 3:
+            return None
+        times = [r.elapsed_s for r in self.readings]
+        deltas = [r.delta_pressure_atm for r in self.readings]
+        try:
+            peak_index, peak_value = find_pulse(times, deltas)
+            if peak_value < pulse_config.min_pulse_pressure_atm:
+                return None
+            start, end = fit_window(
+                times,
+                deltas,
+                peak_index=peak_index,
+                peak_value=peak_value,
+                start_fraction=pulse_config.fit_start_fraction,
+                end_fraction=pulse_config.fit_end_fraction,
+            )
+            if end - start < pulse_config.min_fit_samples:
+                self._record_warning(
+                    f"The fit window holds {end - start} samples, fewer than "
+                    f"pulse_decay.min_fit_samples ({pulse_config.min_fit_samples}). "
+                    "The decay did not run far enough, or the sample rate is too low."
+                )
+                return None
+            return fit_decay_rate(
+                times[start:end],
+                deltas[start:end],
+                fit_offset=pulse_config.fit_offset,
+                bin_s=pulse_config.fit_bin_s,
+            )
+        except PulseDecayInputError as exc:
+            self._record_warning(f"Could not fit the decay: {exc}")
+            return None
+
+    def summarize(self, csv_path: str | None = None) -> RunSummary:
+        """Reduce the run to its reported result."""
+        return summarize_pulse_decay_run(
+            self.readings,
+            self.config,
+            fit=self.fit(),
+            processor=self.processor,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
+            csv_path=csv_path,
+            warnings=list(self.warnings),
+        )
+
+
 # --------------------------------------------------------------------------
 # Reduction
 # --------------------------------------------------------------------------
+
+
+def _temperature_lag_warnings(
+    window_readings: Sequence[Reading], config: GaspermConfig
+) -> list[str]:
+    """Whether the probe kept up over the window the result was taken from.
+
+    Holding a value between conversions is normal for a slow sensor; a value
+    held for many conversions is the probe having stopped, which the operator
+    can otherwise only infer from the console. Shared by both methods, because
+    a stale temperature corrupts viscosity either way.
+    """
+    conversion_time_s = config.hardware.temperature.conversion_time_s
+    ages = [r.temperature_age_s for r in window_readings if r.temperature_age_s is not None]
+    if not ages:
+        return []
+    missed = sum(1 for age in ages if age > MISSED_CONVERSIONS * conversion_time_s)
+    if not missed:
+        return []
+    return [
+        f"The temperature probe fell behind on {missed} of {len(ages)} samples in the "
+        f"reported window: the value was older than {MISSED_CONVERSIONS} x "
+        f"conversion_time_s ({MISSED_CONVERSIONS * conversion_time_s:.2f} s), peaking "
+        f"at {max(ages):.2f} s. Viscosity was computed from a held temperature."
+    ]
 
 
 def _dominant_component_warnings(
@@ -833,21 +1258,7 @@ def summarize_run(
     mean_reference_q, _ = _mean_stddev([r.flow_reference_cm3_s for r in window_readings])
     mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window_readings])
 
-    # Whether the probe kept up. Holding a value between conversions is normal
-    # for a slow sensor; a value held for many conversions is the probe having
-    # stopped, which the operator can otherwise only infer from the console.
-    conversion_time_s = config.hardware.temperature.conversion_time_s
-    ages = [r.temperature_age_s for r in window_readings if r.temperature_age_s is not None]
-    if ages:
-        missed_beats = sum(1 for age in ages if age > MISSED_CONVERSIONS * conversion_time_s)
-        if missed_beats:
-            collected_warnings.append(
-                f"The temperature probe fell behind on {missed_beats} of {len(ages)} "
-                f"steady-state samples: the value was older than "
-                f"{MISSED_CONVERSIONS} x conversion_time_s "
-                f"({MISSED_CONVERSIONS * conversion_time_s:.2f} s), peaking at "
-                f"{max(ages):.2f} s. Viscosity was computed from a held temperature."
-            )
+    collected_warnings.extend(_temperature_lag_warnings(window_readings, config))
 
     # A declared downstream pressure is an assertion about the rig. The outlet
     # transducer is still being read, so check it: a shut valve would otherwise
@@ -936,6 +1347,286 @@ def summarize_run(
 # --------------------------------------------------------------------------
 
 
+def _thermal_drift_warnings(
+    window_readings: Sequence[Reading],
+    mean_pressure_atm: float,
+    fit: DecayFit,
+    config: GaspermConfig,
+) -> list[str]:
+    """Catch room temperature masquerading as a decay.
+
+    A closed vessel obeys ``dP/P = dT/T``, so a 0.1 K room swing moves the
+    pressure by 0.34 kPa at 10 atm -- comparable to the late-time signal of a
+    small pulse, and drifting on hour timescales, which looks exactly like a
+    slow exponential. The fitted offset absorbs a *constant* thermal bias but
+    not a ramp, so a drift comparable to the fit's own residual scatter is
+    worth saying out loud. This is the pulse-decay counterpart of the
+    dominated-budget check.
+    """
+    inside = [
+        r
+        for r in window_readings
+        if fit.start_elapsed_s <= r.elapsed_s <= fit.end_elapsed_s
+    ]
+    if len(inside) < 2:
+        return []
+    temperatures = [r.temperature_c for r in inside]
+    swing_k = max(temperatures) - min(temperatures)
+    if swing_k <= 0.0:
+        return []
+    mean_k_abs = units.celsius_to_kelvin(sum(temperatures) / len(temperatures))
+    # The pressure a closed vessel would move by, purely from the room.
+    thermal_atm = mean_pressure_atm * swing_k / mean_k_abs
+    if thermal_atm <= 0.1 * fit.amplitude_atm:
+        return []
+    unit = config.run.display_pressure_unit
+    return [
+        f"Room temperature moved {swing_k:.2f} K across the fit window. In a closed "
+        f"vessel that alone shifts the pressure by about "
+        f"{units.from_atm(thermal_atm, unit):.3g} {unit}, which is "
+        f"{thermal_atm / fit.amplitude_atm:.0%} of the "
+        f"{units.from_atm(fit.amplitude_atm, unit):.3g} {unit} pulse. The fitted "
+        "offset absorbs a constant thermal bias but not a ramp, so part of the decay "
+        "reported here may be the room rather than the rock. Insulate the vessels, or "
+        "run when the room is stable."
+    ]
+
+
+def summarize_pulse_decay_run(
+    readings: Sequence[Reading],
+    config: GaspermConfig,
+    *,
+    fit: DecayFit | None,
+    processor: PulseProcessor | None = None,
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
+    csv_path: str | None = None,
+    warnings: Sequence[str] = (),
+) -> RunSummary:
+    """Reduce a pulse-decay run to its reported permeability.
+
+    Unlike the steady-state path there is no averaging window: the whole fitted
+    decay *is* the measurement, and the permeability comes from its rate. The
+    means reported alongside are taken over the fit window, because that is the
+    state the decay actually happened at.
+
+    Args:
+        readings: Every sample of the run.
+        config: The configuration it ran under.
+        fit: The fitted decay, or ``None`` when there was nothing to fit.
+        processor: Supplies the vessel volumes and the storage model. Rebuilt
+            from ``config`` when omitted, so a stored run can be re-reduced.
+        started_at / ended_at: Wall-clock bounds, defaulting to the readings'.
+        csv_path: Recorded in the summary for traceability.
+        warnings: Warnings already collected by the loop.
+
+    Raises:
+        ValueError: the run produced no usable sample at all.
+    """
+    if not readings:
+        raise ValueError("No samples were recorded, so there is nothing to summarise.")
+
+    collected_warnings = list(warnings)
+    if processor is None:
+        processor = PulseProcessor(config, build_provider(config.run.gas))
+
+    first, last = readings[0], readings[-1]
+    if fit is None:
+        # No fit: still emit a summary so the CSV and metadata survive, but say
+        # plainly that nothing was measured rather than reporting a zero.
+        collected_warnings.append(
+            "No decay could be fitted, so this run did NOT measure the sample's "
+            "permeability. The readings are recorded for inspection."
+        )
+        window = list(readings)
+        mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window])
+        mean_t, _ = _mean_stddev([r.temperature_c for r in window])
+        return RunSummary(
+            sample_id=config.sample.id,
+            gas_name=config.run.gas.name,
+            method="pulse_decay",
+            started_at=started_at or first.timestamp,
+            ended_at=ended_at or last.timestamp,
+            duration_s=last.elapsed_s,
+            sample_count=len(readings),
+            steady_state_reached=False,
+            measurement_confirmed=False,
+            mean_pressure_atm=mean_p,
+            permeability_darcy=0.0,
+            permeability_stddev_darcy=0.0,
+            mean_temperature_c=mean_t,
+            averaged_samples=len(window),
+            metadata=experiment_metadata(config),
+            csv_path=csv_path,
+            warnings=collected_warnings,
+        )
+
+    window = [
+        r for r in readings if fit.start_elapsed_s <= r.elapsed_s <= fit.end_elapsed_s
+    ] or list(readings)
+    mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window])
+    mean_t, _ = _mean_stddev([r.temperature_c for r in window])
+    mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window])
+
+    gas_state = processor.gas_provider.state_at_cgs(mean_t, max(mean_p, 1e-9))
+    compressibility = gas_state.isothermal_compressibility_per_atm or (
+        1.0 / max(mean_p, 1e-9)
+    )
+    permeability = processor.permeability_from_rate(fit.decay_rate_per_s, gas_state)
+    if permeability is None or permeability <= 0.0:
+        collected_warnings.append(
+            f"The fitted decay rate ({fit.decay_rate_per_s:.6g} 1/s) did not yield a "
+            "positive permeability. Check the vessel volumes and the gas."
+        )
+        permeability = 0.0
+
+    geometry = config.geometry()
+    storage_ratio_up = storage_ratio_down = theta = None
+    if processor.storage_correction == "dicker_smits" and processor.porosity_fraction:
+        pore = pore_volume_cm3(
+            area_cm2=geometry.area_cm2,
+            length_cm=geometry.length_cm,
+            porosity_fraction=processor.porosity_fraction,
+        )
+        storage_ratio_up, storage_ratio_down = storage_ratios(
+            pore_volume_cm3=pore,
+            upstream_volume_cm3=processor.upstream_volume_cm3,
+            downstream_volume_cm3=processor.downstream_volume_cm3,
+        )
+        theta = first_storage_root(storage_ratio_up, storage_ratio_down)
+
+    result = PulseDecayResult(
+        decay_rate_per_s=fit.decay_rate_per_s,
+        decay_rate_standard_uncertainty_per_s=fit.decay_rate_standard_uncertainty_per_s,
+        degrees_of_freedom=fit.degrees_of_freedom,
+        pulse_amplitude_atm=processor.monitor.pulse_amplitude_atm or fit.amplitude_atm,
+        pulse_at_elapsed_s=processor.monitor.status.pulse_at_elapsed_s or 0.0,
+        fitted_offset_atm=fit.offset_atm,
+        r_squared=fit.r_squared,
+        fit_start_elapsed_s=fit.start_elapsed_s,
+        fit_end_elapsed_s=fit.end_elapsed_s,
+        fit_sample_count=fit.sample_count,
+        fit_model=fit.model,
+        residual_autocorrelation=fit.residual_autocorrelation,
+        upstream_volume_cm3=processor.upstream_volume_cm3,
+        downstream_volume_cm3=processor.downstream_volume_cm3,
+        upstream_storage_ratio=storage_ratio_up,
+        downstream_storage_ratio=storage_ratio_down,
+        storage_root=theta,
+        storage_correction=processor.storage_correction,
+        gas_compressibility_per_atm=compressibility,
+    )
+
+    # -- quality gates ----------------------------------------------------
+    pulse_config = config.run.pulse_decay
+    confirmed = permeability > 0.0 and fit.r_squared >= pulse_config.min_r_squared
+    if fit.r_squared < pulse_config.min_r_squared:
+        collected_warnings.append(
+            f"The decay fit's R^2 is {fit.r_squared:.5f}, below "
+            f"pulse_decay.min_r_squared ({pulse_config.min_r_squared:g}). The "
+            "differential is not decaying as a single exponential -- suspect a leak, "
+            "a thermal ramp, or a pulse too large for the linearisation."
+        )
+    if fit.model == "log_linear":
+        collected_warnings.append(
+            "The offset fit did not converge, so a log-linear fit was used instead. "
+            "Any zero mismatch between the two transducers biases that rate LOW, and "
+            "with it the permeability."
+        )
+    if (
+        fit.residual_autocorrelation is not None
+        and fit.residual_autocorrelation > pulse_config.max_residual_autocorrelation
+    ):
+        collected_warnings.append(
+            f"The fit residuals are still correlated after binning "
+            f"(lag-1 = {fit.residual_autocorrelation:.2f} > "
+            f"{pulse_config.max_residual_autocorrelation:g}), which means they carry "
+            "structure rather than noise and u(alpha) below is understated. A longer "
+            "pulse_decay.fit_bin_s, or a look at the residual plot, will say which."
+        )
+    if fit.amplitude_atm > 0.0 and mean_p > 0.0:
+        pulse_fraction = fit.amplitude_atm / mean_p
+        if pulse_fraction > pulse_config.max_pulse_fraction:
+            collected_warnings.append(
+                f"The pulse was {pulse_fraction:.1%} of the mean pore pressure, above "
+                f"pulse_decay.max_pulse_fraction ({pulse_config.max_pulse_fraction:.0%}). "
+                "The small-pulse linearisation assumes the gas compressibility is "
+                "constant across the decay, and at this amplitude it is not."
+            )
+    collected_warnings.extend(_temperature_lag_warnings(window, config))
+    collected_warnings.extend(
+        _thermal_drift_warnings(window, mean_p, fit, config)
+    )
+
+    budget: UncertaintyBudget | None = None
+    if config.run.uncertainty.enabled and permeability > 0.0:
+        try:
+            budget = build_pulse_decay_budget(
+                PulseDecayPoint(
+                    permeability_darcy=permeability,
+                    decay_rate_per_s=fit.decay_rate_per_s,
+                    mean_pressure_atm=mean_p,
+                    viscosity_cp=mean_mu,
+                    gas_compressibility_per_atm=compressibility,
+                    temperature_c=mean_t,
+                    upstream_volume_cm3=processor.upstream_volume_cm3,
+                    downstream_volume_cm3=processor.downstream_volume_cm3,
+                    porosity_fraction=(
+                        processor.porosity_fraction
+                        if processor.storage_correction == "dicker_smits"
+                        else None
+                    ),
+                    storage_root=theta,
+                ),
+                geometry,
+                config.hardware,
+                config.run,
+                decay_rate_relative_uncertainty=(
+                    fit.relative_standard_uncertainty or 0.0
+                ),
+                decay_rate_dof=fit.degrees_of_freedom,
+                viscosity_temperature_exponent=(
+                    processor.gas_provider.viscosity_temperature_exponent(
+                        units.celsius_to_kelvin(mean_t), mean_p * units.ATM_IN_PA
+                    )
+                ),
+                compressibility_pressure_exponent=(
+                    processor.gas_provider.compressibility_pressure_exponent(
+                        units.celsius_to_kelvin(mean_t), mean_p * units.ATM_IN_PA
+                    )
+                ),
+            )
+        except ValueError as exc:
+            collected_warnings.append(f"Could not evaluate the uncertainty budget: {exc}")
+
+    if budget is not None:
+        collected_warnings.extend(
+            _dominant_component_warnings(budget, config, mean_flow_cm3_s=0.0)
+        )
+
+    return RunSummary(
+        sample_id=config.sample.id,
+        gas_name=config.run.gas.name,
+        method="pulse_decay",
+        started_at=started_at or first.timestamp,
+        ended_at=ended_at or last.timestamp,
+        duration_s=last.elapsed_s,
+        sample_count=len(readings),
+        steady_state_reached=False,
+        measurement_confirmed=confirmed,
+        mean_pressure_atm=mean_p,
+        permeability_darcy=permeability,
+        permeability_stddev_darcy=0.0,
+        mean_temperature_c=mean_t,
+        averaged_samples=len(window),
+        pulse_decay=result,
+        uncertainty=budget,
+        metadata=experiment_metadata(config),
+        csv_path=csv_path,
+        warnings=collected_warnings,
+    )
+
+
 def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
     """One console line for a reading, in the configured **display** units."""
     run = config.run
@@ -949,7 +1640,11 @@ def format_reading_line(reading: Reading, config: GaspermConfig) -> str:
     # transducer.
     p2 = units.from_atm(reading.downstream_pressure_atm, pressure_unit)
     p2_flag = "" if reading.downstream_pressure_atm == reading.outlet_pressure_atm else "*"
-    flow = units.flow_from_cm3_s(reading.flow_cm3_s, flow_unit)
+    flow = (
+        units.flow_from_cm3_s(reading.flow_cm3_s, flow_unit)
+        if reading.flow_cm3_s is not None
+        else float("nan")
+    )
 
     if reading.permeability_darcy_avg is not None:
         k_display = units.darcy_to(reading.permeability_darcy_avg, permeability_unit)
@@ -979,4 +1674,55 @@ def console_header(config: GaspermConfig) -> str:
         f"{'flow':>11} ({config.run.display_flow_unit})  "
         f"{'temp':>8}  "
         f"{'permeability':>14} ({config.run.display_permeability_unit})  {'state':>11}"
+    )
+
+
+def format_pulse_reading_line(
+    reading: Reading, status: PulseDecayStatus, config: GaspermConfig
+) -> str:
+    """One console line for a pulse-decay sample.
+
+    A sibling of :func:`format_reading_line` rather than a branch inside it:
+    the columns are genuinely different -- no flow, but a differential, a decay
+    fraction and a time constant -- and both functions hard-code their widths
+    to match their own header.
+    """
+    run = config.run
+    pressure_unit = run.display_pressure_unit
+    permeability_unit = run.display_permeability_unit
+
+    p1 = units.from_atm(reading.inlet_pressure_atm, pressure_unit)
+    p2 = units.from_atm(reading.outlet_pressure_atm, pressure_unit)
+    delta = units.from_atm(reading.delta_pressure_atm, pressure_unit)
+    fraction = (
+        f"{reading.decay_fraction:7.3f}" if reading.decay_fraction is not None else f"{'--':>7}"
+    )
+    tau = f"{status.time_constant_s:8.0f}" if status.time_constant_s else f"{'--':>8}"
+
+    if reading.permeability_darcy is not None:
+        k_display = units.darcy_to(reading.permeability_darcy, permeability_unit)
+        k_text = f"{k_display:>11.4g} {permeability_unit}"
+    else:
+        k_text = f"{'--':>11} {permeability_unit}"
+
+    temperature_flag = "" if reading.temperature_ok and not reading.temperature_stale else "*"
+    line = (
+        f"{reading.elapsed_s:7.1f}s  "
+        f"P1 {p1:9.3f}  P2 {p2:9.3f} {pressure_unit}  "
+        f"dP {delta:8.3f}  dP/dP0 {fraction}  "
+        f"T {reading.temperature_c:6.2f}{temperature_flag:1}C  "
+        f"tau {tau} s  k {k_text}  {status.phase:>10}"
+    )
+    if status.reversed_since_peak:
+        line += "   [RISING]"
+    return line
+
+
+def pulse_console_header(config: GaspermConfig) -> str:
+    """Header matching :func:`format_pulse_reading_line`'s columns."""
+    unit = config.run.display_pressure_unit
+    return (
+        f"{'time':>8}  {'P1':>12} {'P2':>12} ({unit})  "
+        f"{'dP':>11}  {'dP/dP0':>14}  {'temp':>8}  {'tau':>12}  "
+        f"{'permeability':>14} ({config.run.display_permeability_unit})  {'phase':>10}"
     )

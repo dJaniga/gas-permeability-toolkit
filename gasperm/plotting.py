@@ -31,11 +31,17 @@ from typing import Any, Callable, NamedTuple, Sequence
 
 from gasperm import units
 from gasperm.config import GaspermConfig
+from gasperm.config.run import METHOD_ONLY_PANELS
 from gasperm.models import KlinkenbergResult, Reading, SteadyStateStatus
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LivePlot", "plot_klinkenberg", "PlottingUnavailable"]
+__all__ = [
+    "LivePlot",
+    "plot_klinkenberg",
+    "plot_pulse_decay",
+    "PlottingUnavailable",
+]
 
 #: How many points the live window keeps per series. Bounded so a multi-hour
 #: run cannot grow the figure's memory without limit.
@@ -100,6 +106,10 @@ class _Panel(NamedTuple):
     #: Detector-internal units to display units. Affine, not merely scaled:
     #: the detector works in kelvin so it never divides by a near-zero mean.
     to_display: Callable[[float], float]
+    #: ``"log"`` for the decay fraction, where a straightening line is the whole
+    #: visual confirmation the operator is waiting for. Defaulted, so no
+    #: existing construction site changes.
+    yscale: str = "linear"
 
 
 def _channel_values(reading: Reading, run) -> dict[str, float]:
@@ -122,7 +132,19 @@ def _channel_values(reading: Reading, run) -> dict[str, float]:
         "downstream_pressure": units.from_atm(
             reading.downstream_pressure_atm, run.display_pressure_unit
         ),
-        "flow": units.flow_from_cm3_s(reading.flow_cm3_s, run.display_flow_unit),
+        "delta_pressure": units.from_atm(
+            reading.delta_pressure_atm, run.display_pressure_unit
+        ),
+        # NaN rather than a dropped point, as for permeability: before the pulse
+        # there is no fraction, and matplotlib leaves the gap.
+        "decay_fraction": (
+            reading.decay_fraction if reading.decay_fraction is not None else float("nan")
+        ),
+        "flow": (
+            units.flow_from_cm3_s(reading.flow_cm3_s, run.display_flow_unit)
+            if reading.flow_cm3_s is not None
+            else float("nan")
+        ),
         "temperature": reading.temperature_c,
         "permeability": darcy(reading.permeability_darcy),
         "permeability_avg": darcy(reading.permeability_darcy_avg),
@@ -161,6 +183,24 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             signal=None,
             to_display=lambda atm: units.from_atm(atm, pressure),
         ),
+        "delta_pressure": _Panel(
+            key="delta_pressure",
+            ylabel=f"dP = P1-P2 ({pressure})",
+            traces=(_Trace("delta_pressure", "dP", "tab:red"),),
+            signal=None,
+            to_display=lambda atm: units.from_atm(atm, pressure),
+        ),
+        "decay_fraction": _Panel(
+            key="decay_fraction",
+            ylabel="dP / dP0",
+            traces=(_Trace("decay_fraction", "dP/dP0", "tab:red"),),
+            signal=None,
+            to_display=lambda value: value,
+            # Log: an exponential decay straightens into a line here, which is
+            # the fastest visual check that the plug -- and not a leak or a
+            # thermal ramp -- is what the differential is doing.
+            yscale="log",
+        ),
         "flow": _Panel(
             key="flow",
             ylabel=f"flow ({run.display_flow_unit})",
@@ -189,7 +229,14 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             to_display=lambda d: units.darcy_to(d, run.display_permeability_unit),
         ),
     }
-    return [available[name] for name in run.plot.panels]
+    # Filter by method rather than making the operator curate the list per run:
+    # `panels` defaults to every panel, and a flow trace on a pulse run (or a
+    # decay trace on a steady one) would be a permanently empty axes.
+    return [
+        available[name]
+        for name in run.plot.panels
+        if METHOD_ONLY_PANELS.get(name, run.method) == run.method
+    ]
 
 
 class _History:
@@ -438,6 +485,8 @@ class LivePlot:
             axis.clear()
             axis.grid(True, alpha=0.3)
             axis.set_ylabel(panel.ylabel, fontsize="small")
+            if panel.yscale != "linear":
+                axis.set_yscale(panel.yscale)
             for trace in panel.traces:
                 axis.plot(
                     times,
@@ -709,6 +758,117 @@ def plot_klinkenberg(
     axis.set_title(title)
     axis.grid(True, alpha=0.3)
     axis.legend(loc="best", fontsize="small")
+    figure.tight_layout()
+
+    saved: Path | None = None
+    if path is not None:
+        saved = Path(path)
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(saved, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return saved
+
+
+def plot_pulse_decay(
+    result,
+    readings: Sequence[Reading],
+    *,
+    path: str | Path | None = None,
+    show: bool = False,
+    pressure_unit: str = "kPa",
+) -> Path | None:
+    """Plot the fitted decay and its residuals.
+
+    Two stacked axes. The top shows dP against time on a **log** y-axis with the
+    fitted curve over it and the fit window shaded: on a log axis a single
+    exponential is a straight line, so a curve that bends is telling you the
+    model does not fit. The bottom shows the residuals, which is where a thermal
+    ramp or a leak appears as structure rather than as noise -- the two failures
+    that a good R^2 will happily hide.
+
+    Args:
+        result: A :class:`~gasperm.models.PulseDecayResult`.
+        readings: The run's readings, for the measured differential.
+        path: Where to save the PNG. ``None`` skips saving.
+        show: Open an interactive window as well.
+        pressure_unit: Display unit for the differential.
+
+    Returns:
+        The saved path, or ``None`` when nothing was saved.
+    """
+    plt = _pyplot(interactive=show)
+
+    times = [r.elapsed_s for r in readings]
+    deltas = [units.from_atm(r.delta_pressure_atm, pressure_unit) for r in readings]
+    offset = units.from_atm(result.fitted_offset_atm or 0.0, pressure_unit)
+    amplitude = units.from_atm(
+        result.pulse_amplitude_atm, pressure_unit
+    )
+
+    figure, (top, bottom) = plt.subplots(
+        2, 1, sharex=True, figsize=(9, 6.5), height_ratios=(3, 1)
+    )
+
+    top.plot(times, deltas, color="tab:blue", linewidth=1.0, label="measured dP")
+    inside = [
+        (t, d)
+        for t, d in zip(times, deltas)
+        if result.fit_start_elapsed_s <= t <= result.fit_end_elapsed_s
+    ]
+    if inside:
+        fitted_amplitude = units.from_atm(
+            result.pulse_amplitude_atm, pressure_unit
+        )
+        # Re-evaluate the fitted model over the window, from its own start.
+        curve_t = [t for t, _ in inside]
+        start = result.fit_start_elapsed_s
+        measured_start = inside[0][1]
+        curve = [
+            (measured_start - offset) * math.exp(-result.decay_rate_per_s * (t - start))
+            + offset
+            for t in curve_t
+        ]
+        top.plot(
+            curve_t, curve, color="tab:red", linestyle="--", linewidth=1.6,
+            label=(
+                f"fit: alpha = {result.decay_rate_per_s:.4e} 1/s, "
+                f"tau = {result.time_constant_s:.0f} s  "
+                f"(R^2 = {result.r_squared:.5f})"
+            ),
+        )
+        top.axvspan(
+            result.fit_start_elapsed_s, result.fit_end_elapsed_s,
+            color="tab:green", alpha=0.10, zorder=0, label="fit window",
+        )
+        residuals = [d - c for (_, d), c in zip(inside, curve)]
+        bottom.axhline(0.0, color="0.6", linewidth=0.8)
+        bottom.plot(curve_t, residuals, color="tab:red", linewidth=0.9)
+        bottom.set_ylabel(f"residual ({pressure_unit})", fontsize="small")
+        _ = fitted_amplitude
+
+    if result.fitted_offset_atm is not None:
+        top.axhline(
+            offset, color="tab:orange", linestyle=":", linewidth=1.2,
+            label=f"fitted offset = {offset:+.4g} {pressure_unit}",
+        )
+
+    # Log y so a single exponential reads as a straight line. Only the positive
+    # part can be shown; the offset makes late samples cross zero, and that is
+    # precisely what the residual panel below is for.
+    if any(d > 0 for d in deltas):
+        top.set_yscale("log")
+    top.set_ylabel(f"dP ({pressure_unit})")
+    top.grid(True, alpha=0.3, which="both")
+    top.legend(loc="upper right", fontsize="small")
+    top.set_title(
+        f"Pulse decay - dP0 = {amplitude:.4g} {pressure_unit}, "
+        f"{result.storage_correction.replace('_', '-')} model"
+    )
+    bottom.grid(True, alpha=0.3)
+    bottom.set_xlabel("elapsed (s)")
     figure.tight_layout()
 
     saved: Path | None = None

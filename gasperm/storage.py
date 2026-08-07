@@ -53,7 +53,9 @@ __all__ = [
     "point_from_run",
     "collect_points",
     "describe_convention",
+    "describe_method",
     "downstream_convention",
+    "run_method",
     "safe_sample_id",
     "write_klinkenberg_result",
 ]
@@ -75,6 +77,11 @@ READING_COLUMNS: tuple[str, ...] = (
     "outlet_pressure_atm",
     "downstream_pressure_atm",
     "mean_pressure_atm",
+    # P1 - P2 and dP/dP0. Derivable for a steady-state run, but in pulse decay
+    # the differential IS the measurand's signal, so it earns its own column --
+    # which also makes re-fitting a stored decay externally trivial.
+    "delta_pressure_atm",
+    "decay_fraction",
     "flow_cm3_s",
     "flow_reference_cm3_s",
     "flow_reference_pressure_atm",
@@ -137,14 +144,18 @@ def _reading_row(reading: Reading) -> dict[str, Any]:
         "elapsed_s": f"{reading.elapsed_s:.4f}",
         "inlet_voltage_V": f"{reading.inlet_voltage:.6f}",
         "outlet_voltage_V": f"{reading.outlet_voltage:.6f}",
-        "flow_voltage_V": f"{reading.flow_voltage:.6f}",
+        # The flow columns are blank, not zero, in a pulse-decay run: no meter
+        # was read, and a zero would read as one that measured nothing.
+        "flow_voltage_V": _optional(reading.flow_voltage, ".6f"),
         "inlet_pressure_atm": f"{reading.inlet_pressure_atm:.8g}",
         "outlet_pressure_atm": f"{reading.outlet_pressure_atm:.8g}",
         "downstream_pressure_atm": f"{reading.downstream_pressure_atm:.8g}",
         "mean_pressure_atm": f"{reading.mean_pressure_atm:.8g}",
-        "flow_cm3_s": f"{reading.flow_cm3_s:.8g}",
-        "flow_reference_cm3_s": f"{reading.flow_reference_cm3_s:.8g}",
-        "flow_reference_pressure_atm": f"{reading.flow_reference_pressure_atm:.8g}",
+        "delta_pressure_atm": f"{reading.delta_pressure_atm:.8g}",
+        "decay_fraction": _optional(reading.decay_fraction),
+        "flow_cm3_s": _optional(reading.flow_cm3_s),
+        "flow_reference_cm3_s": _optional(reading.flow_reference_cm3_s),
+        "flow_reference_pressure_atm": _optional(reading.flow_reference_pressure_atm),
         "temperature_C": f"{reading.temperature_c:.4f}",
         "temperature_ok": int(reading.temperature_ok),
         "temperature_stale": int(reading.temperature_stale),
@@ -313,7 +324,18 @@ def read_readings_csv(path: str | Path) -> list[dict[str, Any]]:
                 "temperature_C": temperature_c,
                 "flow_cm3_s": _float_or_none(row.get("flow_cm3_s")),
                 "steady_state": _float_or_none(row.get("steady_state")),
+                # Absent from runs recorded before pulse decay existed; the
+                # differential is recomputed below when so.
+                "delta_pressure_atm": _float_or_none(row.get("delta_pressure_atm")),
+                "decay_fraction": _float_or_none(row.get("decay_fraction")),
             }
+            if parsed["delta_pressure_atm"] is None and None not in (
+                parsed["inlet_pressure_atm"],
+                parsed["downstream_pressure_atm"],
+            ):
+                parsed["delta_pressure_atm"] = (
+                    parsed["inlet_pressure_atm"] - parsed["downstream_pressure_atm"]
+                )
             # Detector signal aliases.
             parsed["permeability"] = parsed["permeability_D"]
             parsed["inlet_pressure"] = parsed["inlet_pressure_atm"]
@@ -370,6 +392,12 @@ class RunRecord:
     mean_pressure_atm: float | None = None
     permeability_darcy: float | None = None
     steady_state_reached: bool | None = None
+    #: Whether the run met its own method's criterion; see
+    #: :func:`_summary_confirmed`. Preferred over ``steady_state_reached``,
+    #: which is always False for a pulse-decay run.
+    measurement_confirmed: bool | None = None
+    #: ``"steady_state"`` or ``"pulse_decay"``; see :func:`run_method`.
+    method: str | None = None
     flowmeter: str | None = None
     #: How this run obtained P2; see :func:`downstream_convention`.
     downstream_convention: str | None = None
@@ -406,6 +434,48 @@ def downstream_convention(stored_config: Mapping[str, Any] | None) -> str | None
         return f"fixed:{units.to_atm(float(value), unit):.6g}"
     except (TypeError, ValueError):
         return None
+
+
+def run_method(stored_config: Mapping[str, Any] | None) -> str | None:
+    """Which measurement method a stored run used.
+
+    Derived from the *presence of the run block*, not of the key -- exactly as
+    :func:`downstream_convention` is, and for the same reason: a sidecar written
+    before pulse decay existed was steady-state by definition, and returning
+    ``None`` for those would let a mixed set of old and new runs collapse to one
+    distinct method and slip past the check this exists for. ``None`` means
+    genuinely unknown -- no sidecar at all.
+    """
+    if not stored_config:
+        return None
+    run_block = stored_config.get("run")
+    if run_block is None:
+        return None
+    value = run_block.get("method", "steady_state")
+    return value if isinstance(value, str) else None
+
+
+def describe_method(key: str | None) -> str:
+    """Human-readable method name, for listings and messages."""
+    if key is None:
+        return "unknown"
+    return {"steady_state": "steady state", "pulse_decay": "pulse decay"}.get(key, key)
+
+
+def _summary_confirmed(summary: Mapping[str, Any]) -> bool:
+    """Whether a stored summary reports a usable measurement.
+
+    Prefers ``measurement_confirmed``, which every method sets, and falls back
+    to ``steady_state_reached`` for sidecars written before pulse decay existed.
+    Without this fallback-and-preference pair, a pulse-decay run would fail the
+    short-circuit below and be sent to a steady-state replay that cannot
+    possibly succeed -- reported as "never reached steady state", which would be
+    both wrong and baffling.
+    """
+    confirmed = summary.get("measurement_confirmed")
+    if confirmed is None:
+        confirmed = summary.get("steady_state_reached")
+    return bool(confirmed)
 
 
 def describe_convention(key: str | None) -> str:
@@ -473,6 +543,10 @@ def _record_from_directory(directory: Path) -> RunRecord:
         mean_pressure_atm=summary.get("mean_pressure_atm"),
         permeability_darcy=summary.get("permeability_darcy"),
         steady_state_reached=summary.get("steady_state_reached"),
+        measurement_confirmed=(
+            _summary_confirmed(summary) if summary else None
+        ),
+        method=run_method(stored_config) or summary.get("method"),
         flowmeter=experiment.get("flowmeter"),
         downstream_convention=downstream_convention(stored_config),
     )
@@ -594,11 +668,12 @@ def point_from_run(
     label = Path(readings_path).parent.name
     convention = downstream_convention(stored_config)
 
+    method = run_method(stored_config)
     summary = metadata.get("summary") if isinstance(metadata, dict) else None
     if (
         summary
         and averaging_window_s is None
-        and summary.get("steady_state_reached")
+        and _summary_confirmed(summary)
         and summary.get("permeability_darcy")
     ):
         budget = summary.get("uncertainty") or {}
@@ -615,7 +690,19 @@ def point_from_run(
             sample_id=sample_id or summary.get("sample_id"),
             steady_state=True,
             downstream_convention=convention,
+            method=method or summary.get("method"),
             flow_cm3_s=_summary_float(summary.get("mean_flow_cm3_s")),
+        )
+
+    if method == "pulse_decay":
+        # A pulse-decay run's result is its fitted decay rate, which lives in
+        # the summary. Falling through to the steady-state replay below would
+        # run a detector that cannot apply and report "never reached steady
+        # state", which is both wrong and unactionable.
+        raise ValueError(
+            f"{readings_path} is a pulse-decay run with no recorded decay fit, so it "
+            "has no permeability to contribute. Re-run 'collect' on it, or check the "
+            "run's warnings for why the fit was rejected."
         )
 
     rows = read_readings_csv(readings_path)
@@ -669,6 +756,7 @@ def point_from_run(
         sample_id=sample_id,
         steady_state=window is not None,
         downstream_convention=convention,
+        method=method,
         flow_cm3_s=sum(flows) / len(flows) if flows else None,
     )
 
@@ -717,6 +805,7 @@ def write_klinkenberg_result(result, path: str | Path) -> Path:
                 "label": point.label,
                 "sample_id": point.sample_id,
                 "steady_state": point.steady_state,
+                "method": point.method,
                 "downstream_pressure": describe_convention(point.downstream_convention),
                 "mean_pressure_atm": point.mean_pressure_atm,
                 "inverse_mean_pressure_per_atm": point.inverse_mean_pressure,

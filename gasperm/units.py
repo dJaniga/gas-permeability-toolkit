@@ -35,6 +35,8 @@ __all__ = [
     "SUPPORTED_PRESSURE_UNITS",
     "SUPPORTED_FLOW_UNITS",
     "SUPPORTED_LENGTH_UNITS",
+    "SUPPORTED_VOLUME_UNITS",
+    "SUPPORTED_COMPRESSIBILITY_UNITS",
     "SUPPORTED_PERMEABILITY_UNITS",
     "SUPPORTED_TEMPERATURE_UNITS",
     "ATM_IN_PA",
@@ -53,6 +55,12 @@ __all__ = [
     "slpm_to_cm3_s",
     "length_to_cm",
     "length_from_cm",
+    "volume_to_cm3",
+    "volume_from_cm3",
+    "compressibility_to_per_atm",
+    "compressibility_from_per_atm",
+    "per_pa_to_per_atm",
+    "per_atm_to_per_pa",
     "pa_s_to_cp",
     "cp_to_pa_s",
     "darcy_to",
@@ -281,6 +289,130 @@ def circle_area_cm2(diameter_cm: float) -> float:
     if diameter_cm <= 0.0:
         raise ValueError(f"diameter must be positive, got {diameter_cm}")
     return math.pi * (diameter_cm / 2.0) ** 2
+
+
+# --------------------------------------------------------------------------
+# Volume
+# --------------------------------------------------------------------------
+
+#: Units for the pulse-decay reservoir volumes. cm^3 is the internal unit,
+#: matching the CGS-Darcy system the physics is worked in.
+SUPPORTED_VOLUME_UNITS: frozenset[str] = frozenset({"cm3", "mL", "L", "m3", "in3"})
+
+_VOLUME_TO_CM3: dict[str, float] = {
+    "cm3": 1.0,
+    "mL": 1.0,  # 1 mL == 1 cm^3 exactly, since the 1964 redefinition of the litre
+    "L": 1.0e3,
+    "m3": 1.0e6,
+    "in3": 16.387_064,  # 2.54^3, exact
+}
+
+_VOLUME_ALIASES: dict[str, str] = {u.lower(): u for u in _VOLUME_TO_CM3}
+_VOLUME_ALIASES.update(
+    {
+        "cc": "cm3",
+        "cm^3": "cm3",
+        "ccm": "cm3",
+        "millilitre": "mL",
+        "milliliter": "mL",
+        "litre": "L",
+        "liter": "L",
+        "m^3": "m3",
+        "in^3": "in3",
+        "cu_in": "in3",
+        "cubic_inch": "in3",
+    }
+)
+
+
+def _normalize_volume_unit(unit: str) -> str:
+    canonical = _VOLUME_ALIASES.get(unit.strip().lower())
+    if canonical is None:
+        supported = ", ".join(sorted(SUPPORTED_VOLUME_UNITS))
+        raise ValueError(
+            f"Unsupported volume unit {unit!r}. Supported units: {supported}."
+        )
+    return canonical
+
+
+def volume_to_cm3(value: float, unit: str) -> float:
+    """Convert a volume in ``unit`` to cm^3 (the internal unit)."""
+    return value * _VOLUME_TO_CM3[_normalize_volume_unit(unit)]
+
+
+def volume_from_cm3(value_cm3: float, unit: str) -> float:
+    """Convert a cm^3 volume out to ``unit``, for display or storage."""
+    return value_cm3 / _VOLUME_TO_CM3[_normalize_volume_unit(unit)]
+
+
+# --------------------------------------------------------------------------
+# Compressibility (reciprocal pressure)
+# --------------------------------------------------------------------------
+
+#: Isothermal gas compressibility is a reciprocal pressure, so its units are
+#: exactly the pressure units inverted. The internal unit is 1/atm, which is
+#: what makes the pulse-decay equation come out in darcy with no extra factor.
+#:
+#: There is deliberately no separate constant table: the factors are derived
+#: from :data:`_PRESSURE_TO_PA`, so adding a pressure unit extends this family
+#: automatically. That is what "units.py owns every constant" means here.
+SUPPORTED_COMPRESSIBILITY_UNITS: frozenset[str] = frozenset(
+    f"1/{unit}" for unit in SUPPORTED_PRESSURE_UNITS
+)
+
+
+def _normalize_compressibility_unit(unit: str) -> str:
+    """Canonicalise ``1/kPa``, ``kPa^-1`` or ``per_kPa`` to ``1/kPa``.
+
+    A bare pressure unit is rejected rather than assumed: ``atm`` and ``1/atm``
+    differ by six orders of magnitude at a typical pore pressure, and silently
+    guessing which was meant is exactly the class of error this module exists
+    to prevent.
+    """
+    text = unit.strip()
+    lowered = text.lower()
+    for prefix in ("1/", "per_", "per "):
+        if lowered.startswith(prefix):
+            base = text[len(prefix) :]
+            break
+    else:
+        if lowered.endswith("^-1"):
+            base = text[:-3]
+        elif lowered.endswith("-1"):
+            base = text[:-2]
+        else:
+            supported = ", ".join(sorted(SUPPORTED_COMPRESSIBILITY_UNITS))
+            raise ValueError(
+                f"Unsupported compressibility unit {unit!r}: it must be a reciprocal "
+                f"pressure, written like '1/kPa'. Supported units: {supported}."
+            )
+    return f"1/{normalize_pressure_unit(base)}"
+
+
+def compressibility_to_per_atm(value: float, unit: str) -> float:
+    """Convert a compressibility in ``unit`` to 1/atm (the internal unit)."""
+    canonical = _normalize_compressibility_unit(unit)[2:]
+    return value * ATM_IN_PA / _PRESSURE_TO_PA[canonical]
+
+
+def compressibility_from_per_atm(value_per_atm: float, unit: str) -> float:
+    """Convert a 1/atm compressibility out to ``unit``."""
+    canonical = _normalize_compressibility_unit(unit)[2:]
+    return value_per_atm * _PRESSURE_TO_PA[canonical] / ATM_IN_PA
+
+
+def per_pa_to_per_atm(value: float) -> float:
+    """Convert a 1/Pa compressibility to 1/atm.
+
+    Named because it is the boundary CoolProp returns at, mirroring
+    :func:`pa_to_atm` for pressures themselves.
+    """
+    return value * ATM_IN_PA
+
+
+def per_atm_to_per_pa(value: float) -> float:
+    """Convert a 1/atm compressibility back to 1/Pa."""
+    return value / ATM_IN_PA
 
 
 # --------------------------------------------------------------------------
