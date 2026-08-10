@@ -502,12 +502,21 @@ The vessels and the transducers are bench hardware, so they live in
 ```yaml
 reservoirs:
   upstream:
-    volume: 400.0     # DEAD volume: vessel + tubing + ports + valves
+    vessel: 380.0     # the calibrated vessel itself
+    dead: 20.0        # tubing + ports + valve internals to the plug face
     unit: cm3
     method: gas expansion
   downstream:
-    volume: 75.0
+    vessel: 65.0
+    dead: 10.0
     unit: cm3
+  spacer_types:       # the bores this rig owns; lengths are per-run
+    wide:
+      internal_diameter: 25.4
+      dimension_unit: mm
+    narrow:
+      internal_diameter: 12.7
+      dimension_unit: mm
   correlation: 0.0    # both sensitivities are POSITIVE, unlike P1/P2
 
 pulse_transducers:    # null reuses the inlet/outlet pair
@@ -523,11 +532,72 @@ pulse_transducers:    # null reuses the inlet/outlet pair
     unit: bar
 ```
 
-**Dead volume, not nameplate volume**: the vessel plus every cm³ of tubing,
-transducer port and valve internal volume up to the plug face. Permeability is
-directly proportional to it, so the tubing you leave out goes straight into the
-result. It is the largest systematic in the method — measure it by gas expansion
-against a reference vessel.
+**Dead volume, not nameplate volume.** `vessel` and `dead` are separate because
+they are established by different means and change independently — the vessel is
+a calibrated object, while the dead volume is the tubing, transducer port and
+valve internals up to the plug face, which changes whenever the rig is
+replumbed. Both go into V1 identically, and the dead volume is the one routinely
+forgotten. Measure both by gas expansion against a reference vessel, not from a
+drawing.
+
+### Spacers
+
+A hollow spacer fitted upstream of the core face is part of the flow path, so
+its internal volume adds to V1.
+
+A spacer is characterised by **two** measurements, and they are established in
+different places. The **internal diameter** belongs to a set of parts bored to
+one size, so it is bench hardware and lives in `spacer_types`. The **length**
+differs from spacer to spacer even within a type, so it is given per fitted
+spacer at run time — the stack is made up to suit the plug in the holder and
+changes between runs without the bench changing. Same split as `flowmeters`:
+defined once, selected per run.
+
+```bash
+gasperm collect --sample samples/core-041.yaml --method pulse_decay \
+    --spacer wide:50 --spacer wide:25 --spacer narrow:30
+```
+
+Repeat `--spacer` to stack; the length is in the type's own `dimension_unit`.
+`--spacer none` declares an empty holder, which is how you override a stack
+that `run.yaml` sets by default:
+
+```yaml
+pulse_decay:
+  upstream_spacers:
+    - {type: wide, length: 50.0}
+    - {type: narrow, length: 30.0}
+```
+
+Volume is the cylinder `π(d/2)²·L` plus each type's `end_correction_cm3`, which
+is there for chamfers, o-ring grooves and counterbores the plain cylinder
+misses. **Bore enters squared**, so its caliper uncertainty counts double —
+the same reason the plug's diameter dominates the steady-state budget. An
+unknown type name is fatal at startup and names the bores you do have, so a
+typo never becomes a quietly wrong V1.
+
+How much a miscounted stack costs you **depends on the rig**, so `collect`
+prints the figure at startup rather than asserting a rule. What scales the
+permeability is the *effective* volume `V1·V2/(V1+V2)`, which the **smaller**
+side dominates:
+
+| | 3 × 5 cm³ spacers shift k by |
+|---|---|
+| V1 = 400, V2 = 75 cm³ | **0.6 %** |
+| V1 = V2 = 20 cm³ | **27 %** |
+
+So on a large upstream vessel the stack barely matters — but it matters a great
+deal once you shrink the vessels to get the run time down, which is exactly the
+change you would make for a microdarcy plug. The stack is recorded in every
+run's summary as `type:length` entries, so a series measured at different stack
+heights is never confused with one measured at the same.
+
+Their uncertainty follows how the two measurements actually correlate. **Bore
+error is shared** by every spacer of a type — they are bored to one spec — so it
+sums within a type and adds in quadrature across types. **Length error is
+independent**, since each spacer is measured separately, so those grow as
+`sqrt(n)`. Treating the bore as independent too would understate the stack by
+roughly `sqrt(n)`.
 
 The run-level knobs live in `run.yaml`:
 

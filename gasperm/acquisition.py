@@ -430,8 +430,11 @@ class PulseProcessor(_ChannelProcessor):
             pulse_config, min_pulse_atm=pulse_config.min_pulse_pressure_atm
         )
         reservoirs = config.hardware.reservoirs
-        self.upstream_volume_cm3 = reservoirs.upstream.volume_cm3
-        self.downstream_volume_cm3 = reservoirs.downstream.volume_cm3
+        # The spacer stack is part of V1 and is decided per run, so the total
+        # is composed once here rather than read off the vessel.
+        self.upstream_spacers = list(pulse_config.upstream_spacers)
+        self.upstream_volume_cm3 = reservoirs.upstream_volume_cm3(self.upstream_spacers)
+        self.downstream_volume_cm3 = reservoirs.downstream_volume_cm3()
         self.porosity_fraction = config.sample.porosity_fraction
         self.storage_correction = self._resolve_storage_correction()
 
@@ -1510,6 +1513,10 @@ def summarize_pulse_decay_run(
         residual_autocorrelation=fit.residual_autocorrelation,
         upstream_volume_cm3=processor.upstream_volume_cm3,
         downstream_volume_cm3=processor.downstream_volume_cm3,
+        upstream_spacers=[str(f) for f in processor.upstream_spacers],
+        spacer_volume_cm3=config.hardware.reservoirs.spacer_volume_cm3(
+            processor.upstream_spacers
+        ),
         upstream_storage_ratio=storage_ratio_up,
         downstream_storage_ratio=storage_ratio_down,
         storage_root=theta,
@@ -1571,6 +1578,7 @@ def summarize_pulse_decay_run(
                     temperature_c=mean_t,
                     upstream_volume_cm3=processor.upstream_volume_cm3,
                     downstream_volume_cm3=processor.downstream_volume_cm3,
+                    upstream_spacers=processor.upstream_spacers,
                     porosity_fraction=(
                         processor.porosity_fraction
                         if processor.storage_correction == "dicker_smits"

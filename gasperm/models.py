@@ -495,8 +495,15 @@ class PulseDecayResult(BaseModel):
     residual_autocorrelation: float | None = None
 
     # -- the rig it was measured on ---------------------------------------
+    #: V1 as assembled for this run: vessel + dead volume + the spacer stack.
     upstream_volume_cm3: float
     downstream_volume_cm3: float
+    #: The spacers fitted upstream, as ``"type:length"`` strings. Recorded
+    #: because they are part of V1, and because a series measured at different
+    #: stack heights is otherwise indistinguishable from one measured at the
+    #: same -- the record is what makes that checkable afterwards.
+    upstream_spacers: list[str] = Field(default_factory=list)
+    spacer_volume_cm3: float = 0.0
     #: ``V_pore / V1`` and ``V_pore / V2``. ``None`` when porosity is unrecorded
     #: and the zero-storage form was used.
     upstream_storage_ratio: float | None = None

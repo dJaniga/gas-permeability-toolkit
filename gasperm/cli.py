@@ -52,6 +52,49 @@ app = typer.Typer(
 # --------------------------------------------------------------------------
 
 
+def _parse_spacers(values: list[str], config: GaspermConfig) -> list:
+    """Turn ``--spacer TYPE:LENGTH`` arguments into fittings.
+
+    Repeat the flag to stack: ``--spacer wide:50 --spacer wide:50`` is two of
+    them. The single word ``none`` declares an empty holder, which is how you
+    override a stack that ``run.yaml`` defines by default -- without it there
+    would be no way to say "no spacers today" on the command line.
+
+    Raises:
+        ValueError: a malformed argument, an unknown bore, or a bad length.
+            All caught before the DAQ is opened.
+    """
+    from gasperm.config import SpacerFitting
+
+    if len(values) == 1 and values[0].strip().lower() == "none":
+        return []
+
+    fittings: list[SpacerFitting] = []
+    for raw in values:
+        text = raw.strip()
+        if ":" not in text:
+            raise ValueError(
+                f"--spacer {raw!r} should be TYPE:LENGTH, e.g. 'wide:50'. Bores "
+                "available: "
+                + (", ".join(sorted(config.hardware.reservoirs.spacer_types)) or "(none)")
+            )
+        name, _, length_text = text.partition(":")
+        name = name.strip()
+        # Resolve the bore now so a typo fails here, naming the alternatives,
+        # rather than surfacing later as a quietly wrong V1.
+        config.hardware.reservoirs.resolve_spacer_type(name)
+        try:
+            length = float(length_text)
+        except ValueError:
+            raise ValueError(
+                f"--spacer {raw!r}: {length_text!r} is not a length."
+            ) from None
+        if length <= 0.0:
+            raise ValueError(f"--spacer {raw!r}: the length must be positive.")
+        fittings.append(SpacerFitting(type=name, length=length))
+    return fittings
+
+
 def _fail(message: str) -> None:
     """Print an error to stderr and exit non-zero."""
     typer.secho(message, fg=typer.colors.RED, err=True)
@@ -791,6 +834,13 @@ def collect_command(
         help="Measurement method for this run. pulse_decay reads no flowmeter "
              "and requires a closed downstream vessel.",
     ),
+    spacer: Optional[list[str]] = typer.Option(
+        None, "--spacer", metavar="TYPE:LENGTH",
+        help="One hollow spacer fitted upstream, e.g. 'wide:50'. Repeat to "
+             "stack. Bores are defined in hardware.reservoirs.spacer_types; "
+             "the length is in that type's dimension_unit. Replaces run.yaml's "
+             "list entirely, so '--spacer none' declares an empty holder.",
+    ),
     plot: bool = typer.Option(
         False, "--plot",
         help="Open a live window: one stacked panel per parameter, with the "
@@ -910,6 +960,13 @@ def collect_command(
         try:
             config.run.method = method
         except Exception as exc:  # noqa: BLE001 - pydantic enforces the pairing
+            _fail(str(exc))
+            return
+
+    if spacer:
+        try:
+            config.run.pulse_decay.upstream_spacers = _parse_spacers(spacer, config)
+        except ValueError as exc:
             _fail(str(exc))
             return
 
@@ -1192,13 +1249,26 @@ def _print_pulse_criteria(config: GaspermConfig, processor) -> None:
     """Startup banner for a pulse-decay run: vessels, criteria, expected length."""
     pulse = config.run.pulse_decay
     reservoirs = config.hardware.reservoirs
+    spacers = pulse.upstream_spacers
     typer.secho(
-        f"Pulse decay: V1 = {reservoirs.upstream.volume_cm3:g} cm3, "
-        f"V2 = {reservoirs.downstream.volume_cm3:g} cm3 "
-        f"(effective {reservoirs.effective_volume_cm3:.4g} cm3), "
+        f"Pulse decay: {reservoirs.describe(spacers)}"
+        f"   effective {reservoirs.effective_volume_cm3(spacers):.4g} cm3, "
         f"{processor.storage_correction.replace('_', '-')} model",
         fg=typer.colors.CYAN,
     )
+    if spacers:
+        effect = (
+            reservoirs.effective_volume_cm3(spacers)
+            / reservoirs.effective_volume_cm3()
+            - 1.0
+        )
+        stack = ", ".join(str(fitting) for fitting in spacers)
+        typer.secho(
+            f"Confirm {len(spacers)} spacer{'s' if len(spacers) != 1 else ''} "
+            f"[{stack}] {'are' if len(spacers) != 1 else 'is'} actually fitted: "
+            f"they raise the reported k by {effect:.2%}.",
+            fg=typer.colors.YELLOW,
+        )
     typer.secho(
         f"Apply a pulse of at least {pulse.min_pulse_pressure:g} "
         f"{pulse.pulse_pressure_unit}; the run ends at dP/dP0 = "
@@ -1262,9 +1332,16 @@ def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
         f"  [{result.fit_model}]"
     )
     vessels = (
-        f"  vessels             V1 = {result.upstream_volume_cm3:g} cm3, "
-        f"V2 = {result.downstream_volume_cm3:g} cm3"
+        f"  volumes             V1 = {result.upstream_volume_cm3:g} cm3"
     )
+    if result.upstream_spacers:
+        vessels += (
+            f" (incl. {len(result.upstream_spacers)} spacer"
+            f"{'s' if len(result.upstream_spacers) != 1 else ''} = "
+            f"{result.spacer_volume_cm3:g} cm3: "
+            f"{', '.join(result.upstream_spacers)})"
+        )
+    vessels += f", V2 = {result.downstream_volume_cm3:g} cm3"
     if result.upstream_storage_ratio is not None:
         vessels += (
             f"    a1 = {result.upstream_storage_ratio:.3f}, "

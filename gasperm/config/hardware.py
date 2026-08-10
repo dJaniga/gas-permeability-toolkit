@@ -8,7 +8,8 @@ or a new pressure step is run. Keeping it separate is what makes
 
 from __future__ import annotations
 
-from typing import Literal
+import math
+from typing import Any, Literal, Sequence
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -363,20 +364,108 @@ class PulseTransducersConfig(_Base):
     correlation: float = Field(default=0.0, ge=-1.0, le=1.0)
 
 
-class ReservoirConfig(_Base):
-    """One pulse-decay vessel: its **dead volume** and how well that is known.
+class SpacerTypeConfig(_Base):
+    """One **bore** of hollow spacer: the property a whole set of them shares.
 
-    Dead volume, not nameplate volume: the vessel plus every cm^3 of tubing,
-    transducer port and valve internal volume up to the plug face. "The vessel
-    is 400 mL" is wrong by the tubing, and since permeability is directly
-    proportional to this number, that error goes straight into the result. It
-    is the largest systematic in the method.
+    A spacer is characterised by two measurements, and they belong in different
+    places. The **internal diameter** is a property of the type -- a set of
+    spacers bored to one size -- and is a bench fact, so it lives here. The
+    **length** differs from spacer to spacer even within a type, so it is given
+    per fitted spacer in ``run.pulse_decay.upstream_spacers``.
+
+    Volume is computed as a cylinder, ``pi (d/2)^2 L``, plus
+    :attr:`end_correction`. Diameter enters **squared**, so its caliper
+    uncertainty counts double -- the same reason the plug's diameter dominates
+    the steady-state budget.
     """
 
-    volume: float = Field(default=100.0, gt=0.0)
+    #: Internal (gas-holding) bore, in :attr:`dimension_unit`.
+    internal_diameter: float = Field(gt=0.0)
+    #: Unit for the bore **and** for the lengths given per fitted spacer -- both
+    #: come off the same calipers, so one unit covers them.
+    dimension_unit: str = "mm"
+    description: str = ""
+    #: Volume the plain cylinder misses: chamfers, o-ring grooves, counterbores.
+    #: cm^3, and signed -- negative for anything that displaces gas.
+    end_correction_cm3: float = 0.0
+    #: Standard uncertainty of the bore, in :attr:`dimension_unit`. Systematic
+    #: across spacers of one type: they are bored to one spec, so an error in
+    #: the figure is shared by all of them rather than averaging out.
+    diameter_uncertainty: float = Field(default=0.05, ge=0.0)
+    #: Standard uncertainty of each spacer's length. Independent between
+    #: spacers, since each is measured separately.
+    length_uncertainty: float = Field(default=0.1, ge=0.0)
+
+    @field_validator("dimension_unit")
+    @classmethod
+    def _check_dimension_unit(cls, value: str) -> str:
+        units.length_to_cm(1.0, value)  # raises ValueError on an unknown unit
+        return value
+
+    @property
+    def internal_diameter_cm(self) -> float:
+        return units.length_to_cm(self.internal_diameter, self.dimension_unit)
+
+    @property
+    def bore_area_cm2(self) -> float:
+        """Cross-sectional area of the bore, cm^2."""
+        return units.circle_area_cm2(self.internal_diameter_cm)
+
+    def volume_cm3(self, length: float) -> float:
+        """Internal volume of one spacer of this type, cm^3.
+
+        Args:
+            length: That spacer's length, in :attr:`dimension_unit`.
+        """
+        length_cm = units.length_to_cm(length, self.dimension_unit)
+        return self.bore_area_cm2 * length_cm + self.end_correction_cm3
+
+    def relative_diameter_uncertainty(self) -> float:
+        """``u(d)/d`` -- doubled when it reaches the volume, since V ~ d^2."""
+        if self.internal_diameter <= 0.0:
+            return math.inf
+        return self.diameter_uncertainty / self.internal_diameter
+
+    def length_uncertainty_cm3(self) -> float:
+        """``u(V)`` from ONE spacer's length uncertainty alone, cm^3."""
+        return self.bore_area_cm2 * units.length_to_cm(
+            self.length_uncertainty, self.dimension_unit
+        )
+
+
+def _default_spacer_types() -> dict[str, SpacerTypeConfig]:
+    """Two bores, the usual arrangement. Rename or replace to suit the rig."""
+    return {
+        "wide": SpacerTypeConfig(
+            internal_diameter=25.4, dimension_unit="mm", description="1 in bore"
+        ),
+        "narrow": SpacerTypeConfig(
+            internal_diameter=12.7, dimension_unit="mm", description="1/2 in bore"
+        ),
+    }
+
+
+class ReservoirConfig(_Base):
+    """One side's fixed gas volume, split into the parts you measure separately.
+
+    Two entries rather than one total, because they are established by
+    different means and change independently: the **vessel** is a calibrated
+    object, while the **dead volume** is the tubing, transducer port and valve
+    internals up to the plug face, which changes whenever the rig is replumbed.
+    Lumping them hides which one moved.
+
+    Both matter equally to the result -- permeability is directly proportional
+    to their sum -- and dead volume is the one routinely forgotten. "The vessel
+    is 400 mL" is wrong by the tubing, and that error goes straight into k.
+    """
+
+    #: The calibrated vessel itself, in :attr:`unit`.
+    vessel: float = Field(default=100.0, ge=0.0)
+    #: Tubing, transducer port and valve internal volume up to the plug face.
+    dead: float = Field(default=0.0, ge=0.0)
     unit: str = "cm3"
-    #: How the volume was determined -- gas expansion against a reference
-    #: vessel, water fill, CAD. Provenance, like ``calibrated_by``.
+    #: How these were determined -- gas expansion against a reference vessel,
+    #: water fill, CAD. Provenance, like ``calibrated_by``.
     method: str = ""
     uncertainty: UncertaintySpec = Field(
         default_factory=lambda: UncertaintySpec(
@@ -390,23 +479,53 @@ class ReservoirConfig(_Base):
         units.volume_to_cm3(1.0, value)  # raises ValueError on an unknown unit
         return value
 
+    @model_validator(mode="after")
+    def _some_volume_exists(self) -> ReservoirConfig:
+        if self.vessel + self.dead <= 0.0:
+            raise ValueError(
+                "a reservoir needs a positive total volume; both 'vessel' and "
+                "'dead' are zero"
+            )
+        return self
+
     @property
-    def volume_cm3(self) -> float:
-        """The dead volume in the internal unit."""
-        return units.volume_to_cm3(self.volume, self.unit)
+    def fixed_volume_cm3(self) -> float:
+        """Vessel plus dead volume, cm^3 -- everything except the spacers.
+
+        Named ``fixed`` deliberately: the upstream side's *total* depends on how
+        many spacers this run has, so a bare ``volume_cm3`` would be a quietly
+        wrong number half the time. Go through
+        :meth:`ReservoirsConfig.upstream_volume_cm3` for the total.
+        """
+        return units.volume_to_cm3(self.vessel + self.dead, self.unit)
+
+    @property
+    def fixed_uncertainty_cm3(self) -> float:
+        """Standard uncertainty of the fixed part, cm^3."""
+        total = self.vessel + self.dead
+        return units.volume_to_cm3(
+            self.uncertainty.standard_uncertainty(total, total), self.unit
+        )
 
 
 class ReservoirsConfig(_Base):
-    """The two closed vessels either side of the plug, for pulse decay.
+    """The two closed volumes either side of the plug, for pulse decay.
 
     Only read when ``run.method`` is ``pulse_decay``.
     """
 
     upstream: ReservoirConfig = Field(
-        default_factory=lambda: ReservoirConfig(volume=400.0)
+        default_factory=lambda: ReservoirConfig(vessel=380.0, dead=20.0)
     )
     downstream: ReservoirConfig = Field(
-        default_factory=lambda: ReservoirConfig(volume=75.0)
+        default_factory=lambda: ReservoirConfig(vessel=65.0, dead=10.0)
+    )
+    #: The hollow spacer bores this rig owns, by name. Which spacers are
+    #: actually fitted -- and how long each is -- is a per-run decision in
+    #: ``run.pulse_decay.upstream_spacers``. Same split as ``flowmeters``:
+    #: defined once on the bench, selected per run.
+    spacer_types: dict[str, SpacerTypeConfig] = Field(
+        default_factory=_default_spacer_types
     )
     #: Correlation between the two volume errors -- two vessels calibrated the
     #: same way against the same reference share a systematic. Unlike the P1/P2
@@ -414,16 +533,114 @@ class ReservoirsConfig(_Base):
     #: correlation *increases* the combined uncertainty, by up to sqrt(2).
     correlation: float = Field(default=0.0, ge=-1.0, le=1.0)
 
-    @property
-    def effective_volume_cm3(self) -> float:
+    def resolve_spacer_type(self, name: str) -> SpacerTypeConfig:
+        """The named bore, or a ``ValueError`` naming what is defined.
+
+        Raises:
+            ValueError: no such type. Caught at ``collect`` startup, so a typo
+                in a stack never becomes a silently wrong V1.
+        """
+        try:
+            return self.spacer_types[name]
+        except KeyError:
+            available = ", ".join(sorted(self.spacer_types)) or "(none defined)"
+            raise ValueError(
+                f"spacer type {name!r} is not defined in "
+                f"hardware.reservoirs.spacer_types. Available: {available}"
+            ) from None
+
+    def spacer_volume_cm3(self, spacers: Sequence[Any] = ()) -> float:
+        """Total volume of the fitted stack, cm^3.
+
+        Args:
+            spacers: Fitted spacers, each with ``.type`` and ``.length``.
+        """
+        return sum(
+            self.resolve_spacer_type(fitting.type).volume_cm3(fitting.length)
+            for fitting in spacers
+        )
+
+    def upstream_volume_cm3(self, spacers: Sequence[Any] = ()) -> float:
+        """V1 for a run with this stack fitted: vessel + dead + the spacers."""
+        return self.upstream.fixed_volume_cm3 + self.spacer_volume_cm3(spacers)
+
+    def downstream_volume_cm3(self) -> float:
+        """V2. No spacers: they sit upstream of the core face."""
+        return self.downstream.fixed_volume_cm3
+
+    def spacer_uncertainty_cm3(self, spacers: Sequence[Any] = ()) -> float:
+        """``u`` of the whole stack's volume, cm^3.
+
+        The two measurements behave differently and are combined accordingly:
+
+        **Bore** -- shared by every spacer of a type, since they are bored to
+        one spec, so an error in that figure moves all of them the same way.
+        It is summed *within* a type (fully correlated) and added in quadrature
+        *across* types, and it enters doubled because ``V ~ d^2``.
+
+        **Length** -- measured separately for each spacer, so those errors are
+        independent and add in quadrature, growing as ``sqrt(n)`` rather than
+        ``n``.
+
+        Treating the bore as independent too would understate the stack by
+        roughly ``sqrt(n)``, which is the whole reason this is not a simple
+        per-spacer sum.
+        """
+        by_type: dict[str, list[float]] = {}
+        for fitting in spacers:
+            by_type.setdefault(fitting.type, []).append(fitting.length)
+
+        variance = 0.0
+        for name, lengths in by_type.items():
+            spacer_type = self.resolve_spacer_type(name)
+            # Bore: correlated, so the type's total volume scales together.
+            type_volume = sum(spacer_type.volume_cm3(length) for length in lengths)
+            from_bore = 2.0 * spacer_type.relative_diameter_uncertainty() * type_volume
+            # Length: independent per spacer.
+            from_lengths = spacer_type.length_uncertainty_cm3() * math.sqrt(len(lengths))
+            variance += from_bore**2 + from_lengths**2
+        return math.sqrt(variance)
+
+    def upstream_uncertainty_cm3(self, spacers: Sequence[Any] = ()) -> float:
+        """u(V1), cm^3: the fixed volume and the stack, in quadrature."""
+        return math.hypot(
+            self.upstream.fixed_uncertainty_cm3, self.spacer_uncertainty_cm3(spacers)
+        )
+
+    def downstream_uncertainty_cm3(self) -> float:
+        """u(V2), cm^3."""
+        return self.downstream.fixed_uncertainty_cm3
+
+    def effective_volume_cm3(self, spacers: Sequence[Any] = ()) -> float:
         """``V1 V2 / (V1 + V2)`` -- what actually sets the decay rate.
 
-        The harmonic combination is dominated by the *smaller* vessel, which is
-        why enlarging only the big one barely changes the run time.
+        The harmonic combination is dominated by the *smaller* volume, which is
+        why enlarging only the big one barely changes the run time, and why
+        spacers on a large upstream side move it very little.
         """
-        v1 = self.upstream.volume_cm3
-        v2 = self.downstream.volume_cm3
+        v1 = self.upstream_volume_cm3(spacers)
+        v2 = self.downstream_volume_cm3()
         return v1 * v2 / (v1 + v2)
+
+    def describe(self, spacers: Sequence[Any] = ()) -> str:
+        """One-line breakdown for the console, e.g. for the startup banner."""
+        upstream = self.upstream
+        text = (
+            f"V1 = {self.upstream_volume_cm3(spacers):g} cm3 "
+            f"(vessel {units.volume_to_cm3(upstream.vessel, upstream.unit):g}"
+            f" + dead {units.volume_to_cm3(upstream.dead, upstream.unit):g}"
+        )
+        if spacers:
+            stack = ", ".join(
+                f"{fitting.type} {fitting.length:g}"
+                f"{self.resolve_spacer_type(fitting.type).dimension_unit}"
+                for fitting in spacers
+            )
+            text += (
+                f" + {self.spacer_volume_cm3(spacers):g} spacers [{stack}]"
+            )
+        text += f"),  V2 = {self.downstream_volume_cm3():g} cm3"
+        return text
 
 
 class HardwareConfig(_Base):

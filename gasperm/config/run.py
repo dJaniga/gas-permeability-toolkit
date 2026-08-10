@@ -24,6 +24,7 @@ __all__ = [
     "SteadyStateConfig",
     "UncertaintyReportConfig",
     "PulseDecayConfig",
+    "SpacerFitting",
     "LivePlotConfig",
     "PLOT_PANELS",
     "MEASUREMENT_METHODS",
@@ -187,6 +188,23 @@ class UncertaintyReportConfig(_Base):
     max_component_contribution: float | None = Field(default=0.25, gt=0.0)
 
 
+class SpacerFitting(_Base):
+    """One hollow spacer actually fitted upstream of the core, for this run.
+
+    The ``type`` names a bore defined in ``hardware.reservoirs.spacer_types``;
+    the ``length`` is that particular spacer's, in the type's own
+    ``dimension_unit``. Two measurements, split the way they are actually
+    established: the bore is a property of a set of parts, the length is a
+    property of the one you just put in.
+    """
+
+    type: str
+    length: float = Field(gt=0.0)
+
+    def __str__(self) -> str:  # for messages and the console
+        return f"{self.type}:{self.length:g}"
+
+
 class PulseDecayConfig(_Base):
     """When a pulse-decay run is finished, and which part of it is the answer.
 
@@ -211,6 +229,17 @@ class PulseDecayConfig(_Base):
     times the time and is slightly *worse*. Hence a fit window of 0.90 to 0.50
     and a stop at 0.40, not 0.05.
     """
+
+    # -- the rig, as assembled for THIS run --------------------------------
+    #: The hollow spacers stacked upstream of the core face, in order, each as
+    #: ``{type, length}``. Their internal volume is part of V1, and V1 is in
+    #: the equation, so a stack recorded wrongly moves the result.
+    #:
+    #: This lives here rather than in hardware.yaml because the stack is made
+    #: up to suit the plug in the holder and changes between runs without the
+    #: bench changing. The bores are in ``hardware.reservoirs.spacer_types``.
+    #: Override per run with ``--spacer TYPE:LENGTH`` (repeat it to stack).
+    upstream_spacers: list[SpacerFitting] = Field(default_factory=list)
 
     # -- the pulse --------------------------------------------------------
     #: Smallest differential that counts as a pulse having been applied. Below

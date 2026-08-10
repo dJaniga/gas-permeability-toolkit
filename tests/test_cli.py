@@ -921,10 +921,58 @@ class TestPulseDecayFlags:
         # which is the point: the refusal was not a config one.
         assert "CLOSED downstream vessel" not in strip_ansi(result.output)
 
+    def test_a_malformed_spacer_is_refused(self, tmp_path):
+        result = self._collect(tmp_path, "--method", "pulse_decay", "--spacer", "wide")
+        assert result.exit_code == 1
+        assert "TYPE:LENGTH" in strip_ansi(result.output)
+
+    def test_an_unknown_bore_is_refused_and_lists_the_real_ones(self, tmp_path):
+        result = self._collect(
+            tmp_path, "--method", "pulse_decay", "--spacer", "enormous:50"
+        )
+        assert result.exit_code == 1
+        plain = strip_ansi(result.output)
+        assert "enormous" in plain
+        assert "wide" in plain and "narrow" in plain
+
+    def test_a_bad_length_is_refused(self, tmp_path):
+        result = self._collect(
+            tmp_path, "--method", "pulse_decay", "--spacer", "wide:abc"
+        )
+        assert result.exit_code == 1
+        assert "not a length" in strip_ansi(result.output)
+
+    def test_the_stack_reaches_the_config(self, tmp_path):
+        """The stack changes per run, so it is a run-level list."""
+        init_config(tmp_path, "run.method=pulse_decay")
+        config = load_config(tmp_path, sample=add_sample(tmp_path / "samples", "core-041"))
+        from gasperm.config import SpacerFitting
+
+        config.run.pulse_decay.upstream_spacers = [
+            SpacerFitting(type="wide", length=50.0),
+            SpacerFitting(type="narrow", length=25.0),
+        ]
+        reservoirs = config.hardware.reservoirs
+        expected = reservoirs.spacer_types["wide"].volume_cm3(50.0) + reservoirs.spacer_types[
+            "narrow"
+        ].volume_cm3(25.0)
+        assert reservoirs.upstream_volume_cm3(
+            config.run.pulse_decay.upstream_spacers
+        ) == pytest.approx(400.0 + expected)
+
+    def test_the_bores_survive_a_config_round_trip(self, tmp_path):
+        init_config(tmp_path, "run.method=pulse_decay")
+        config = load_config(tmp_path, sample=add_sample(tmp_path / "samples", "core-041"))
+        types = config.hardware.reservoirs.spacer_types
+        assert set(types) == {"wide", "narrow"}
+        assert types["wide"].internal_diameter == pytest.approx(25.4)
+        assert types["narrow"].internal_diameter == pytest.approx(12.7)
+
     def test_the_flags_are_documented_in_help(self):
         result = runner.invoke(app, ["collect", "--help"], env={"COLUMNS": "200"})
         plain = strip_ansi(result.output)
         assert "--method" in plain
+        assert "--spacer" in plain
         result = runner.invoke(app, ["klinkenberg", "--help"], env={"COLUMNS": "200"})
         assert "--allow-mixed-methods" in strip_ansi(result.output)
 
@@ -933,8 +981,12 @@ class TestPulseDecayFlags:
         sample = add_sample(tmp_path / "samples", "core-041")
         config = load_config(tmp_path, sample=sample)
         assert config.run.method == "pulse_decay"
-        assert config.hardware.reservoirs.upstream.volume_cm3 == pytest.approx(400.0)
-        assert config.hardware.reservoirs.downstream.volume_cm3 == pytest.approx(75.0)
+        reservoirs = config.hardware.reservoirs
+        assert reservoirs.upstream_volume_cm3() == pytest.approx(400.0)
+        assert reservoirs.downstream_volume_cm3() == pytest.approx(75.0)
+        # Split into the parts that are separately measured.
+        assert reservoirs.upstream.vessel == pytest.approx(380.0)
+        assert reservoirs.upstream.dead == pytest.approx(20.0)
 
 
 class TestVersion:

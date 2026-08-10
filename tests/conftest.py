@@ -60,8 +60,10 @@ def pulse_config(base_config: GaspermConfig) -> GaspermConfig:
     """
     base_config.run.method = "pulse_decay"
     base_config.hardware.daq.sample_rate_hz = 1000.0
-    base_config.hardware.reservoirs.upstream.volume = 8.0
-    base_config.hardware.reservoirs.downstream.volume = 8.0
+    base_config.hardware.reservoirs.upstream.vessel = 8.0
+    base_config.hardware.reservoirs.upstream.dead = 0.0
+    base_config.hardware.reservoirs.downstream.vessel = 8.0
+    base_config.hardware.reservoirs.downstream.dead = 0.0
     base_config.sample.porosity_fraction = 0.10
     base_config.run.pulse_decay.fit_bin_s = None
     base_config.run.pulse_decay.min_fit_samples = 10

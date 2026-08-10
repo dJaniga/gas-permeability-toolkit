@@ -108,6 +108,7 @@ steady_state:
 # The run continues a little past the window (stop_below_fraction) so
 # there is data below it to pin the fitted offset.
 pulse_decay:
+  upstream_spacers: []                        # spacers fitted this run; --spacers overrides
   min_pulse_pressure: 20.0                    # smallest differential that counts as a pulse
   pulse_pressure_unit: kPa
   max_pulse_fraction: 0.1                     # largest dP0/P_mean the linearisation allows

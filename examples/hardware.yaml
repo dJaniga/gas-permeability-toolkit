@@ -122,7 +122,8 @@ default_flowmeter: low_range                  # used when run.yaml leaves 'flowm
 # dominates, so enlarging only the big one barely changes the run time.
 reservoirs:
   upstream:
-    volume: 400.0                             # DEAD volume: vessel + tubing + ports + valves
+    vessel: 380.0                             # the calibrated vessel itself
+    dead: 20.0                                # tubing + ports + valve internals to the plug face
     unit: cm3                                 # one of: L, cm3, in3, m3, mL
     method: ''                                # gas expansion | water fill | CAD
     uncertainty:
@@ -133,7 +134,8 @@ reservoirs:
       degrees_of_freedom: null
       source: vessel calibration
   downstream:
-    volume: 75.0                              # the smaller vessel dominates the decay rate
+    vessel: 65.0                              # the smaller side dominates the decay rate
+    dead: 10.0                                # tubing + ports + valve internals to the plug face
     unit: cm3                                 # one of: L, cm3, in3, m3, mL
     method: ''                                # gas expansion | water fill | CAD
     uncertainty:
@@ -143,6 +145,21 @@ reservoirs:
       coverage_factor: 2.0
       degrees_of_freedom: null
       source: vessel calibration
+  spacer_types:
+    wide:
+      internal_diameter: 25.4
+      dimension_unit: mm
+      description: 1 in bore
+      end_correction_cm3: 0.0
+      diameter_uncertainty: 0.05
+      length_uncertainty: 0.1
+    narrow:
+      internal_diameter: 12.7
+      dimension_unit: mm
+      description: 1/2 in bore
+      end_correction_cm3: 0.0
+      diameter_uncertainty: 0.05
+      length_uncertainty: 0.1
   # Two vessels calibrated the same way share a systematic error. Unlike
   # the P1/P2 case, BOTH volume sensitivities are positive, so a positive
   # correlation INCREASES the combined uncertainty.

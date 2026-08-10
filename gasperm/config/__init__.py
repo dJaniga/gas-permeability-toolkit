@@ -50,6 +50,7 @@ from gasperm.config.hardware import (
     PulseTransducersConfig,
     ReservoirConfig,
     ReservoirsConfig,
+    SpacerTypeConfig,
     TemperatureConfig,
 )
 from gasperm.config.run import (
@@ -59,6 +60,7 @@ from gasperm.config.run import (
     LivePlotConfig,
     PulseDecayConfig,
     RunConfig,
+    SpacerFitting,
     SteadyStateConfig,
     UncertaintyReportConfig,
 )
@@ -86,6 +88,8 @@ __all__ = [
     "PulseTransducersConfig",
     "ReservoirConfig",
     "ReservoirsConfig",
+    "SpacerTypeConfig",
+    "SpacerFitting",
     "PressureCalibrationConfig",
     "FlowmeterConfig",
     "TemperatureConfig",
@@ -502,6 +506,17 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
             "The decay rate is set by V1*V2/(V1+V2), which the SMALLER vessel\n"
             "dominates, so enlarging only the big one barely changes the run time."
         ),
+        "reservoirs.spacer": (
+            "The hollow spacer stacked upstream of the core face. Its internal\n"
+            "volume is part of V1, so a miscounted stack moves the result. How far\n"
+            "depends on the rig: what scales k is V1*V2/(V1+V2), dominated by the\n"
+            "SMALLER side. On a 400/75 cm3 pair three 5 cm3 spacers shift k by 0.6%;\n"
+            "on a 20/20 cm3 pair the same three shift it by 27%. 'collect' reports\n"
+            "the figure for YOUR rig at startup.\n"
+            "HOW MANY are fitted is a per-run decision -- see\n"
+            "run.pulse_decay.upstream_spacers, or 'collect --spacers N'. Set this\n"
+            "block to null on a rig with no spacers."
+        ),
         "reservoirs.correlation": (
             "Two vessels calibrated the same way share a systematic error. Unlike\n"
             "the P1/P2 case, BOTH volume sensitivities are positive, so a positive\n"
@@ -554,12 +569,16 @@ def render_hardware_yaml(config: GaspermConfig) -> str:
         "pressure_calibration.outlet.unit": "independent of inlet: may be 'bar' here",
         "pressure_calibration.outlet.reading_type": "gauge adds run.atmospheric_pressure",
         "default_flowmeter": "used when run.yaml leaves 'flowmeter' null",
-        "reservoirs.upstream.volume": "DEAD volume: vessel + tubing + ports + valves",
+        "reservoirs.upstream.vessel": "the calibrated vessel itself",
+        "reservoirs.upstream.dead": "tubing + ports + valve internals to the plug face",
         "reservoirs.upstream.unit": f"one of: {_SUPPORTED_VOLUME}",
         "reservoirs.upstream.method": "gas expansion | water fill | CAD",
-        "reservoirs.downstream.volume": "the smaller vessel dominates the decay rate",
+        "reservoirs.downstream.vessel": "the smaller side dominates the decay rate",
+        "reservoirs.downstream.dead": "tubing + ports + valve internals to the plug face",
         "reservoirs.downstream.unit": f"one of: {_SUPPORTED_VOLUME}",
         "reservoirs.downstream.method": "gas expansion | water fill | CAD",
+        "reservoirs.spacer.volume": "internal volume of ONE spacer",
+        "reservoirs.spacer.unit": f"one of: {_SUPPORTED_VOLUME}",
         "temperature.parse_pattern": "'{value}' marks the number; null = first float",
         "temperature.conversion_time_s": "DS18B20: 0.75 s at 12-bit, 0.19 s at 9-bit",
         "temperature.warmup_timeout_s": "startup wait for the probe's first reading",
@@ -747,6 +766,7 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "warn when one input is worth this fraction of k"
         ),
         "method": "steady_state | pulse_decay",
+        "pulse_decay.upstream_spacers": "spacers fitted this run; --spacers overrides",
         "pulse_decay.min_pulse_pressure": "smallest differential that counts as a pulse",
         "pulse_decay.max_pulse_fraction": "largest dP0/P_mean the linearisation allows",
         "pulse_decay.stop_below_fraction": "end the run at this dP/dP0",
@@ -994,11 +1014,21 @@ def _pulse_decay_problems(config: GaspermConfig) -> list[str]:
 
     for side in ("upstream", "downstream"):
         vessel = getattr(reservoirs, side)
-        volume = vessel.volume_cm3
+        volume = vessel.fixed_volume_cm3
         if not math.isfinite(volume) or volume <= 0.0:
             problems.append(
-                f"hardware.reservoirs.{side}.volume is not a usable dead volume "
-                f"({vessel.volume} {vessel.unit})."
+                f"hardware.reservoirs.{side} has no usable volume "
+                f"(vessel {vessel.vessel} + dead {vessel.dead} {vessel.unit})."
+            )
+
+    for fitting in pulse.upstream_spacers:
+        try:
+            reservoirs.resolve_spacer_type(fitting.type)
+        except ValueError as exc:
+            problems.append(
+                f"run.pulse_decay.upstream_spacers lists {fitting}, but {exc}. Each "
+                "spacer is part of V1, which is in the equation, so its bore cannot "
+                "be guessed."
             )
 
     if pulse.storage_correction == "dicker_smits" and (
@@ -1024,15 +1054,46 @@ def _pulse_decay_warnings(config: GaspermConfig) -> list[str]:
     geometry = config.geometry()
 
     # -- the vessels ------------------------------------------------------
-    for side in ("upstream", "downstream"):
-        volume = getattr(reservoirs, side).volume_cm3
+    spacers = list(pulse.upstream_spacers)
+    if any(fitting.type not in reservoirs.spacer_types for fitting in spacers):
+        # An unknown bore is already a fatal problem, and every volume below
+        # would raise on it. Say nothing more; the caller is about to abort
+        # with a message that names the offending type.
+        return warnings
+    for side, volume in (
+        ("upstream", reservoirs.upstream_volume_cm3(spacers)),
+        ("downstream", reservoirs.downstream_volume_cm3()),
+    ):
         low, high = _PLAUSIBLE_VOLUME_CM3
         if volume < low or volume > high:
             warnings.append(
-                f"hardware.reservoirs.{side}.volume is {volume:g} cm3, which is "
-                f"outside the plausible {low:g}-{high:g} cm3 range; check "
+                f"hardware.reservoirs.{side} totals {volume:g} cm3, which is outside "
+                f"the plausible {low:g}-{high:g} cm3 range; check "
                 f"reservoirs.{side}.unit."
             )
+
+    if spacers:
+        added = reservoirs.spacer_volume_cm3(spacers)
+        total = reservoirs.upstream_volume_cm3(spacers)
+        # What actually scales the result is the EFFECTIVE volume
+        # V1*V2/(V1+V2), not V1 alone -- and that is dominated by the smaller
+        # side. Reporting the real effect keeps the warning honest: on a large
+        # upstream vessel the stack barely matters, while on a small one it
+        # dominates, and a fixed "proportional to V1" claim would be wrong in
+        # both directions.
+        effect = (
+            reservoirs.effective_volume_cm3(spacers)
+            / reservoirs.effective_volume_cm3()
+            - 1.0
+        )
+        stack = ", ".join(str(fitting) for fitting in spacers)
+        warnings.append(
+            f"{len(spacers)} upstream spacer{'s' if len(spacers) != 1 else ''} "
+            f"[{stack}] add {added:g} cm3 to V1, making it {total:g} cm3. That raises "
+            f"the reported permeability by about {effect:.2%} against a bare holder -- "
+            "record the stack wrongly and the result moves by that much. Check it "
+            "against the holder."
+        )
 
     # -- the storage correction -------------------------------------------
     porosity = config.sample.porosity_fraction
@@ -1044,8 +1105,8 @@ def _pulse_decay_warnings(config: GaspermConfig) -> list[str]:
         )
         a1, a2 = pulse_physics.storage_ratios(
             pore_volume_cm3=pore,
-            upstream_volume_cm3=reservoirs.upstream.volume_cm3,
-            downstream_volume_cm3=reservoirs.downstream.volume_cm3,
+            upstream_volume_cm3=reservoirs.upstream_volume_cm3(spacers),
+            downstream_volume_cm3=reservoirs.downstream_volume_cm3(),
         )
         if pulse.storage_correction == "brace" and max(a1, a2) > pulse.max_storage_ratio:
             theta = pulse_physics.first_storage_root(a1, a2)
@@ -1121,8 +1182,10 @@ def _predicted_decay_notes(config: GaspermConfig, expected_darcy: float) -> list
         gas_compressibility_per_atm=compressibility_per_atm,
         length_cm=geometry.length_cm,
         area_cm2=geometry.area_cm2,
-        upstream_volume_cm3=reservoirs.upstream.volume_cm3,
-        downstream_volume_cm3=reservoirs.downstream.volume_cm3,
+        upstream_volume_cm3=reservoirs.upstream_volume_cm3(
+            config.run.pulse_decay.upstream_spacers
+        ),
+        downstream_volume_cm3=reservoirs.downstream_volume_cm3(),
     )
     try:
         if porosity is not None and config.run.pulse_decay.storage_correction != "brace":
@@ -1147,8 +1210,9 @@ def _predicted_decay_notes(config: GaspermConfig, expected_darcy: float) -> list
     return [
         f"At the expected {config.run.pulse_decay.expected_permeability:g} "
         f"{config.run.pulse_decay.expected_permeability_unit} with V1 = "
-        f"{reservoirs.upstream.volume_cm3:g} cm3 and V2 = "
-        f"{reservoirs.downstream.volume_cm3:g} cm3, the decay time constant is about "
+        f"{reservoirs.upstream_volume_cm3(config.run.pulse_decay.upstream_spacers):g}"
+        f" cm3 and V2 = {reservoirs.downstream_volume_cm3():g} cm3, the decay time "
+        f"constant is about "
         f"{tau_h:.1f} h / P_mean[atm] and the run reaches dP/dP0 = {stop:g} after "
         f"about {run_h:.1f} h / P_mean[atm]. So at 10 atm mean pore pressure, "
         f"roughly {tau_h / 10.0:.1f} h and {run_h / 10.0:.1f} h. The decay scales as "

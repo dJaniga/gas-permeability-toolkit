@@ -651,6 +651,10 @@ class PulseDecayPoint:
     temperature_c: float
     upstream_volume_cm3: float
     downstream_volume_cm3: float
+    #: The spacers that made up ``upstream_volume_cm3``. Needed here because
+    #: their uncertainty depends on which bores and how many of each, not just
+    #: on the total volume they added.
+    upstream_spacers: tuple = ()
     #: ``None`` when the zero-storage (Brace) form was used, in which case
     #: porosity is not an input to the measurement at all.
     porosity_fraction: float | None = None
@@ -912,32 +916,34 @@ def build_pulse_decay_budget(
         )
     )
 
-    # -- the vessels ------------------------------------------------------
+    # -- the volumes ------------------------------------------------------
+    # A vessel has no meaningful "full scale", so each spec is evaluated with
+    # the reading passed as both -- which makes percent_full_scale and
+    # percent_reading coincide rather than quietly meaning something odd. The
+    # composition of each side (vessel + dead volume + any spacer stack) and
+    # the accumulation of its uncertainty belong to the config, which is what
+    # knows how the side is built; this only consumes the totals.
     reservoirs = hardware.reservoirs
+    spacers = point.upstream_spacers
     volume_relatives: list[float] = []
-    for symbol, name, vessel, volume_cm3, key in (
+    for symbol, name, vessel, volume_cm3, u_volume, key in (
         (
             "V1",
-            "upstream vessel volume",
+            "upstream volume",
             reservoirs.upstream,
             point.upstream_volume_cm3,
+            reservoirs.upstream_uncertainty_cm3(spacers),
             "upstream_volume_cm3",
         ),
         (
             "V2",
-            "downstream vessel volume",
+            "downstream volume",
             reservoirs.downstream,
             point.downstream_volume_cm3,
+            reservoirs.downstream_uncertainty_cm3(),
             "downstream_volume_cm3",
         ),
     ):
-        # A vessel has no meaningful "full scale", so the reading is passed as
-        # both -- which makes percent_full_scale and percent_reading coincide
-        # rather than quietly meaning something odd.
-        in_unit = units.volume_from_cm3(volume_cm3, vessel.unit)
-        u_volume = units.volume_to_cm3(
-            vessel.uncertainty.standard_uncertainty(in_unit, in_unit), vessel.unit
-        )
         relative = u_volume / volume_cm3 if volume_cm3 else math.inf
         volume_relatives.append(relative)
         components.append(
@@ -954,10 +960,21 @@ def build_pulse_decay_budget(
             )
         )
     notes.append(
-        "The vessel volumes are DEAD volumes -- vessel plus tubing, ports and valve "
-        "internals up to the plug face. Permeability is directly proportional to "
-        "them, so any tubing left out of the figure is a systematic error here."
+        "The volumes are DEAD volumes -- vessel plus tubing, ports and valve "
+        "internals up to the plug face, plus any upstream spacers. Permeability is "
+        "directly proportional to them, so anything left out of the figure is a "
+        "systematic error here."
     )
+    if spacers:
+        added = reservoirs.spacer_volume_cm3(spacers)
+        stack = ", ".join(str(fitting) for fitting in spacers)
+        notes.append(
+            f"{len(spacers)} upstream spacer{'s' if len(spacers) != 1 else ''} "
+            f"[{stack}] add {added:.4g} cm3 to V1 "
+            f"({added / point.upstream_volume_cm3:.1%} of it). Their bore error is "
+            "shared within a type, so it sums; their lengths are measured "
+            "separately, so those add in quadrature."
+        )
 
     # -- porosity, only when the storage correction is in use --------------
     if point.porosity_fraction is not None:

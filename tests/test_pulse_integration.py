@@ -48,8 +48,10 @@ def true_decay_rate(config: GaspermConfig, permeability_darcy: float, mean_atm: 
         length_cm=geometry.length_cm,
         area_cm2=geometry.area_cm2,
         porosity_fraction=config.sample.porosity_fraction,
-        upstream_volume_cm3=config.hardware.reservoirs.upstream.volume_cm3,
-        downstream_volume_cm3=config.hardware.reservoirs.downstream.volume_cm3,
+        upstream_volume_cm3=config.hardware.reservoirs.upstream_volume_cm3(
+            config.run.pulse_decay.upstream_spacers
+        ),
+        downstream_volume_cm3=config.hardware.reservoirs.downstream_volume_cm3(),
     )
 
 
@@ -536,6 +538,205 @@ class TestLivePlotPanels:
         assert saved.stat().st_size > 0
 
 
+class TestSpacers:
+    """Hollow spacers upstream of the core: bore on the bench, length per run.
+
+    A spacer is two measurements established in different places -- the bore is
+    a property of a set of parts, the length of the one you just fitted -- so
+    the tests below check that split holds all the way through.
+    """
+
+    def fittings(self, *specs):
+        from gasperm.config import SpacerFitting
+
+        return [SpacerFitting(type=name, length=length) for name, length in specs]
+
+    def test_the_volume_splits_into_vessel_and_dead(self):
+        reservoirs = GaspermConfig().hardware.reservoirs
+        assert reservoirs.upstream.vessel == pytest.approx(380.0)
+        assert reservoirs.upstream.dead == pytest.approx(20.0)
+        assert reservoirs.upstream.fixed_volume_cm3 == pytest.approx(400.0)
+
+    def test_a_reservoir_with_no_volume_at_all_is_refused(self):
+        from gasperm.config import ReservoirConfig
+
+        with pytest.raises(ValueError, match="positive total volume"):
+            ReservoirConfig(vessel=0.0, dead=0.0)
+
+    def test_a_spacer_volume_is_the_cylinder_of_its_bore_and_length(self):
+        types = GaspermConfig().hardware.reservoirs.spacer_types
+        wide = types["wide"]
+        # 25.4 mm bore, 50 mm long: pi (1.27 cm)^2 * 5 cm.
+        assert wide.volume_cm3(50.0) == pytest.approx(math.pi * 1.27**2 * 5.0, rel=1e-9)
+
+    def test_the_two_bores_give_different_volumes_for_one_length(self):
+        """The whole point of having types: bore enters squared."""
+        types = GaspermConfig().hardware.reservoirs.spacer_types
+        wide = types["wide"].volume_cm3(50.0)
+        narrow = types["narrow"].volume_cm3(50.0)
+        assert wide == pytest.approx(4.0 * narrow, rel=1e-9)
+
+    def test_length_varies_within_a_type(self):
+        wide = GaspermConfig().hardware.reservoirs.spacer_types["wide"]
+        assert wide.volume_cm3(100.0) == pytest.approx(2.0 * wide.volume_cm3(50.0))
+
+    def test_an_end_correction_is_added(self):
+        """For chamfers and o-ring grooves the plain cylinder misses."""
+        from gasperm.config import SpacerTypeConfig
+
+        plain = SpacerTypeConfig(internal_diameter=25.4)
+        corrected = SpacerTypeConfig(internal_diameter=25.4, end_correction_cm3=-0.3)
+        assert corrected.volume_cm3(50.0) == pytest.approx(plain.volume_cm3(50.0) - 0.3)
+
+    def test_a_mixed_stack_sums(self):
+        reservoirs = GaspermConfig().hardware.reservoirs
+        stack = self.fittings(("wide", 50.0), ("narrow", 30.0), ("wide", 25.0))
+        expected = (
+            reservoirs.spacer_types["wide"].volume_cm3(50.0)
+            + reservoirs.spacer_types["narrow"].volume_cm3(30.0)
+            + reservoirs.spacer_types["wide"].volume_cm3(25.0)
+        )
+        assert reservoirs.spacer_volume_cm3(stack) == pytest.approx(expected)
+        assert reservoirs.upstream_volume_cm3(stack) == pytest.approx(400.0 + expected)
+
+    def test_spacers_do_not_touch_v2(self):
+        """They sit upstream of the core face."""
+        reservoirs = GaspermConfig().hardware.reservoirs
+        assert reservoirs.downstream_volume_cm3() == pytest.approx(75.0)
+
+    def test_an_unknown_bore_is_refused_by_name(self):
+        reservoirs = GaspermConfig().hardware.reservoirs
+        with pytest.raises(ValueError, match="not defined"):
+            reservoirs.resolve_spacer_type("enormous")
+        with pytest.raises(ValueError, match="wide"):
+            reservoirs.resolve_spacer_type("enormous")
+
+    def test_bore_error_sums_within_a_type_and_lengths_add_in_quadrature(self):
+        """The two measurements correlate differently, so they combine differently."""
+        reservoirs = GaspermConfig().hardware.reservoirs
+        wide = reservoirs.spacer_types["wide"]
+        stack = self.fittings(("wide", 50.0), ("wide", 50.0))
+
+        total_volume = 2 * wide.volume_cm3(50.0)
+        from_bore = 2.0 * wide.relative_diameter_uncertainty() * total_volume
+        from_lengths = wide.length_uncertainty_cm3() * math.sqrt(2)
+        assert reservoirs.spacer_uncertainty_cm3(stack) == pytest.approx(
+            math.hypot(from_bore, from_lengths), rel=1e-9
+        )
+
+    def test_treating_the_bore_as_independent_would_understate_it(self):
+        """Why the split matters: it is not a per-spacer quadrature sum."""
+        reservoirs = GaspermConfig().hardware.reservoirs
+        wide = reservoirs.spacer_types["wide"]
+        four = self.fittings(*[("wide", 50.0)] * 4)
+        one_alone = reservoirs.spacer_uncertainty_cm3(self.fittings(("wide", 50.0)))
+        naive = one_alone * math.sqrt(4)
+        assert reservoirs.spacer_uncertainty_cm3(four) > naive
+        assert wide.relative_diameter_uncertainty() > 0.0
+
+    def test_different_bores_are_independent_of_each_other(self):
+        reservoirs = GaspermConfig().hardware.reservoirs
+        mixed = reservoirs.spacer_uncertainty_cm3(
+            self.fittings(("wide", 50.0), ("narrow", 50.0))
+        )
+        wide_only = reservoirs.spacer_uncertainty_cm3(self.fittings(("wide", 50.0)))
+        narrow_only = reservoirs.spacer_uncertainty_cm3(self.fittings(("narrow", 50.0)))
+        assert mixed == pytest.approx(math.hypot(wide_only, narrow_only), rel=1e-9)
+
+    def test_an_unknown_bore_in_the_run_is_fatal(self):
+        """Fatal, not a warning: the volume cannot be guessed."""
+        from gasperm.config import ConfigError, validate_for_collect
+
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        config.hardware.temperature.required = False
+        config.run.pulse_decay.upstream_spacers = self.fittings(("enormous", 50.0))
+        with pytest.raises(ConfigError, match="not defined"):
+            validate_for_collect(config)
+
+    def test_the_stack_is_reported_at_startup(self):
+        from gasperm.config import validate_for_collect
+
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        config.hardware.temperature.required = False
+        config.run.pulse_decay.upstream_spacers = self.fittings(
+            ("wide", 50.0), ("narrow", 30.0)
+        )
+        notes = [w for w in validate_for_collect(config) if "spacer" in w]
+        assert any("wide:50" in w and "narrow:30" in w for w in notes)
+
+    def test_the_breakdown_is_printable(self):
+        reservoirs = GaspermConfig().hardware.reservoirs
+        text = reservoirs.describe(self.fittings(("wide", 50.0), ("narrow", 30.0)))
+        assert "vessel 380" in text
+        assert "dead 20" in text
+        assert "wide 50mm" in text
+        assert "narrow 30mm" in text
+
+    def test_spacers_change_the_recovered_permeability(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The physical point: V1 is in the equation, so the stack matters.
+
+        The same decay analysed with a different stack gives a different k --
+        which is why an unrecorded spacer is a silent error, and why the stack
+        goes on the record.
+        """
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+
+        pulse_config.run.pulse_decay.upstream_spacers = []
+        bare = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+
+        pulse_config.run.pulse_decay.upstream_spacers = self.fittings(
+            ("narrow", 40.0), ("narrow", 40.0)
+        )
+        stacked = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+
+        assert stacked.pulse_decay.upstream_spacers == ["narrow:40", "narrow:40"]
+        assert stacked.pulse_decay.spacer_volume_cm3 > 0.0
+        assert stacked.permeability_darcy > bare.permeability_darcy
+
+    def test_the_stack_reaches_the_budget(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        stack = self.fittings(("narrow", 30.0), ("narrow", 30.0), ("narrow", 30.0))
+        pulse_config.run.pulse_decay.upstream_spacers = stack
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+        budget = summary.uncertainty
+        upstream = next(c for c in budget.components if c.symbol == "V1")
+        expected = pulse_config.hardware.reservoirs.upstream_uncertainty_cm3(stack)
+        assert upstream.standard_uncertainty == pytest.approx(expected, rel=1e-9)
+        assert any("narrow:30" in note for note in budget.notes)
+
+    def test_no_spacers_leaves_the_budget_unchanged(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+        budget = summary.uncertainty
+        upstream = next(c for c in budget.components if c.symbol == "V1")
+        assert upstream.standard_uncertainty == pytest.approx(
+            pulse_config.hardware.reservoirs.upstream.fixed_uncertainty_cm3, rel=1e-9
+        )
+        # The general "plus any upstream spacers" note always appears; what
+        # must not is a note describing an actual stack.
+        assert not any("add " in note and "cm3 to V1" in note for note in budget.notes)
+
+
 class TestConfigRefusals:
     def test_a_supplied_p2_and_pulse_decay_cannot_coexist(self):
         from gasperm.config import RunConfig
@@ -559,10 +760,10 @@ class TestConfigRefusals:
         """It is the SMALLER vessel that sets the decay rate."""
         config = GaspermConfig()
         reservoirs = config.hardware.reservoirs
-        assert reservoirs.effective_volume_cm3 == pytest.approx(
+        assert reservoirs.effective_volume_cm3() == pytest.approx(
             400.0 * 75.0 / 475.0, rel=1e-9
         )
-        assert reservoirs.effective_volume_cm3 < 75.0
+        assert reservoirs.effective_volume_cm3() < 75.0
 
     def test_the_predicted_duration_is_reported_at_startup(self):
         from gasperm.config import validate_for_collect
