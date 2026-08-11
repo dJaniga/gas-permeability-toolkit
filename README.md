@@ -293,6 +293,13 @@ band is often tens of times wider than the signal, and letting it set the y-axis
 would flatten the trace into a line and hide the drift — so it is left off-scale
 and the corner note says `(band off-scale)`. The numbers are always shown.
 
+**The panel set follows the method.** A pulse-decay run has no flowmeter, so it
+drops the flow panel and gains `delta_pressure` and `decay_fraction` — the latter
+on a log axis, where an exponential decay straightens into a line and a leak or a
+thermal ramp does not. Neither of the criterion annotations below applies there:
+no steady-state detector runs in pulse mode, so the bands, the shading and the
+corner notes are all omitted rather than drawn as passing.
+
 Panels the detector does not watch say **"not a steady-state signal"** rather
 than just having no lines: the outlet transducer is never a criterion, and
 `steady_state.signals` leaves temperature out by default. The permeability panel
@@ -667,14 +674,83 @@ large P1→P2 span while pulse-decay `k_g` is at essentially a single pressure, 
 a systematic offset between the methods would masquerade as slippage and land
 in `b`.
 
-### Before trusting any of it: the leak test
+### The pre-step: a leak test
 
-Blank or bypass the plug, pressurise both vessels to `P̄`, close everything, and
-record for at least 3τ. Any decay in that configuration is the system's
-leak-plus-thermal rate, and it must be **under 5 %** of the rate you later
-attribute to the sample. Without this the whole measurement is a leak
-measurement — it is the pulse-decay counterpart of checking the flowmeter's zero
-with the inlet closed.
+**Do this before any measurement.** A leak produces a differential decay that is
+indistinguishable from a slow sample, so without a bound on it a pulse-decay
+result could be entirely the apparatus. It is the pulse-decay counterpart of
+checking the flowmeter's zero with the inlet closed.
+
+Blank or bypass the plug, charge both vessels to the pressure you will measure
+at, apply the same pulse, and run:
+
+```bash
+gasperm collect --sample samples/core-041.yaml --leak-test
+```
+
+`--leak-test` implies `--method pulse_decay`. Unlike a measurement this is a
+**fixed observation, not a decay to be waited out** — on a tight rig the ideal
+outcome is that nothing happens, so there is no completion signal to stop on and
+it runs for `pulse_decay.leak_test_duration_s` (default 1 h). A run without a
+duration is refused rather than left to run forever.
+
+The result is reported as **the permeability the apparatus alone would fake**,
+which is the number your sample has to stand clear of:
+
+```
+  purpose             LEAK TEST -- the apparatus, not the sample
+  leak equivalent     0.031 uD +/- 0.006 uD
+  ! LEAK TEST: the blanked rig decays at 8.4e-06 1/s, which is what a sample of
+    0.031 uD would look like. At pulse_decay.max_leak_fraction (5%) that puts the
+    floor for a trustworthy measurement at about 0.62 uD.
+```
+
+and a tight rig reports the outcome you want:
+
+```
+  leak                NONE MEASURABLE -- the blanked rig held its differential
+```
+
+`--plot` works here as it does on any `collect` run, and an hour of watching a
+differential is exactly where it earns its place:
+
+```bash
+gasperm collect --sample samples/core-041.yaml --leak-test --plot
+```
+
+The window is titled `LEAK TEST (the apparatus, not the sample)` so a plot left
+on screen is never mistaken for a measurement, and the permeability panel is
+labelled `leak equiv.` for the same reason. The `dP/dP0` panel is pinned to the
+span between `stop_below_fraction` and 1 rather than autoscaled: on a rig that is
+holding, the differential is constant to a few parts in 10^5, and a log axis
+fitted to *that* would render the flat line you want to see as violent noise.
+A tight rig therefore reads as a line along the top; a leak curves away from it
+visibly, long before the fit at the end confirms it.
+
+**Every later run compares itself against the most recent test automatically** —
+found by rig, not by plug, since the apparatus leaked the same whichever core was
+in it. A measurement warns when the leak is a large share of what it measured:
+
+```
+  leak test           core-041_20260810T125426Z: 4.28e-02 1/s = 150 uD  (30.0% of this decay)
+  ! The rig's own decay is 30.0% of the one measured here, above
+    pulse_decay.max_leak_fraction (5%) ... at this ratio you are largely
+    measuring the apparatus.
+```
+
+It also warns when **no** leak test has been done at all, and when the one it
+found was at a materially different pore pressure — leak conductance depends on
+pressure, so a test that passed at 3 atm says nothing about 30 atm.
+
+Leak tests are excluded from `klinkenberg` discovery: a leak is a property of the
+bench, not a point on any plug's curve.
+
+**Subtraction is off by default.** Setting `pulse_decay.leak_correction:
+subtract` takes the leak rate off the measured one, which is defensible for a
+linear, stable leak — the leak path is in parallel with the plug, so the rates
+add. But a leak that changed since the test would move the result with nothing to
+show for it, so the shipped behaviour is to compare and warn, and the correction
+says loudly when it has been applied.
 
 Two more checks worth running once: three pulses at one `P̄` should agree within
 their combined `u(alpha)` (a monotone walk means the plug is still equilibrating

@@ -55,7 +55,9 @@ __all__ = [
     "describe_convention",
     "describe_method",
     "downstream_convention",
+    "find_leak_test",
     "run_method",
+    "run_purpose",
     "safe_sample_id",
     "write_klinkenberg_result",
 ]
@@ -398,6 +400,8 @@ class RunRecord:
     measurement_confirmed: bool | None = None
     #: ``"steady_state"`` or ``"pulse_decay"``; see :func:`run_method`.
     method: str | None = None
+    #: ``"measurement"`` or ``"leak_test"``; see :func:`run_purpose`.
+    purpose: str | None = None
     flowmeter: str | None = None
     #: How this run obtained P2; see :func:`downstream_convention`.
     downstream_convention: str | None = None
@@ -453,6 +457,34 @@ def run_method(stored_config: Mapping[str, Any] | None) -> str | None:
         return None
     value = run_block.get("method", "steady_state")
     return value if isinstance(value, str) else None
+
+
+def run_purpose(stored_config: Mapping[str, Any] | None) -> str | None:
+    """Whether a stored run measured the sample or characterised the rig.
+
+    Derived from the presence of the run block, like :func:`run_method`: a
+    sidecar written before leak tests existed was a measurement by definition,
+    and calling it unknown would let one slip into a Klinkenberg series.
+    """
+    if not stored_config:
+        return None
+    run_block = stored_config.get("run")
+    if run_block is None:
+        return None
+    value = run_block.get("purpose", "measurement")
+    return value if isinstance(value, str) else None
+
+
+def find_leak_test(records: Sequence[RunRecord]) -> RunRecord | None:
+    """The most recent leak test among ``records``, or ``None``.
+
+    A leak test belongs to the *bench*, not to a plug, so it is not filtered by
+    sample id: the rig leaked the same on the day you measured whichever core.
+    """
+    tests = [r for r in records if r.purpose == "leak_test"]
+    if not tests:
+        return None
+    return max(tests, key=lambda r: r.started_at or _UNKNOWN_START)
 
 
 def describe_method(key: str | None) -> str:
@@ -547,6 +579,7 @@ def _record_from_directory(directory: Path) -> RunRecord:
             _summary_confirmed(summary) if summary else None
         ),
         method=run_method(stored_config) or summary.get("method"),
+        purpose=run_purpose(stored_config) or summary.get("purpose") or "measurement",
         flowmeter=experiment.get("flowmeter"),
         downstream_convention=downstream_convention(stored_config),
     )
@@ -669,6 +702,12 @@ def point_from_run(
     convention = downstream_convention(stored_config)
 
     method = run_method(stored_config)
+    if run_purpose(stored_config) == "leak_test":
+        raise ValueError(
+            f"{readings_path} is a leak test, not a measurement of the sample. It "
+            "characterises the rig with the plug blanked, so it is not a point on "
+            "any plug's Klinkenberg curve."
+        )
     summary = metadata.get("summary") if isinstance(metadata, dict) else None
     if (
         summary

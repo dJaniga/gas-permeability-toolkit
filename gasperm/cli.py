@@ -834,6 +834,12 @@ def collect_command(
         help="Measurement method for this run. pulse_decay reads no flowmeter "
              "and requires a closed downstream vessel.",
     ),
+    leak_test: bool = typer.Option(
+        False, "--leak-test",
+        help="Run the pulse-decay PRE-STEP instead of a measurement: blank or "
+             "bypass the plug, apply the same pulse, and record what the rig "
+             "alone does. Implies --method pulse_decay.",
+    ),
     spacer: Optional[list[str]] = typer.Option(
         None, "--spacer", metavar="TYPE:LENGTH",
         help="One hollow spacer fitted upstream, e.g. 'wide:50'. Repeat to "
@@ -961,6 +967,26 @@ def collect_command(
             config.run.method = method
         except Exception as exc:  # noqa: BLE001 - pydantic enforces the pairing
             _fail(str(exc))
+            return
+
+    if leak_test:
+        # Implies the method, since a leak test is a pulse-decay observation --
+        # asking for both would be redundant and forgetting --method would be a
+        # confusing refusal.
+        try:
+            config.run.method = "pulse_decay"
+            config.run.purpose = "leak_test"
+        except Exception as exc:  # noqa: BLE001 - pydantic enforces the pairing
+            _fail(str(exc))
+            return
+        if config.run.pulse_decay.leak_test_duration_s is None and (
+            config.run.duration_s is None and config.run.max_samples is None
+        ):
+            _fail(
+                "A leak test needs a duration: on a tight rig nothing decays, so "
+                "there is no completion signal to stop on and the run would never "
+                "end. Set pulse_decay.leak_test_duration_s, or pass --duration."
+            )
             return
 
     if spacer:
@@ -1249,6 +1275,17 @@ def _print_pulse_criteria(config: GaspermConfig, processor) -> None:
     """Startup banner for a pulse-decay run: vessels, criteria, expected length."""
     pulse = config.run.pulse_decay
     reservoirs = config.hardware.reservoirs
+    if config.run.purpose == "leak_test":
+        typer.secho(
+            "LEAK TEST -- this run measures the APPARATUS, not the sample.",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        typer.secho(
+            "Blank or bypass the plug, charge both vessels to the pressure you will "
+            "measure at, and apply the same pulse. Whatever decays is the rig.",
+            fg=typer.colors.YELLOW,
+        )
     spacers = pulse.upstream_spacers
     typer.secho(
         f"Pulse decay: {reservoirs.describe(spacers)}"
@@ -1269,13 +1306,22 @@ def _print_pulse_criteria(config: GaspermConfig, processor) -> None:
             f"they raise the reported k by {effect:.2%}.",
             fg=typer.colors.YELLOW,
         )
-    typer.secho(
-        f"Apply a pulse of at least {pulse.min_pulse_pressure:g} "
-        f"{pulse.pulse_pressure_unit}; the run ends at dP/dP0 = "
-        f"{pulse.stop_below_fraction:g}, fitting "
-        f"{pulse.fit_start_fraction:g} down to {pulse.fit_end_fraction:g}.",
-        fg=typer.colors.CYAN,
-    )
+    if config.run.purpose == "leak_test":
+        duration = pulse.leak_test_duration_s or config.run.duration_s
+        typer.secho(
+            f"Apply a pulse of at least {pulse.min_pulse_pressure:g} "
+            f"{pulse.pulse_pressure_unit} and let it sit for "
+            f"{duration:g} s. Nothing decaying is the result you want.",
+            fg=typer.colors.CYAN,
+        )
+    else:
+        typer.secho(
+            f"Apply a pulse of at least {pulse.min_pulse_pressure:g} "
+            f"{pulse.pulse_pressure_unit}; the run ends at dP/dP0 = "
+            f"{pulse.stop_below_fraction:g}, fitting "
+            f"{pulse.fit_start_fraction:g} down to {pulse.fit_end_fraction:g}.",
+            fg=typer.colors.CYAN,
+        )
 
 
 def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
@@ -1283,6 +1329,21 @@ def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
     result = summary.pulse_decay
     unit = config.run.display_pressure_unit
     if result is None:
+        if summary.purpose == "leak_test":
+            # For a leak test the absence of a decay is the pass condition, so
+            # the same state reads the opposite way round.
+            typer.secho(
+                "  purpose             LEAK TEST -- the apparatus, not the sample",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
+            typer.secho(
+                "  leak                NONE MEASURABLE -- the blanked rig held its "
+                "differential for the whole run",
+                fg=typer.colors.GREEN,
+                bold=True,
+            )
+            return
         typer.secho(
             "  decay fit           REJECTED -- no decay could be fitted, so this run "
             "did not measure the sample",
@@ -1292,6 +1353,12 @@ def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
         return
 
     correction = result.storage_correction.replace("_", " & ").title()
+    if summary.purpose == "leak_test":
+        typer.secho(
+            "  purpose             LEAK TEST -- the apparatus, not the sample",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
     typer.echo(f"  method              pulse decay -- {correction} model")
     amplitude = units.from_atm(result.pulse_amplitude_atm, unit)
     fraction = (
@@ -1348,6 +1415,29 @@ def _print_pulse_decay_result(summary, config: GaspermConfig) -> None:
             f"a2 = {result.downstream_storage_ratio:.3f}"
         )
     typer.echo(vessels)
+    if result.leak_rate_per_s is not None:
+        unit = config.run.display_permeability_unit
+        equivalent = result.leak_equivalent_permeability_darcy
+        fraction = result.leak_fraction
+        text = (
+            f"  leak test           {result.leak_test_source}: "
+            f"{result.leak_rate_per_s:.4e} 1/s"
+        )
+        if equivalent:
+            text += f" = {units.darcy_to(equivalent, unit):.4g} {unit}"
+        if fraction is not None:
+            text += f"   ({fraction:.1%} of this decay)"
+        if result.leak_subtracted:
+            text += "  [SUBTRACTED]"
+        typer.secho(
+            text,
+            fg=(
+                typer.colors.GREEN
+                if fraction is not None
+                and fraction <= config.run.pulse_decay.max_leak_fraction
+                else typer.colors.YELLOW
+            ),
+        )
     if result.storage_root is not None:
         ratios = result.upstream_storage_ratio + result.downstream_storage_ratio
         understated = ratios / result.storage_root**2
@@ -1412,11 +1502,18 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
         )
 
     good = bool(summary.measurement_confirmed)
+    if summary.purpose == "leak_test" and summary.pulse_decay is None:
+        # Nothing decayed, so there is no permeability to report -- and a bare
+        # "0" would read as a measurement of zero rather than as no signal.
+        return
+    # A leak test's "permeability" is what the apparatus alone would fake, not
+    # a property of any rock, so it must not be labelled as one.
+    label = "leak equivalent" if summary.purpose == "leak_test" else "apparent k_g"
     budget = summary.uncertainty
     if budget is not None:
         expanded = units.darcy_to(budget.expanded_uncertainty_darcy, permeability_unit)
         typer.secho(
-            f"  apparent k_g        {k_display:.5g} +/- {expanded:.3g} {permeability_unit}"
+            f"  {label:<18}  {k_display:.5g} +/- {expanded:.3g} {permeability_unit}"
             f"  ({budget.relative_expanded_uncertainty:.2%}, k = {budget.coverage_factor:.2f},"
             f" {budget.coverage_probability:.0%})",
             fg=typer.colors.GREEN if good else typer.colors.YELLOW,
@@ -1426,7 +1523,7 @@ def _print_run_summary(summary, config: GaspermConfig) -> None:
     else:
         stddev = units.darcy_to(summary.permeability_stddev_darcy, permeability_unit)
         typer.secho(
-            f"  apparent k_g        {k_display:.5g} +/- {stddev:.3g} {permeability_unit} (1 sd)",
+            f"  {label:<18}  {k_display:.5g} +/- {stddev:.3g} {permeability_unit} (1 sd)",
             fg=typer.colors.GREEN if good else typer.colors.YELLOW,
             bold=True,
         )

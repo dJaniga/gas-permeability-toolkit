@@ -23,6 +23,7 @@ notes: ''
 # Pulse decay requires downstream_pressure: measured, reads no flowmeter,
 # and takes its vessel volumes from hardware.reservoirs.
 method: steady_state                          # steady_state | pulse_decay
+purpose: measurement                          # measurement | leak_test (see 'collect --leak-test')
 
 # Working gas and where its properties come from.
 gas:
@@ -123,6 +124,10 @@ pulse_decay:
   max_residual_autocorrelation: 0.5
   storage_correction: auto                    # auto | brace | dicker_smits
   max_storage_ratio: 0.05                     # warn above this V_pore/V on the Brace form
+  leak_test_duration_s: 3600.0                # a leak test is a FIXED observation
+  max_leak_fraction: 0.05                     # warn above this share of rig-vs-sample decay
+  leak_correction: 'off'                      # off | subtract
+  leak_pressure_tolerance: 0.2                # a test at another charge does not apply
   expected_permeability: null                 # planning only; never enters a result
   expected_permeability_unit: uD
 

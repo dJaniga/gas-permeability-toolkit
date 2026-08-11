@@ -25,6 +25,7 @@ import signal
 import statistics
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
@@ -902,7 +903,14 @@ class PulseDecayLoop(_LoopBase):
         interval_s = 1.0 / self.config.hardware.daq.sample_rate_hz
         run_config = self.config.run
         pulse_config = run_config.pulse_decay
+        # A leak test is a *fixed observation*, not a decay to be waited out:
+        # on a tight rig the ideal outcome is that nothing happens, so there is
+        # no completion signal to stop on. It runs for its configured time and
+        # ignores the decay-fraction stop entirely.
+        leak_test = run_config.purpose == "leak_test"
         duration_s = run_config.duration_s
+        if leak_test:
+            duration_s = pulse_config.leak_test_duration_s or duration_s
         max_samples = run_config.max_samples
         max_decay_s = pulse_config.max_decay_s
 
@@ -926,6 +934,7 @@ class PulseDecayLoop(_LoopBase):
                 pulse_at = self.status.pulse_at_elapsed_s
                 if (
                     max_decay_s is not None
+                    and not leak_test
                     and pulse_at is not None
                     and elapsed - pulse_at >= max_decay_s
                 ):
@@ -944,7 +953,7 @@ class PulseDecayLoop(_LoopBase):
                     self.readings.append(reading)
                     self._emit(reading)
 
-                if self.monitor.is_complete:
+                if self.monitor.is_complete and not leak_test:
                     self._stop_reason = (
                         f"decay reached dP/dP0 = {self.status.decay_fraction:.3f}"
                     )
@@ -961,7 +970,13 @@ class PulseDecayLoop(_LoopBase):
                 signal.signal(signal.SIGINT, previous_handler)
             self.close()
 
-        if not self.pulse_seen:
+        if leak_test and not self.pulse_seen:
+            self._record_warning(
+                "No pulse was detected during the leak test, so nothing was watched "
+                "decaying and the test bounds nothing. Apply the same pulse you will "
+                "use for the measurement, with the plug blanked or bypassed."
+            )
+        elif not self.pulse_seen:
             self._record_warning(
                 "No pulse was ever detected: the differential never reached "
                 f"pulse_decay.min_pulse_pressure "
@@ -1395,6 +1410,157 @@ def _thermal_drift_warnings(
     ]
 
 
+@dataclass(frozen=True)
+class _ResolvedLeak:
+    """A leak test found for a measurement run, and how it is being used.
+
+    ``rate_per_s`` is ``None`` when the test was done and **nothing decayed** --
+    which is the outcome you want, and is quite different from no test having
+    been done at all. Collapsing the two would tell an operator who did the
+    right thing that they had not.
+    """
+
+    rate_per_s: float | None
+    source: str
+    mean_pressure_atm: float | None
+    subtracted: bool
+
+
+def find_recorded_leak_test(config: GaspermConfig) -> _ResolvedLeak | None:
+    """The most recent leak test recorded for this rig, if any.
+
+    Looked up by rig rather than by plug: the apparatus leaked the same
+    whichever core was in it. Returns ``None`` when there is no runs directory
+    yet, none has been done, or the stored one has no usable rate -- all of
+    which the caller reports rather than treats as an error.
+    """
+    from gasperm.storage import find_leak_test, find_runs, read_run_metadata
+
+    try:
+        records = find_runs(config.resolved_output_dir())
+    except (FileNotFoundError, OSError):
+        return None
+    record = find_leak_test(records)
+    if record is None or record.metadata_path is None:
+        return None
+
+    summary = read_run_metadata(record.metadata_path).get("summary") or {}
+    decay = summary.get("pulse_decay") or {}
+    rate = decay.get("decay_rate_per_s")
+    usable = isinstance(rate, (int, float)) and rate > 0.0
+    return _ResolvedLeak(
+        # A test with no fitted decay passed: it bounds the leak below what the
+        # pulse and duration could resolve. Reported as None, not as absent.
+        rate_per_s=float(rate) if usable else None,
+        source=record.name,
+        mean_pressure_atm=summary.get("mean_pressure_atm"),
+        subtracted=(
+            usable and config.run.pulse_decay.leak_correction == "subtract"
+        ),
+    )
+
+
+def _leak_warnings(
+    leak: _ResolvedLeak | None,
+    config: GaspermConfig,
+    *,
+    measured_rate_per_s: float,
+    mean_pressure_atm: float,
+    permeability_darcy: float,
+    leak_permeability_darcy: float | None,
+) -> list[str]:
+    """Compare a measurement against the rig's own decay rate.
+
+    The leak test is what separates "this rock passes gas slowly" from "this
+    apparatus does". Without one there is no way to tell them apart, which is
+    why its absence is itself a warning rather than silence.
+    """
+    pulse = config.run.pulse_decay
+    unit = config.run.display_permeability_unit
+    if leak is None:
+        return [
+            "No leak test has been recorded for this rig, so nothing separates the "
+            "sample's decay from the apparatus's. Blank or bypass the plug and run "
+            "'collect --method pulse_decay --leak-test' at this pore pressure; "
+            "whatever decays then is the floor below which a measurement means "
+            "nothing."
+        ]
+
+    warnings: list[str] = []
+
+    # Checked first, and regardless of whether anything decayed: leak
+    # conductance grows with pressure, so a test that found nothing at a lower
+    # charge is not evidence of tightness at this one.
+    if leak.mean_pressure_atm:
+        difference = abs(leak.mean_pressure_atm - mean_pressure_atm) / mean_pressure_atm
+        if difference > pulse.leak_pressure_tolerance:
+            display = config.run.display_pressure_unit
+            warnings.append(
+                f"The leak test ({leak.source}) was done at "
+                f"{units.from_atm(leak.mean_pressure_atm, display):.4g} {display} but "
+                f"this run is at {units.from_atm(mean_pressure_atm, display):.4g} "
+                f"({difference:.0%} apart). Leak conductance depends on pressure, so "
+                "that test does not describe this run -- repeat it at this charge."
+            )
+
+    if leak.rate_per_s is None:
+        warnings.append(
+            f"The leak test ({leak.source}) found no measurable decay, so the "
+            "apparatus is not contributing anything this run could resolve. Nothing "
+            "to correct for."
+        )
+        return warnings
+
+    total = measured_rate_per_s + (leak.rate_per_s if leak.subtracted else 0.0)
+    fraction = abs(leak.rate_per_s / total) if total else math.inf
+    if fraction > pulse.max_leak_fraction:
+        equivalent = (
+            f"{units.darcy_to(leak_permeability_darcy, unit):.4g} {unit}"
+            if leak_permeability_darcy
+            else "an unknown permeability"
+        )
+        warnings.append(
+            f"The rig's own decay is {fraction:.1%} of the one measured here, above "
+            f"pulse_decay.max_leak_fraction ({pulse.max_leak_fraction:.0%}). The leak "
+            f"test ({leak.source}) alone would report {equivalent}, against this run's "
+            f"{units.darcy_to(permeability_darcy, unit):.4g} {unit}. Find the leak "
+            "before trusting this number -- at this ratio you are largely measuring "
+            "the apparatus."
+        )
+
+    if leak.subtracted:
+        warnings.append(
+            f"The leak rate {leak.rate_per_s:.4e} 1/s was SUBTRACTED from the measured "
+            "one (pulse_decay.leak_correction: subtract). That is only sound if the "
+            "leak is linear and has not changed since the test; if it has, the "
+            "correction moves the result without any sign that it did."
+        )
+    return warnings
+
+
+def _leak_test_verdict(
+    config: GaspermConfig, permeability_darcy: float, fit: DecayFit
+) -> list[str]:
+    """State what a completed leak test bounds, in the units of the decision.
+
+    The useful form is not a decay rate but the permeability the apparatus
+    alone would report: that is the number the next measurement has to stand
+    clear of, and it is directly comparable with the k you are chasing.
+    """
+    unit = config.run.display_permeability_unit
+    equivalent = units.darcy_to(permeability_darcy, unit)
+    ceiling = permeability_darcy / config.run.pulse_decay.max_leak_fraction
+    return [
+        f"LEAK TEST: the blanked rig decays at {fit.decay_rate_per_s:.4e} 1/s, which "
+        f"is what a sample of {equivalent:.4g} {unit} would look like. At "
+        f"pulse_decay.max_leak_fraction ({config.run.pulse_decay.max_leak_fraction:.0%}) "
+        f"that puts the floor for a trustworthy measurement at about "
+        f"{units.darcy_to(ceiling, unit):.4g} {unit} -- below that you would mostly be "
+        "measuring this apparatus. Runs from here on are compared against it "
+        "automatically."
+    ]
+
+
 def summarize_pulse_decay_run(
     readings: Sequence[Reading],
     config: GaspermConfig,
@@ -1435,12 +1601,21 @@ def summarize_pulse_decay_run(
 
     first, last = readings[0], readings[-1]
     if fit is None:
-        # No fit: still emit a summary so the CSV and metadata survive, but say
-        # plainly that nothing was measured rather than reporting a zero.
-        collected_warnings.append(
-            "No decay could be fitted, so this run did NOT measure the sample's "
-            "permeability. The readings are recorded for inspection."
-        )
+        # No fit. For a measurement that means nothing was measured. For a leak
+        # test it means the opposite -- the differential did not decay, which is
+        # the outcome you want -- so the same condition is reported as a pass.
+        leak_test_no_decay = config.run.purpose == "leak_test"
+        if leak_test_no_decay:
+            collected_warnings.append(
+                "No decay could be fitted, which for a leak test is the result you "
+                "want: the blanked rig held its differential for the whole run. The "
+                "leak is below what this pulse and duration can resolve."
+            )
+        else:
+            collected_warnings.append(
+                "No decay could be fitted, so this run did NOT measure the sample's "
+                "permeability. The readings are recorded for inspection."
+            )
         window = list(readings)
         mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window])
         mean_t, _ = _mean_stddev([r.temperature_c for r in window])
@@ -1448,12 +1623,14 @@ def summarize_pulse_decay_run(
             sample_id=config.sample.id,
             gas_name=config.run.gas.name,
             method="pulse_decay",
+            purpose=config.run.purpose,
             started_at=started_at or first.timestamp,
             ended_at=ended_at or last.timestamp,
             duration_s=last.elapsed_s,
             sample_count=len(readings),
             steady_state_reached=False,
-            measurement_confirmed=False,
+            # A leak test that found nothing has done its job.
+            measurement_confirmed=leak_test_no_decay,
             mean_pressure_atm=mean_p,
             permeability_darcy=0.0,
             permeability_stddev_darcy=0.0,
@@ -1475,7 +1652,25 @@ def summarize_pulse_decay_run(
     compressibility = gas_state.isothermal_compressibility_per_atm or (
         1.0 / max(mean_p, 1e-9)
     )
-    permeability = processor.permeability_from_rate(fit.decay_rate_per_s, gas_state)
+
+    # A leak test characterises the bench, so it looks for no prior test of its
+    # own; a measurement compares itself against the most recent one.
+    leak_test_run = config.run.purpose == "leak_test"
+    leak = None if leak_test_run else find_recorded_leak_test(config)
+
+    decay_rate = fit.decay_rate_per_s
+    if leak is not None and leak.subtracted and leak.rate_per_s is not None:
+        # The leak path is in parallel with the plug, so for a linear leak the
+        # two rates add and the sample's is the difference.
+        decay_rate = max(decay_rate - leak.rate_per_s, 0.0)
+        if decay_rate <= 0.0:
+            collected_warnings.append(
+                f"Subtracting the leak rate ({leak.rate_per_s:.4e} 1/s) left nothing "
+                f"of the measured {fit.decay_rate_per_s:.4e} 1/s. This run detected no "
+                "decay the apparatus does not already account for."
+            )
+
+    permeability = processor.permeability_from_rate(decay_rate, gas_state)
     if permeability is None or permeability <= 0.0:
         collected_warnings.append(
             f"The fitted decay rate ({fit.decay_rate_per_s:.6g} 1/s) did not yield a "
@@ -1499,7 +1694,7 @@ def summarize_pulse_decay_run(
         theta = first_storage_root(storage_ratio_up, storage_ratio_down)
 
     result = PulseDecayResult(
-        decay_rate_per_s=fit.decay_rate_per_s,
+        decay_rate_per_s=decay_rate,
         decay_rate_standard_uncertainty_per_s=fit.decay_rate_standard_uncertainty_per_s,
         degrees_of_freedom=fit.degrees_of_freedom,
         pulse_amplitude_atm=processor.monitor.pulse_amplitude_atm or fit.amplitude_atm,
@@ -1522,6 +1717,14 @@ def summarize_pulse_decay_run(
         storage_root=theta,
         storage_correction=processor.storage_correction,
         gas_compressibility_per_atm=compressibility,
+        leak_rate_per_s=leak.rate_per_s if leak else None,
+        leak_equivalent_permeability_darcy=(
+            processor.permeability_from_rate(leak.rate_per_s, gas_state)
+            if leak and leak.rate_per_s is not None
+            else None
+        ),
+        leak_test_source=leak.source if leak else None,
+        leak_subtracted=bool(leak and leak.subtracted),
     )
 
     # -- quality gates ----------------------------------------------------
@@ -1564,6 +1767,21 @@ def summarize_pulse_decay_run(
     collected_warnings.extend(
         _thermal_drift_warnings(window, mean_p, fit, config)
     )
+    if leak_test_run:
+        collected_warnings.extend(
+            _leak_test_verdict(config, permeability, fit)
+        )
+    else:
+        collected_warnings.extend(
+            _leak_warnings(
+                leak,
+                config,
+                measured_rate_per_s=decay_rate,
+                mean_pressure_atm=mean_p,
+                permeability_darcy=permeability,
+                leak_permeability_darcy=result.leak_equivalent_permeability_darcy,
+            )
+        )
 
     budget: UncertaintyBudget | None = None
     if config.run.uncertainty.enabled and permeability > 0.0:
@@ -1616,6 +1834,7 @@ def summarize_pulse_decay_run(
         sample_id=config.sample.id,
         gas_name=config.run.gas.name,
         method="pulse_decay",
+        purpose=config.run.purpose,
         started_at=started_at or first.timestamp,
         ended_at=ended_at or last.timestamp,
         duration_s=last.elapsed_s,

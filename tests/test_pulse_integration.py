@@ -737,6 +737,286 @@ class TestSpacers:
         assert not any("add " in note and "cm3 to V1" in note for note in budget.notes)
 
 
+class TestLeakTest:
+    """The pre-step: characterise the rig before believing anything about rock.
+
+    A leak produces a differential decay indistinguishable from a slow sample,
+    so a pulse-decay measurement means nothing without a bound on it. These
+    check that the bound is recorded, found again, compared, and never mistaken
+    for a measurement.
+    """
+
+    def leak_config(self, pulse_config):
+        pulse_config.run.purpose = "leak_test"
+        pulse_config.run.pulse_decay.leak_test_duration_s = 30.0
+        return pulse_config
+
+    def write_run(self, config, loop, tmp_path):
+        """Store a completed run the way `collect` does, and return its dir."""
+        from gasperm.storage import RunWriter
+
+        config.run.output_dir = str(tmp_path)
+        writer = RunWriter(config)
+        writer.open()
+        for reading in loop.readings:
+            writer.write(reading)
+        writer.close()
+        writer.write_metadata(loop.summarize(csv_path=str(writer.readings_path)))
+        return writer.directory
+
+    # -- what a leak test is ------------------------------------------------
+
+    def test_a_leak_test_only_makes_sense_for_pulse_decay(self):
+        """Steady-state on a blanked plug would just report no flow."""
+        from gasperm.config import RunConfig
+
+        with pytest.raises(ValueError, match="pulse-decay observation"):
+            RunConfig(purpose="leak_test", method="steady_state")
+
+    def test_it_is_marked_in_the_summary(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        config = self.leak_config(pulse_config)
+        summary = run_decay(
+            config, fake_analog_source, fake_temperature_source,
+            rate=0.05, duration_s=30.0,
+        ).summarize()
+        assert summary.purpose == "leak_test"
+        assert summary.method == "pulse_decay"
+
+    def test_it_runs_for_its_duration_rather_than_to_a_decay_fraction(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """On a tight rig nothing decays, so there is no completion signal."""
+        config = self.leak_config(pulse_config)
+        loop = run_decay(
+            config, fake_analog_source, fake_temperature_source,
+            rate=1e-6, duration_s=20.0,
+        )
+        assert "decay reached" not in loop.stop_reason
+
+    def test_no_decay_is_a_pass_not_a_failure(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The inversion that matters: for a measurement this is a failure."""
+        config = self.leak_config(pulse_config)
+        summary = run_decay(
+            config, fake_analog_source, fake_temperature_source,
+            rate=1e-9, duration_s=20.0,
+        ).summarize()
+        assert summary.pulse_decay is None
+        assert summary.measurement_confirmed
+        assert any("result you want" in w for w in summary.warnings)
+
+    def test_the_same_state_is_a_failure_for_a_measurement(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=1e-9, duration_s=20.0,
+        ).summarize()
+        assert not summary.measurement_confirmed
+        assert any("did NOT measure" in w for w in summary.warnings)
+
+    def test_a_measurable_leak_is_reported_as_a_permeability(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The number to compare against k, in the units of the decision."""
+        config = self.leak_config(pulse_config)
+        summary = run_decay(
+            config, fake_analog_source, fake_temperature_source,
+            rate=0.05, duration_s=30.0,
+        ).summarize()
+        assert summary.permeability_darcy > 0.0
+        assert any("LEAK TEST:" in w for w in summary.warnings)
+        assert any("floor for a trustworthy measurement" in w for w in summary.warnings)
+
+    # -- how a measurement uses it -----------------------------------------
+
+    def test_a_measurement_without_one_says_so(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        pulse_config.run.output_dir = str(tmp_path)
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+        assert summary.pulse_decay.leak_rate_per_s is None
+        assert any("No leak test has been recorded" in w for w in summary.warnings)
+
+    def test_a_recorded_leak_is_found_and_compared(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        sample_rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+
+        leak = self.leak_config(pulse_config)
+        leak_loop = run_decay(
+            leak, fake_analog_source, fake_temperature_source,
+            rate=sample_rate * 0.3, duration_s=30.0,
+        )
+        self.write_run(leak, leak_loop, tmp_path)
+
+        pulse_config.run.purpose = "measurement"
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=sample_rate, duration_s=40.0,
+        ).summarize()
+
+        result = summary.pulse_decay
+        assert result.leak_rate_per_s == pytest.approx(sample_rate * 0.3, rel=0.05)
+        assert result.leak_equivalent_permeability_darcy > 0.0
+        assert result.leak_fraction == pytest.approx(0.3, abs=0.02)
+        assert any("rig's own decay is" in w for w in summary.warnings)
+
+    def test_a_small_leak_does_not_warn(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        sample_rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        leak = self.leak_config(pulse_config)
+        self.write_run(
+            leak,
+            run_decay(
+                leak, fake_analog_source, fake_temperature_source,
+                rate=sample_rate * 0.01, duration_s=30.0,
+            ),
+            tmp_path,
+        )
+        pulse_config.run.purpose = "measurement"
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=sample_rate, duration_s=40.0,
+        ).summarize()
+        assert not any("above pulse_decay.max_leak_fraction" in w for w in summary.warnings)
+
+    def test_a_passing_leak_test_is_not_the_same_as_none(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        """Telling an operator who did the right thing that they did not is worse
+        than saying nothing."""
+        leak = self.leak_config(pulse_config)
+        self.write_run(
+            leak,
+            run_decay(
+                leak, fake_analog_source, fake_temperature_source,
+                rate=1e-9, duration_s=20.0,
+            ),
+            tmp_path,
+        )
+        pulse_config.run.purpose = "measurement"
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        ).summarize()
+        assert not any("No leak test has been recorded" in w for w in summary.warnings)
+        assert any("no measurable decay" in w for w in summary.warnings)
+
+    def test_the_leak_can_be_subtracted_when_asked(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        sample_rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        leak = self.leak_config(pulse_config)
+        self.write_run(
+            leak,
+            run_decay(
+                leak, fake_analog_source, fake_temperature_source,
+                rate=sample_rate * 0.3, duration_s=30.0,
+            ),
+            tmp_path,
+        )
+        pulse_config.run.purpose = "measurement"
+
+        uncorrected = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=sample_rate, duration_s=40.0,
+        ).summarize()
+
+        pulse_config.run.pulse_decay.leak_correction = "subtract"
+        corrected = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=sample_rate, duration_s=40.0,
+        ).summarize()
+
+        assert corrected.pulse_decay.leak_subtracted
+        assert corrected.permeability_darcy < uncorrected.permeability_darcy
+        assert any("was SUBTRACTED" in w for w in corrected.warnings)
+
+    def test_subtracting_is_off_by_default(self, pulse_config):
+        """A leak that changed since the test would corrupt a result silently."""
+        assert pulse_config.run.pulse_decay.leak_correction == "off"
+
+    def test_a_leak_test_at_a_different_pressure_is_flagged(
+        self, pulse_config, fake_analog_source, fake_temperature_source, tmp_path
+    ):
+        """Leak conductance is pressure-dependent, so the test must match."""
+        sample_rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        leak = self.leak_config(pulse_config)
+        self.write_run(
+            leak,
+            run_decay(
+                leak, fake_analog_source, fake_temperature_source,
+                rate=sample_rate * 0.01, duration_s=30.0, mean_pressure_atm=3.0,
+            ),
+            tmp_path,
+        )
+        pulse_config.run.purpose = "measurement"
+        summary = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=sample_rate, duration_s=40.0, mean_pressure_atm=10.0,
+        ).summarize()
+        assert any("does not describe this run" in w for w in summary.warnings)
+
+    # -- it is never a data point ------------------------------------------
+
+    def test_a_leak_test_is_refused_as_a_klinkenberg_point(
+        self, tmp_path, fake_run_writer
+    ):
+        from gasperm.storage import point_from_run
+
+        directory = fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 1, 9, tzinfo=timezone.utc),
+            method="pulse_decay", purpose="leak_test",
+        )
+        with pytest.raises(ValueError, match="leak test, not a measurement"):
+            point_from_run(directory)
+
+    def test_run_purpose_reads_the_block_not_the_key(self):
+        from gasperm.storage import run_purpose
+
+        assert run_purpose({"run": {}}) == "measurement"
+        assert run_purpose({"run": {"purpose": "leak_test"}}) == "leak_test"
+        assert run_purpose({}) is None
+
+    def test_the_latest_leak_test_wins(self, tmp_path, fake_run_writer):
+        from gasperm.storage import find_leak_test, find_runs
+
+        fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 1, 9, tzinfo=timezone.utc),
+            method="pulse_decay", purpose="leak_test",
+        )
+        newest = fake_run_writer(
+            tmp_path, "core-002", datetime(2026, 3, 2, 9, tzinfo=timezone.utc),
+            method="pulse_decay", purpose="leak_test",
+        )
+        fake_run_writer(
+            tmp_path, "core-001", datetime(2026, 3, 3, 9, tzinfo=timezone.utc),
+            method="pulse_decay",
+        )
+        found = find_leak_test(find_runs(tmp_path))
+        assert found.directory == newest
+
+    def test_it_is_found_across_plugs(self, tmp_path, fake_run_writer):
+        """The rig leaked the same whichever core was in it."""
+        from gasperm.storage import find_leak_test, find_runs
+
+        fake_run_writer(
+            tmp_path, "core-999", datetime(2026, 3, 1, 9, tzinfo=timezone.utc),
+            method="pulse_decay", purpose="leak_test",
+        )
+        assert find_leak_test(find_runs(tmp_path)) is not None
+
+
 class TestConfigRefusals:
     def test_a_supplied_p2_and_pulse_decay_cannot_coexist(self):
         from gasperm.config import RunConfig

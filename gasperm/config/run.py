@@ -290,6 +290,33 @@ class PulseDecayConfig(_Base):
     #: the zero-storage form is in use.
     max_storage_ratio: float = Field(default=0.05, gt=0.0)
 
+    # -- the leak test ----------------------------------------------------
+    #: How long a ``--leak-test`` run records for. A leak test is a *fixed
+    #: observation*, not a decay to be waited out: on a tight rig the ideal
+    #: outcome is that nothing happens, so there is no completion signal to
+    #: stop on and it must be given a duration. ``null`` falls back to
+    #: ``run.duration_s``, and a leak test with neither is refused.
+    leak_test_duration_s: float | None = Field(default=3600.0, gt=0.0)
+    #: Largest share of the measured decay that may come from the rig rather
+    #: than the rock before the measurement stops being about the sample.
+    #: Compared as an equivalent permeability, so it reads directly against k.
+    max_leak_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+    #: What to do with a recorded leak rate.
+    #:
+    #: ``off``
+    #:     Compare and warn only. The default, deliberately: a leak that
+    #:     changed between the test and the run would silently corrupt a
+    #:     subtracted result, and the correction is worth less than knowing
+    #:     the leak is small.
+    #: ``subtract``
+    #:     Take the leak rate off the measured one. Only defensible when the
+    #:     leak is linear and stable, and it is still reported both ways.
+    leak_correction: Literal["off", "subtract"] = "off"
+    #: Warn when the leak test's mean pressure differs from the run's by more
+    #: than this. Leak conductance is pressure-dependent, so a test done at a
+    #: different charge does not describe this run.
+    leak_pressure_tolerance: float = Field(default=0.2, gt=0.0)
+
     # -- planning ---------------------------------------------------------
     #: Roughly expected permeability, used ONLY to predict the run's duration at
     #: startup. Never enters a result.
@@ -406,6 +433,21 @@ class RunConfig(_Base):
     #:     Requires ``downstream_pressure: measured`` and the two vessel
     #:     volumes in ``hardware.reservoirs``.
     method: Literal["steady_state", "pulse_decay"] = "steady_state"
+    #: What this run is for.
+    #:
+    #: ``measurement``
+    #:     A permeability measurement, the normal case.
+    #: ``leak_test``
+    #:     The pre-step: the plug blanked or bypassed, the same pulse applied,
+    #:     and the differential watched for a fixed time. Whatever decays there
+    #:     is the rig -- leaks and thermal drift -- and it sets the floor below
+    #:     which a sample's decay cannot be distinguished from the apparatus.
+    #:     Reported as the equivalent permeability the rig alone would fake, so
+    #:     it compares directly against the k you are trying to measure.
+    #:
+    #:     Excluded from ``klinkenberg`` discovery: it is a property of the
+    #:     bench, not a point on the sample's curve.
+    purpose: Literal["measurement", "leak_test"] = "measurement"
     gas: GasConfig = Field(default_factory=GasConfig)
     #: Which meter in ``hardware.flowmeters`` this run uses. ``null`` takes the
     #: rig's ``default_flowmeter``. This lives here, not in hardware.yaml,
@@ -563,6 +605,25 @@ class RunConfig(_Base):
                 f"{self.downstream_pressure_unit}. Pulse decay watches P1 - P2 decay "
                 "into a CLOSED downstream vessel; a declared constant P2 asserts the "
                 "outlet is open to something. Set downstream_pressure: measured."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _leak_test_is_a_pulse_decay_step(self) -> RunConfig:
+        """A leak test only means something for pulse decay.
+
+        Steady-state Darcy reads a flow, and a blanked plug passes none -- the
+        run would simply report no flow, which says nothing about the rig's
+        leak rate. The pre-step exists because pulse decay infers permeability
+        from a *rate*, and a leak produces a rate indistinguishable from a slow
+        sample.
+        """
+        if self.purpose == "leak_test" and self.method != "pulse_decay":
+            raise ValueError(
+                f"run.purpose is 'leak_test' but run.method is {self.method!r}. A "
+                "leak test measures the differential decay of a blanked rig, which "
+                "is a pulse-decay observation; a steady-state run on a blanked plug "
+                "would just report no flow. Set method: pulse_decay."
             )
         return self
 

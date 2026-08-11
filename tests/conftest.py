@@ -137,6 +137,7 @@ def write_fake_run(
     downstream_pressure: float | str = "measured",
     mean_flow_cm3_s: float | None = None,
     method: str = "steady_state",
+    purpose: str = "measurement",
     pulse_decay: dict | None = None,
 ) -> Path:
     """Write a run directory without driving the acquisition loop.
@@ -189,6 +190,7 @@ def write_fake_run(
                 "sample": {"id": sample_id},
                 "run": {
                     "method": method,
+                    "purpose": purpose,
                     "downstream_pressure": downstream_pressure,
                     "downstream_pressure_unit": "kPa",
                 },
@@ -198,6 +200,7 @@ def write_fake_run(
             payload["summary"] = {
                 "sample_id": sample_id,
                 "method": method,
+                "purpose": purpose,
                 "steady_state_reached": method == "steady_state",
                 "measurement_confirmed": True,
                 "mean_pressure_atm": mean_pressure_atm,

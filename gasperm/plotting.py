@@ -110,6 +110,12 @@ class _Panel(NamedTuple):
     #: visual confirmation the operator is waiting for. Defaulted, so no
     #: existing construction site changes.
     yscale: str = "linear"
+    #: A range the axis must span at least, ``(low, high)``. For a quantity
+    #: with a known meaningful scale this stops autoscale magnifying noise on a
+    #: flat trace into what looks like violent movement -- which is exactly
+    #: what happens to dP/dP0 on a rig that is not leaking, i.e. the case the
+    #: operator most needs to read as "nothing is happening".
+    y_range: tuple[float, float] | None = None
 
 
 def _channel_values(reading: Reading, run) -> dict[str, float]:
@@ -149,6 +155,11 @@ def _channel_values(reading: Reading, run) -> dict[str, float]:
         "permeability": darcy(reading.permeability_darcy),
         "permeability_avg": darcy(reading.permeability_darcy_avg),
     }
+
+
+def _k_label(run) -> str:
+    """What the permeability trace is, which depends on what the run is for."""
+    return "leak equiv." if run.purpose == "leak_test" else "k"
 
 
 def _panels_for(config: GaspermConfig) -> list[_Panel]:
@@ -196,6 +207,10 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             traces=(_Trace("decay_fraction", "dP/dP0", "tab:red"),),
             signal=None,
             to_display=lambda value: value,
+            # The decay only means anything between the stop fraction and 1, so
+            # pin that span: a rig that is holding its differential then reads
+            # as a flat line at the top rather than as magnified noise.
+            y_range=(run.pulse_decay.stop_below_fraction * 0.8, 1.05),
             # Log: an exponential decay straightens into a line here, which is
             # the fastest visual check that the plug -- and not a leak or a
             # thermal ramp -- is what the differential is doing.
@@ -217,13 +232,19 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
         ),
         "permeability": _Panel(
             key="permeability",
-            ylabel=f"k ({run.display_permeability_unit})",
+            # On a leak test this trace is the permeability the APPARATUS would
+            # fake, not the rock's. Same number, entirely different meaning.
+            ylabel=(
+                f"leak equiv. ({run.display_permeability_unit})"
+                if run.purpose == "leak_test"
+                else f"k ({run.display_permeability_unit})"
+            ),
             traces=(
                 # The detector tests the instantaneous value, so that is what
                 # the criterion band belongs around; the rolling mean is drawn
                 # over it because that is the number the console reports.
-                _Trace("permeability", "k (instant)", "tab:red", 0.9, 0.35),
-                _Trace("permeability_avg", "k (averaged)", "tab:red", 1.6),
+                _Trace("permeability", f"{_k_label(run)} (instant)", "tab:red", 0.9, 0.35),
+                _Trace("permeability_avg", f"{_k_label(run)} (averaged)", "tab:red", 1.6),
             ),
             signal="permeability",
             to_display=lambda d: units.darcy_to(d, run.display_permeability_unit),
@@ -499,6 +520,12 @@ class LivePlot:
             # The trace's own y-range, captured before the criterion lines get
             # a vote on the autoscale.
             data_limits = axis.get_ylim()
+            if panel.y_range is not None:
+                data_limits = (
+                    min(data_limits[0], panel.y_range[0]),
+                    max(data_limits[1], panel.y_range[1]),
+                )
+                axis.set_ylim(*data_limits)
             # Shade the stretch the detector has confirmed steady -- the part
             # of the run that will actually be reported.
             for start, end in spans:
@@ -543,6 +570,10 @@ class LivePlot:
         criteria = self.config.run.steady_state
         # Unwatched either because the quantity has no criteria at all (the
         # outlet) or because this run's `signals` list leaves it out.
+        if self.config.run.method != "steady_state":
+            # No detector is running, so "not a steady-state signal" would be
+            # true of every panel and mean nothing on any of them.
+            return
         if panel.signal is None or panel.signal not in criteria.signals:
             _corner_note(axis, "not a steady-state signal", "0.45")
             return
@@ -592,6 +623,10 @@ class LivePlot:
     def _title(self) -> str:
         span = "from t0" if self.window_s is None else f"last {self.window_s:g} s"
         head = f"{self.config.sample.id}   {self.config.gas.name}   [{span}]"
+        if self.config.run.purpose == "leak_test":
+            # An operator glancing at the window must not mistake the pre-step
+            # for a measurement.
+            head = f"LEAK TEST (the apparatus, not the sample)   {head}"
         if self._status is None:
             return head
         # status.summary already carries the "(n/m)" progress, so it is not

@@ -36,6 +36,7 @@ def reading(
     temperature_c: float = 22.0,
     permeability: float | None = 0.005,
     steady: bool = False,
+    decay_fraction: float | None = None,
 ) -> Reading:
     return Reading(
         index=index,
@@ -56,6 +57,7 @@ def reading(
         permeability_darcy=permeability,
         permeability_darcy_avg=permeability,
         steady_state=steady,
+        decay_fraction=decay_fraction,
     )
 
 
@@ -215,6 +217,103 @@ class TestPanels:
         """The detector works in K so it never divides by a near-zero mean."""
         panel = {p.key: p for p in _panels_for(GaspermConfig())}["temperature"]
         assert panel.to_display(295.15) == pytest.approx(22.0)
+
+
+class TestPulseAndLeakPanels:
+    """A pulse-decay window, and how a leak test differs from a measurement."""
+
+    def pulse(self, *, leak_test: bool = False) -> GaspermConfig:
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        if leak_test:
+            config.run.purpose = "leak_test"
+        return config
+
+    def test_the_decay_panels_replace_the_flow_panel(self):
+        keys = [panel.key for panel in _panels_for(self.pulse())]
+        assert "flow" not in keys
+        assert {"delta_pressure", "decay_fraction"} <= set(keys)
+
+    def test_the_decay_fraction_axis_spans_the_meaningful_range(self):
+        """Otherwise a rig that is holding reads as violent noise.
+
+        dP/dP0 sits at 1.0 to within a few parts in 1e5 on a tight rig, and a
+        log axis autoscaled to that turns the flat trace the operator wants to
+        see into apparent chaos.
+        """
+        config = self.pulse(leak_test=True)
+        panel = next(p for p in _panels_for(config) if p.key == "decay_fraction")
+        low, high = panel.y_range
+        assert low == pytest.approx(config.run.pulse_decay.stop_below_fraction * 0.8)
+        assert high >= 1.0
+
+    def test_a_flat_decay_fraction_is_not_magnified(self):
+        config = self.pulse(leak_test=True)
+        config.run.plot.panels = ["decay_fraction"]
+        plot = LivePlot(config)
+        plot.open()
+        for index in range(40):
+            # A rig that is not leaking: 1.0 give or take a few parts in 1e5.
+            plot.add(reading(index, index * 0.1, decay_fraction=1.0 + 1e-5 * (index % 3)))
+        plot.maybe_redraw(now=1000.0)
+        low, high = plot._axes[0].get_ylim()
+        assert low <= config.run.pulse_decay.stop_below_fraction
+        assert high >= 1.0
+        plot.close()
+
+    def test_the_permeability_panel_says_whose_permeability_it_is(self):
+        """On a leak test the trace is the APPARATUS, not the rock."""
+        measurement = next(
+            p for p in _panels_for(self.pulse()) if p.key == "permeability"
+        )
+        leak = next(
+            p for p in _panels_for(self.pulse(leak_test=True)) if p.key == "permeability"
+        )
+        assert measurement.ylabel.startswith("k (")
+        assert leak.ylabel.startswith("leak equiv.")
+        assert all("leak equiv." in trace.label for trace in leak.traces)
+
+    def test_the_title_names_a_leak_test(self):
+        plot = LivePlot(self.pulse(leak_test=True))
+        plot.open()
+        plot.add(reading())
+        plot.maybe_redraw(now=1000.0)
+        assert "LEAK TEST" in plot._figure._suptitle.get_text()
+        plot.close()
+
+    def test_a_measurement_title_does_not(self):
+        plot = LivePlot(self.pulse())
+        plot.open()
+        plot.add(reading())
+        plot.maybe_redraw(now=1000.0)
+        assert "LEAK TEST" not in plot._figure._suptitle.get_text()
+        plot.close()
+
+    def test_no_steady_state_note_appears_in_pulse_mode(self):
+        """No detector is running, so it would be true of every panel."""
+        config = self.pulse()
+        config.run.plot.panels = ["delta_pressure", "temperature"]
+        plot = LivePlot(config)
+        plot.open()
+        for index in range(20):
+            plot.add(reading(index, index * 0.1))
+        plot.maybe_redraw(now=1000.0)
+        for axis in plot._axes:
+            texts = [t.get_text() for t in axis.texts]
+            assert not any("steady-state signal" in t for t in texts)
+        plot.close()
+
+    def test_steady_state_runs_keep_the_note(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["outlet_pressure"]
+        plot = LivePlot(config)
+        plot.open()
+        for index in range(20):
+            plot.add(reading(index, index * 0.1), status_with())
+        plot.maybe_redraw(now=1000.0)
+        texts = [t.get_text() for t in plot._axes[0].texts]
+        assert any("not a steady-state signal" in t for t in texts)
+        plot.close()
 
 
 class TestWindowResolution:

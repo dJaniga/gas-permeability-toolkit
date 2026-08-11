@@ -766,6 +766,11 @@ def render_run_yaml(config: GaspermConfig) -> str:
             "warn when one input is worth this fraction of k"
         ),
         "method": "steady_state | pulse_decay",
+        "purpose": "measurement | leak_test (see 'collect --leak-test')",
+        "pulse_decay.leak_test_duration_s": "a leak test is a FIXED observation",
+        "pulse_decay.max_leak_fraction": "warn above this share of rig-vs-sample decay",
+        "pulse_decay.leak_correction": "off | subtract",
+        "pulse_decay.leak_pressure_tolerance": "a test at another charge does not apply",
         "pulse_decay.upstream_spacers": "spacers fitted this run; --spacers overrides",
         "pulse_decay.min_pulse_pressure": "smallest differential that counts as a pulse",
         "pulse_decay.max_pulse_fraction": "largest dP0/P_mean the linearisation allows",

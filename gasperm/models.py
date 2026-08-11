@@ -513,6 +513,33 @@ class PulseDecayResult(BaseModel):
     storage_correction: Literal["brace", "dicker_smits"] = "brace"
     gas_compressibility_per_atm: float
 
+    # -- the rig's own contribution ---------------------------------------
+    #: Decay rate the blanked rig produced in its leak test, 1/s. ``None`` when
+    #: no leak test was found, which is itself worth knowing.
+    leak_rate_per_s: float | None = None
+    #: Equivalent permeability of that leak: what the apparatus alone would
+    #: report with no sample in it. The number to compare against
+    #: :attr:`RunSummary.permeability_darcy` -- if they are close, the run is
+    #: measuring the bench.
+    leak_equivalent_permeability_darcy: float | None = None
+    #: Where that leak test came from, for traceability.
+    leak_test_source: str | None = None
+    #: True when the leak rate was taken off the measured one rather than
+    #: merely compared against it.
+    leak_subtracted: bool = False
+
+    @property
+    def leak_fraction(self) -> float | None:
+        """The share of the measured decay that came from the rig."""
+        if self.leak_rate_per_s is None or self.decay_rate_per_s == 0.0:
+            return None
+        # Against the *uncorrected* rate, so the figure means the same thing
+        # whether or not the correction was applied.
+        total = self.decay_rate_per_s + (
+            self.leak_rate_per_s if self.leak_subtracted else 0.0
+        )
+        return abs(self.leak_rate_per_s / total) if total else None
+
     @property
     def time_constant_s(self) -> float:
         """1/alpha -- how long the decay takes to fall to 1/e."""
@@ -546,6 +573,10 @@ class RunSummary(BaseModel):
     sample_count: int
     #: Which method produced this result.
     method: Literal["steady_state", "pulse_decay"] = "steady_state"
+    #: Whether this run measured the sample or characterised the rig. A
+    #: ``leak_test`` reports the equivalent permeability the apparatus alone
+    #: would fake, and is never a Klinkenberg point.
+    purpose: Literal["measurement", "leak_test"] = "measurement"
 
     #: True when the detector confirmed stationarity at some point in the run.
     #: Always False for a pulse-decay run -- there is no steady state to reach,

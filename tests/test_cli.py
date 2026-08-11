@@ -968,11 +968,41 @@ class TestPulseDecayFlags:
         assert types["wide"].internal_diameter == pytest.approx(25.4)
         assert types["narrow"].internal_diameter == pytest.approx(12.7)
 
+    def test_leak_test_implies_pulse_decay(self, tmp_path):
+        """A leak test IS a pulse-decay observation, so asking for both is noise."""
+        init_config(tmp_path)
+        sample = add_sample(tmp_path / "samples", "core-041")
+        config = load_config(tmp_path, sample=sample)
+        assert config.run.method == "steady_state"
+        result = runner.invoke(
+            app,
+            ["collect", "-c", str(tmp_path), "--sample", str(sample), "--leak-test"],
+        )
+        # It gets past config and fails on the absent rig, not on the pairing.
+        plain = strip_ansi(result.output)
+        assert "pulse-decay observation" not in plain
+
+    def test_a_leak_test_without_a_duration_is_refused(self, tmp_path):
+        """Nothing decays on a tight rig, so there is no signal to stop on."""
+        init_config(
+            tmp_path,
+            "run.method=pulse_decay",
+            "run.pulse_decay.leak_test_duration_s=null",
+        )
+        sample = add_sample(tmp_path / "samples", "core-041")
+        result = runner.invoke(
+            app,
+            ["collect", "-c", str(tmp_path), "--sample", str(sample), "--leak-test"],
+        )
+        assert result.exit_code == 1
+        assert "needs a duration" in strip_ansi(result.output)
+
     def test_the_flags_are_documented_in_help(self):
         result = runner.invoke(app, ["collect", "--help"], env={"COLUMNS": "200"})
         plain = strip_ansi(result.output)
         assert "--method" in plain
         assert "--spacer" in plain
+        assert "--leak-test" in plain
         result = runner.invoke(app, ["klinkenberg", "--help"], env={"COLUMNS": "200"})
         assert "--allow-mixed-methods" in strip_ansi(result.output)
 
