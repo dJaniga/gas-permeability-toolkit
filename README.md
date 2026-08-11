@@ -4,12 +4,13 @@ Gas permeability measurement for core plugs on a lab rig built around an
 **NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
 temperature probe on USB serial.
 
-Four commands:
+Five commands:
 
 | command | what it does |
 |---|---|
 | `gasperm init` | write the rig and experiment configuration — once per bench |
 | `gasperm new-sample` | add a core plug — one file per plug, rig config untouched |
+| `gasperm preview` | watch the raw signals in configured units, on the console and optionally a live plot — computes nothing, stores nothing |
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
 
@@ -76,6 +77,8 @@ one command:
 ```bash
 gasperm init tight-gas-rig                       # once per bench; creates the folder
 cd tight-gas-rig
+
+gasperm preview --plot                           # check the signals; measures nothing
 
 gasperm new-sample core-041 --dir samples        # -> samples/core-041.yaml
 gasperm new-sample --dir samples --from samples/core-041.yaml   # asks id, then this plug
@@ -203,6 +206,86 @@ command line (`--flowmeter high_range`). Only the selected meter's analog input
 is added to the DAQ task; the others are never read. The meter used is recorded
 in every run's metadata, because two runs on the same plug routinely differ in
 nothing else.
+
+## Checking the signals: `gasperm preview`
+
+Before a run — or in the middle of chasing a wiring fault — you often want to
+see what a transducer is actually doing, with no plug in the holder and nothing
+being measured. That is `preview`:
+
+```bash
+gasperm preview                                  # every signal this rig defines
+gasperm preview --list                           # what it can show, touching no hardware
+gasperm preview -s pulse --plot                  # both pulse-decay transducers
+gasperm preview -s inlet_pressure -s flow --plot # two signals, live window
+gasperm preview -s inlet_pressure:bar            # in a unit of your choosing
+gasperm preview --volts                          # what the wire is doing, uncalibrated
+gasperm preview -s ai7 -d 30                     # an input the config says nothing about
+```
+
+**`-s pulse` picks the pulse-decay transducers automatically.** It resolves the
+pair exactly as a pulse-decay run does: the dedicated low-range pair when
+`hardware.pulse_transducers` defines one, and the steady-state inlet/outlet pair
+when it does not. Either way the banner says which you got —
+
+```
+  pulse_upstream        kPa   ai4  0-10 V -> 0-100 bar (absolute)  [dedicated pulse transducer]
+  pulse_upstream        kPa   ai0  0-5 V -> 0-68.95 MPa (absolute)  [NO dedicated pulse pair -- falls back to the steady-state transducer]
+```
+
+— because a pulse pair that silently turned out to be the 0–68.95 MPa
+transducers is the failure the whole method exists to avoid: they cannot
+resolve a 100 kPa pulse (see [Sizing the transducers](#sizing-the-transducers)),
+and the run would look perfectly healthy while measuring nothing. `--list` warns
+about the same thing up front. Unlike `collect`, this ignores `run.method` —
+checking the dedicated pair is something you do on a rig whose `run.yaml` still
+says `steady_state`, usually because you are about to change it.
+
+`pressure` is a pair the same way (inlet + outlet), and a unit on a pair applies
+to both halves — two ends of one differential in different units would be
+unreadable.
+
+**It computes nothing and stores nothing.** No permeability, no gas lookup, no
+run directory, no CSV, no sidecar. That is what makes it usable as a signal
+check rather than a measurement: a command that also derived a permeability
+would have to invent a sample, a gas and a geometry to do it, and would then
+write a run full of numbers describing nothing. It also means `preview` never
+asks for a sample file — it describes the **bench**, so it reads `hardware.yaml`
+and `run.yaml` and stops there.
+
+**Only the channels you select are opened.** `collect` reads a fixed set fixed
+by the method; preview reads exactly what was named. That is what lets you watch
+the flowmeter a run is *not* using (`-s flow.high_range`), or a bare input with
+no calibration at all (`-s ai7`, shown as raw volts over the widest range the
+6421 supports), without editing a config file.
+
+Each signal is shown in its **configured display unit** — `run.display_pressure_unit`,
+`display_flow_unit`, °C — and `NAME:UNIT` overrides that for one signal.
+Pressures are shown **absolute**, the same number `collect` would compute from
+the same voltage; the banner says so when the transducer is a gauge type. For
+checking a zero, `--volts` is the better tool anyway: it shows the reading
+before any calibration has an opinion about it.
+
+```
+     time       P1 (kPa)       P2 (kPa)  Q:low_range (sccm)        ai7 (V)
+     4.5s      1.013e+04           101.3               0.412          3.301
+```
+
+With `--plot`, each signal gets its own stacked panel sharing a time axis, with
+the same `--plot-window` / `--plot-from-start` choice `collect` offers. **Nothing
+is drawn on top of the traces** — no criterion bands, no steady shading, no
+fitted line: preview runs no detector, so every annotation `collect`'s window
+adds would be asserting something that was never tested.
+
+The DAQ is sampled at `daq.sample_rate_hz` (or `--rate`) so the plot and any
+judgement about noise see the real signal; the console line is refreshed at
+2 Hz, in place, because ten updates a second is not readable. The final sample
+is always printed, so a preview never ends on a stale line.
+
+The temperature probe is opened **only** if `temperature` is among the selected
+signals. If it was asked for explicitly and fails, that is fatal; if it was
+merely part of the default set, its column is dropped with a warning and the
+DAQ half of the preview carries on, which is the half worth watching.
 
 ## Steady state is required, not optional
 

@@ -1,4 +1,4 @@
-"""Command-line entry point: ``gasperm init | collect | klinkenberg``."""
+"""Command-line entry point: ``gasperm init | preview | collect | klinkenberg``."""
 
 from __future__ import annotations
 
@@ -42,7 +42,8 @@ app = typer.Typer(
         "experiment), both from 'init'; plus one sample file per core plug, from "
         "'new-sample'.\n\n"
         "Typical order: init once per rig, new-sample per plug, collect once per "
-        "mean pressure, then klinkenberg across those runs."
+        "mean pressure, then klinkenberg across those runs. 'preview' is the "
+        "signal check you run in between, which measures and stores nothing."
     ),
 )
 
@@ -1222,6 +1223,256 @@ def collect_command(
     # accepted decay fit for the other.
     if summary is not None and not summary.measurement_confirmed:
         exit_code = exit_code or 2
+    if exit_code:
+        raise typer.Exit(code=exit_code)
+
+
+@app.command("preview")
+def preview_command(
+    config_dir: Path = typer.Option(
+        Path("."), "--config-dir", "-c", help="Directory holding hardware.yaml and run.yaml."
+    ),
+    hardware: Optional[Path] = typer.Option(None, "--hardware", help="Override hardware.yaml."),
+    run_file: Optional[Path] = typer.Option(None, "--run", help="Override run.yaml."),
+    signal: Optional[list[str]] = typer.Option(
+        None, "--signal", "-s", metavar="NAME[:UNIT]",
+        help="Signal to preview, e.g. 'inlet_pressure' or 'inlet_pressure:bar'. "
+             "Repeat for more. 'pulse' selects both transducers a pulse-decay "
+             "run would read -- the dedicated pair when the rig has one, the "
+             "steady-state pair when it does not. A bare channel name (ai7) "
+             "previews an uncalibrated input as raw volts. Default: every "
+             "signal this rig defines. See --list.",
+    ),
+    list_signals: bool = typer.Option(
+        False, "--list",
+        help="Print what this rig can preview, with each signal's channel, "
+             "range and calibration, then exit. Touches no hardware.",
+    ),
+    volts: bool = typer.Option(
+        False, "--volts",
+        help="Show raw voltages instead of calibrated values -- what the wire "
+             "is doing, before any calibration has an opinion about it.",
+    ),
+    plot: bool = typer.Option(
+        False, "--plot", help="Open a live window, one stacked panel per signal."
+    ),
+    plot_window: Optional[float] = typer.Option(
+        None, "--plot-window", metavar="SECONDS",
+        help="Live plot shows only this trailing window. Implies --plot.",
+    ),
+    plot_from_start: bool = typer.Option(
+        False, "--plot-from-start",
+        help="Live plot spans the whole session from t0. Implies --plot.",
+    ),
+    rate: Optional[float] = typer.Option(
+        None, "--rate", metavar="HZ",
+        help="Sampling rate. Defaults to daq.sample_rate_hz.",
+    ),
+    duration: Optional[float] = typer.Option(
+        None, "--duration", "-d", metavar="SECONDS", help="Stop after this long."
+    ),
+    samples: Optional[int] = typer.Option(
+        None, "--samples", "-n", help="Stop after this many samples."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Watch the rig's raw signals. Computes nothing, stores nothing.
+
+    A diagnostic view for checking that a transducer reads what you think it
+    does, and how noisy it is right now -- with no plug in the holder and no
+    run directory created. Only the channels you select are opened, which is
+    what lets you look at the flowmeter a run is *not* using, or at a bare
+    input, without editing a config file. Runs until Ctrl+C unless stopped.
+    """
+    from gasperm.config import load_bench_config
+    from gasperm.hardware.daq import DaqError, NiDaqAnalogInput
+    from gasperm.preview import (
+        GROUPS,
+        ConsoleThrottle,
+        PreviewError,
+        PreviewLoop,
+        available_signals,
+        describe_signals,
+        format_preview_line,
+        preview_channel_specs,
+        preview_header,
+        pulse_transducer_pair,
+        resolve_signals,
+    )
+
+    _configure_logging(verbose)
+    try:
+        config = load_bench_config(config_dir, hardware=hardware, run=run_file)
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+
+    if list_signals:
+        catalogue = list(available_signals(config).values())
+        typer.secho(f"Signals available on {config.daq.device_name}:", fg=typer.colors.CYAN)
+        for line in describe_signals(catalogue, volts=False):
+            typer.echo(line)
+        typer.echo("\nPairs, selectable with one --signal:")
+        for name, members in GROUPS.items():
+            typer.echo(f"  {name:<10}  {', '.join(members)}")
+        typer.echo("  flow        whichever meter run.yaml selects")
+        if not pulse_transducer_pair(config)[2]:
+            typer.secho(
+                "\nThis rig has NO dedicated pulse transducers, so 'pulse' resolves to "
+                "the\nsteady-state pair -- which is also what a pulse-decay run would "
+                "read. Set\nhardware.pulse_transducers if you have a lower-range pair "
+                "wired.",
+                fg=typer.colors.YELLOW,
+            )
+        typer.echo(
+            "\nAny bare channel name (ai0, ai7, ...) also works, as raw volts.\n"
+            "Add ':UNIT' to a signal to change its unit, e.g. --signal inlet_pressure:bar."
+        )
+        return
+
+    try:
+        signals = resolve_signals(config, signal)
+    except PreviewError as exc:
+        _fail(str(exc))
+        return
+
+    if plot_window is not None and plot_from_start:
+        _fail(
+            "--plot-window and --plot-from-start ask for opposite views. Pass one: a "
+            "trailing window, or the whole session from t0."
+        )
+        return
+    plot = plot or plot_from_start or plot_window is not None
+
+    rate_hz = rate if rate is not None else config.hardware.daq.sample_rate_hz
+    if rate_hz <= 0.0:
+        _fail(f"--rate must be positive, got {rate_hz:g}.")
+        return
+
+    # Only what was selected is opened -- the whole point of the command.
+    specs = preview_channel_specs(signals)
+    wants_probe = any(s.from_probe for s in signals)
+
+    temperature_source = None
+    if wants_probe:
+        try:
+            temperature_source = _open_temperature_source(config)
+        except OSError as exc:
+            if signal:
+                # Explicitly asked for, so a silent drop would leave the
+                # operator watching a column that is never going to appear.
+                _fail(f"{exc}\nDrop '--signal temperature' to preview without the probe.")
+                return
+            typer.secho(f"warning: {exc}", fg=typer.colors.YELLOW, err=True)
+            typer.secho("Previewing without the temperature probe.", fg=typer.colors.YELLOW)
+            signals = [s for s in signals if not s.from_probe]
+            if not signals:
+                _fail("Nothing left to preview.")
+                return
+
+    analog_source = None
+    if specs:
+        try:
+            analog_source = NiDaqAnalogInput(
+                config.daq.device_name,
+                specs,
+                terminal_config=config.daq.terminal_config,
+            ).open()
+        except DaqError as exc:
+            if temperature_source is not None:
+                temperature_source.close()
+            _fail(str(exc))
+            return
+
+    live_plot = None
+    if plot:
+        from gasperm.plotting import PlottingUnavailable, PreviewPlot
+
+        try:
+            live_plot = PreviewPlot(
+                signals,
+                volts=volts,
+                window_s=plot_window,
+                from_start=plot_from_start,
+                max_points=config.run.plot.max_points,
+                redraw_interval_s=config.run.plot.redraw_interval_s,
+                device_name=config.daq.device_name,
+            ).open()
+        except PlottingUnavailable as exc:
+            typer.secho(f"warning: live plot unavailable: {exc}", fg=typer.colors.YELLOW)
+            live_plot = None
+
+    typer.secho(
+        f"\nPreviewing {len(signals)} signal(s) at {rate_hz:g} Hz   (Ctrl+C to stop)",
+        fg=typer.colors.CYAN,
+    )
+    for line in describe_signals(signals, volts=volts):
+        typer.secho(line, fg=typer.colors.CYAN)
+    typer.secho(
+        "Nothing is computed and nothing is written -- this is a signal check, "
+        "not a measurement.",
+        fg=typer.colors.CYAN,
+    )
+    typer.echo("")
+    typer.echo(preview_header(signals, volts=volts))
+
+    # The DAQ is sampled at the full rate so the plot and any judgement about
+    # noise see the real signal; the console is throttled because ten updates a
+    # second is not readable.
+    throttle = ConsoleThrottle()
+    live = sys.stdout.isatty()
+
+    def show(sample) -> None:
+        line = format_preview_line(sample, signals, volts=volts)
+        if live:
+            # Rewrite one line in place: a preview is watched, not read back.
+            typer.echo(f"\r{line}", nl=False)
+        else:
+            typer.echo(line)
+
+    def on_sample(sample) -> None:
+        if live_plot is not None:
+            live_plot.add(sample)
+            live_plot.maybe_redraw()
+        if throttle.due(time.monotonic()):
+            show(sample)
+
+    loop = PreviewLoop(
+        signals,
+        analog_source,
+        temperature_source,
+        rate_hz=rate_hz,
+        duration_s=duration,
+        max_samples=samples,
+        on_sample=on_sample,
+    )
+
+    exit_code = 0
+    try:
+        loop.run()
+    except DaqError as exc:
+        logger.error("%s", exc)
+        typer.secho(f"\nPreview stopped: {exc}", fg=typer.colors.RED, err=True)
+        exit_code = 1
+    except KeyboardInterrupt:  # pragma: no cover - the handler normally catches this
+        pass
+    finally:
+        # The console is throttled, so the last thing on screen is whatever
+        # sample happened to land on a tick. Show the final one unconditionally
+        # -- a short or fast preview would otherwise end on a stale line.
+        if loop.latest is not None:
+            show(loop.latest)
+        if live:
+            typer.echo("")
+        if live_plot is not None:
+            live_plot.close()
+
+    typer.secho(
+        f"\n{loop.sample_count} sample(s) previewed. Nothing was written.",
+        fg=typer.colors.GREEN,
+    )
+    if loop.stop_reason:
+        typer.echo(f"Stopped: {loop.stop_reason}")
     if exit_code:
         raise typer.Exit(code=exit_code)
 

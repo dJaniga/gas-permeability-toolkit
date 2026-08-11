@@ -103,6 +103,7 @@ __all__ = [
     "RUN_FILENAME",
     "SECTION_NAMES",
     "load_config",
+    "load_bench_config",
     "load_run_config",
     "load_sample_config",
     "save_config",
@@ -387,6 +388,50 @@ def load_config(
         # instance. Neither file is wrong on its own, so name both.
         raise ConfigError(
             _format_validation_error(exc, f"{paths.run} together with {paths.hardware}")
+        ) from exc
+
+
+def load_bench_config(
+    directory: str | Path | None = None,
+    *,
+    hardware: str | Path | None = None,
+    run: str | Path | None = None,
+) -> GaspermConfig:
+    """Load the rig and the experiment, without a core plug.
+
+    For commands that describe the **bench** rather than a measurement --
+    ``preview`` is the one -- where insisting on a sample file would be wrong
+    twice over: a rig folder has no ``sample.yaml`` (plugs live in ``samples/``,
+    one file each), and checking a transducer is something you do with nothing
+    in the holder.
+
+    The returned config carries a **default** :class:`SampleConfig`. Nothing on
+    this path may read it: there is no plug, so its geometry describes nothing.
+    Anything that needs a real sample must go through :func:`load_config`.
+
+    Raises:
+        ConfigError: a file is missing, malformed, or fails validation.
+    """
+    defaults = ConfigPaths.in_directory(directory if directory is not None else ".")
+    hardware_path = Path(hardware) if hardware is not None else defaults.hardware
+    run_path = Path(run) if run is not None else defaults.run
+
+    hardware_raw = _read_mapping(hardware_path, "hardware")
+    _reject_legacy(hardware_raw, hardware_path)
+    hardware_config = _validate_section(
+        HardwareConfig, _unwrap(hardware_raw, "hardware"), hardware_path
+    )
+    run_config = _validate_section(
+        RunConfig, _unwrap(_read_mapping(run_path, "run"), "run"), run_path
+    )
+
+    try:
+        return GaspermConfig(
+            hardware=hardware_config, run=run_config, config_dir=run_path.parent
+        )
+    except ValidationError as exc:
+        raise ConfigError(
+            _format_validation_error(exc, f"{run_path} together with {hardware_path}")
         ) from exc
 
 

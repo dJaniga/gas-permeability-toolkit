@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "LivePlot",
+    "PreviewPlot",
     "plot_klinkenberg",
     "plot_pulse_decay",
     "PlottingUnavailable",
@@ -350,50 +351,34 @@ class _History:
         )
 
 
-class LivePlot:
-    """Live per-parameter view of a ``collect`` run.
+class _StackedPlot:
+    """Shared machinery for every stacked, time-axis live window.
 
-    One stacked panel per configured quantity, the steady-state criteria drawn
-    on the panels the detector watches, and the confirmed steady stretch
-    shaded. Usable as a context manager. Every method is safe to call when the
-    backend turns out to be unusable -- the plot degrades to a no-op rather
-    than taking the run down with it.
+    Figure lifecycle, the bounded buffer, the redraw timer and the two display
+    modes are identical whether the window is showing a ``collect`` run or a
+    ``preview`` of raw signals. What differs is only what gets *drawn on top*
+    of the traces, so subclasses override the two annotation hooks rather than
+    reimplementing the loop.
+
+    Every method is safe to call when the backend turns out to be unusable --
+    the plot degrades to a no-op rather than taking the run down with it.
     """
 
     def __init__(
         self,
-        config: GaspermConfig,
+        panels: Sequence[_Panel],
         *,
-        max_points: int | None = None,
-        redraw_interval_s: float | None = None,
-        window_s: float | None = None,
-        from_start: bool = False,
+        window_s: float | None,
+        max_points: int,
+        redraw_interval_s: float,
+        window_title: str,
     ) -> None:
-        """Args:
-        config: Supplies the panels, display units and criteria; the plot
-            never shows CGS.
-        max_points: Override ``run.plot.max_points``.
-        redraw_interval_s: Override ``run.plot.redraw_interval_s``.
-        window_s: Trailing seconds to show, overriding ``run.plot.window_s``.
-        from_start: Force the whole-run view, overriding a configured window.
-        """
-        plot_config = config.run.plot
-        self.config = config
-        self.redraw_interval_s = (
-            redraw_interval_s if redraw_interval_s is not None else plot_config.redraw_interval_s
-        )
-        if from_start:
-            self.window_s: float | None = None
-        elif window_s is not None:
-            self.window_s = window_s
-        else:
-            self.window_s = plot_config.window_s
-        self._panels = _panels_for(config)
+        self._panels = list(panels)
+        self.window_s = window_s
+        self.redraw_interval_s = redraw_interval_s
+        self._window_title = window_title
         channels = sorted({trace.channel for panel in self._panels for trace in panel.traces})
-        self._history = _History(
-            channels, max_points if max_points is not None else plot_config.max_points
-        )
-        self._status: SteadyStateStatus | None = None
+        self._history = _History(channels, max_points)
         self._last_redraw = 0.0
         self._figure: Any = None
         self._axes: Any = None
@@ -402,7 +387,7 @@ class LivePlot:
 
     # -- lifecycle --------------------------------------------------------
 
-    def open(self) -> LivePlot:
+    def open(self) -> Any:
         """Create the figure. Raises :class:`PlottingUnavailable` if it cannot."""
         plt = _pyplot(interactive=True)
         plt.ion()
@@ -412,9 +397,7 @@ class LivePlot:
         )
         axes = [row[0] for row in axes]
         try:
-            figure.canvas.manager.set_window_title(
-                f"gasperm - {self.config.sample.id} ({self.config.gas.name})"
-            )
+            figure.canvas.manager.set_window_title(self._window_title)
         except Exception as exc:  # noqa: BLE001 - some backends have no manager
             logger.debug("Could not set the window title: %s", exc)
         for panel, axis in zip(self._panels, axes):
@@ -430,7 +413,7 @@ class LivePlot:
         self._plt = plt
         return self
 
-    def __enter__(self) -> LivePlot:
+    def __enter__(self) -> Any:
         try:
             return self.open()
         except PlottingUnavailable as exc:
@@ -454,31 +437,11 @@ class LivePlot:
 
     # -- data flow --------------------------------------------------------
 
-    def add(self, reading: Reading, status: SteadyStateStatus | None = None) -> None:
-        """Buffer a reading. O(1), called from the acquisition loop.
-
-        This is the only method the loop calls per sample; it does no drawing.
-
-        Args:
-            reading: The sample just taken.
-            status: The detector's current verdict, which carries the per-signal
-                means and tolerances the criterion lines are drawn from.
-        """
-        if self._disabled:
-            return
-        self._history.append(
-            reading.elapsed_s,
-            _channel_values(reading, self.config.run),
-            reading.steady_state,
-        )
-        if status is not None:
-            self._status = status
-
     def maybe_redraw(self, now: float | None = None) -> bool:
         """Redraw if ``redraw_interval_s`` has elapsed. Returns whether it did.
 
-        Called from the loop after :meth:`add`; the interval check is what
-        keeps plotting off the critical path.
+        Called from the loop after the per-sample append; the interval check is
+        what keeps plotting off the critical path.
         """
         if self._disabled or self._figure is None or not len(self._history):
             return False
@@ -497,10 +460,10 @@ class LivePlot:
     # -- drawing ----------------------------------------------------------
 
     def _redraw(self) -> None:
-        times, channels, steady = self._history.view(self.window_s)
+        times, channels, flags = self._history.view(self.window_s)
         if not times:
             return
-        spans = _steady_spans(times, steady)
+        spans = self._spans(times, flags)
 
         for panel, axis in zip(self._panels, self._axes):
             axis.clear()
@@ -517,8 +480,8 @@ class LivePlot:
                     alpha=trace.alpha,
                     label=trace.label,
                 )
-            # The trace's own y-range, captured before the criterion lines get
-            # a vote on the autoscale.
+            # The trace's own y-range, captured before any annotation gets a
+            # vote on the autoscale.
             data_limits = axis.get_ylim()
             if panel.y_range is not None:
                 data_limits = (
@@ -526,12 +489,9 @@ class LivePlot:
                     max(data_limits[1], panel.y_range[1]),
                 )
                 axis.set_ylim(*data_limits)
-            # Shade the stretch the detector has confirmed steady -- the part
-            # of the run that will actually be reported.
             for start, end in spans:
                 axis.axvspan(start, end, color=_STEADY_COLOR, alpha=0.12, zorder=0)
-            if self.config.run.plot.show_criteria:
-                self._draw_criteria(panel, axis, data_limits)
+            self._annotate(panel, axis, data_limits)
             if len(panel.traces) > 1:
                 axis.legend(loc="best", fontsize="x-small", framealpha=0.6)
 
@@ -552,6 +512,111 @@ class LivePlot:
         if self.window_s is None:
             return 0.0, end
         return max(0.0, end - self.window_s), end
+
+    # -- hooks ------------------------------------------------------------
+
+    def _spans(
+        self, times: Sequence[float], flags: Sequence[bool]
+    ) -> list[tuple[float, float]]:
+        """Stretches of the x-axis to shade. Nothing, unless a subclass says so."""
+        return []
+
+    def _annotate(self, panel: _Panel, axis: Any, data_limits: tuple[float, float]) -> None:
+        """Draw anything that goes on top of the traces. A no-op by default."""
+
+    def _title(self) -> str:
+        return self._window_title
+
+
+class LivePlot(_StackedPlot):
+    """Live per-parameter view of a ``collect`` run.
+
+    One stacked panel per configured quantity, the steady-state criteria drawn
+    on the panels the detector watches, and the confirmed steady stretch
+    shaded. Usable as a context manager.
+    """
+
+    def __init__(
+        self,
+        config: GaspermConfig,
+        *,
+        max_points: int | None = None,
+        redraw_interval_s: float | None = None,
+        window_s: float | None = None,
+        from_start: bool = False,
+    ) -> None:
+        """Args:
+        config: Supplies the panels, display units and criteria; the plot
+            never shows CGS.
+        max_points: Override ``run.plot.max_points``.
+        redraw_interval_s: Override ``run.plot.redraw_interval_s``.
+        window_s: Trailing seconds to show, overriding ``run.plot.window_s``.
+        from_start: Force the whole-run view, overriding a configured window.
+        """
+        plot_config = config.run.plot
+        self.config = config
+        self._status: SteadyStateStatus | None = None
+        if from_start:
+            resolved_window: float | None = None
+        elif window_s is not None:
+            resolved_window = window_s
+        else:
+            resolved_window = plot_config.window_s
+        super().__init__(
+            _panels_for(config),
+            window_s=resolved_window,
+            max_points=max_points if max_points is not None else plot_config.max_points,
+            redraw_interval_s=(
+                redraw_interval_s
+                if redraw_interval_s is not None
+                else plot_config.redraw_interval_s
+            ),
+            window_title=f"gasperm - {config.sample.id} ({config.gas.name})",
+        )
+
+    def open(self) -> LivePlot:
+        """Create the figure. Raises :class:`PlottingUnavailable` if it cannot."""
+        super().open()
+        return self
+
+    def __enter__(self) -> LivePlot:
+        super().__enter__()
+        return self
+
+    # -- data flow --------------------------------------------------------
+
+    def add(self, reading: Reading, status: SteadyStateStatus | None = None) -> None:
+        """Buffer a reading. O(1), called from the acquisition loop.
+
+        This is the only method the loop calls per sample; it does no drawing.
+
+        Args:
+            reading: The sample just taken.
+            status: The detector's current verdict, which carries the per-signal
+                means and tolerances the criterion lines are drawn from.
+        """
+        if self._disabled:
+            return
+        self._history.append(
+            reading.elapsed_s,
+            _channel_values(reading, self.config.run),
+            reading.steady_state,
+        )
+        if status is not None:
+            self._status = status
+
+    # -- drawing ----------------------------------------------------------
+
+    def _spans(
+        self, times: Sequence[float], flags: Sequence[bool]
+    ) -> list[tuple[float, float]]:
+        """Shade the stretch the detector has confirmed steady -- the part of
+        the run that will actually be reported."""
+        return _steady_spans(times, flags)
+
+    def _annotate(self, panel: _Panel, axis: Any, data_limits: tuple[float, float]) -> None:
+        if self.config.run.plot.show_criteria:
+            self._draw_criteria(panel, axis, data_limits)
 
     def _draw_criteria(
         self, panel: _Panel, axis: Any, data_limits: tuple[float, float]
@@ -632,6 +697,85 @@ class LivePlot:
         # status.summary already carries the "(n/m)" progress, so it is not
         # repeated here.
         return f"{head}\n{self._status.summary}"
+
+
+class PreviewPlot(_StackedPlot):
+    """Live view of raw rig signals -- ``gasperm preview --plot``.
+
+    One panel per selected signal, in the order they were selected, and
+    **nothing drawn on top of them**: no criterion bands, no steady shading, no
+    fitted line. Preview runs no detector and computes no result, so every
+    annotation ``LivePlot`` adds would be an assertion about something that was
+    never tested.
+    """
+
+    def __init__(
+        self,
+        signals: Sequence[Any],
+        *,
+        volts: bool = False,
+        window_s: float | None = None,
+        from_start: bool = False,
+        max_points: int = DEFAULT_MAX_POINTS,
+        redraw_interval_s: float = 0.5,
+        device_name: str = "",
+    ) -> None:
+        """Args:
+        signals: :class:`gasperm.preview.PreviewSignal` objects to stack.
+        volts: Show the raw voltage rather than the calibrated value.
+        window_s: Trailing seconds to show. ``None`` spans the whole session.
+        from_start: Force the whole-session view over any window.
+        device_name: Named in the window title, so two previews of two rigs
+            are told apart.
+        """
+        from gasperm.preview import preview_color
+
+        self.signals = list(signals)
+        self.volts = volts
+        panels = [
+            _Panel(
+                key=signal.key,
+                ylabel=f"{signal.label} ({'V' if volts or signal.raw_only else signal.unit})",
+                traces=(_Trace(signal.key, signal.label, preview_color(index)),),
+                signal=None,
+                to_display=lambda value: value,
+            )
+            for index, signal in enumerate(self.signals)
+        ]
+        super().__init__(
+            panels,
+            window_s=None if from_start else window_s,
+            max_points=max_points,
+            redraw_interval_s=redraw_interval_s,
+            window_title=f"gasperm preview{f' - {device_name}' if device_name else ''}",
+        )
+
+    def open(self) -> PreviewPlot:
+        """Create the figure. Raises :class:`PlottingUnavailable` if it cannot."""
+        super().open()
+        return self
+
+    def __enter__(self) -> PreviewPlot:
+        super().__enter__()
+        return self
+
+    def add(self, sample: Any) -> None:
+        """Buffer one :class:`gasperm.preview.PreviewSample`. O(1)."""
+        if self._disabled:
+            return
+        values = {}
+        for signal in self.signals:
+            source = sample.raw if (self.volts or signal.raw_only) else sample.values
+            # NaN rather than a dropped point: a probe that said nothing this
+            # sample leaves a visible gap instead of a straight line drawn
+            # across the silence.
+            values[signal.key] = source.get(signal.key, float("nan"))
+        self._history.append(sample.elapsed_s, values, False)
+
+    def _title(self) -> str:
+        span = "whole session" if self.window_s is None else f"last {self.window_s:g} s"
+        mode = "raw volts" if self.volts else "calibrated"
+        return f"{self._window_title}   {mode}   [{span}]"
 
 
 def _corner_note(axis: Any, text: str, color: str) -> None:
