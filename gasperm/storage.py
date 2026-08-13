@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from types import TracebackType
 from typing import Any, Mapping, Sequence
 
 import yaml
+from pydantic import ValidationError
 
 from gasperm import units
 from gasperm.config import GaspermConfig, config_to_dict, experiment_metadata
@@ -59,6 +61,8 @@ __all__ = [
     "run_method",
     "run_purpose",
     "safe_sample_id",
+    "summary_from_run",
+    "write_comparison_result",
     "write_klinkenberg_result",
 ]
 
@@ -813,6 +817,138 @@ def collect_points(
         )
         for target in targets
     ]
+
+
+def summary_from_run(target: str | Path) -> RunSummary | None:
+    """Read a stored run's full :class:`RunSummary` back, budget and all.
+
+    Distinct from :func:`point_from_run`, which reduces a run to one Klinkenberg
+    point: comparing two measurements needs the **components** of each run's
+    uncertainty budget, not just its combined value, because deciding which
+    inputs cancel is a per-component question.
+
+    Returns ``None`` for a run that never produced a summary -- one that was
+    interrupted, or never reached its method's criterion. Malformed or partial
+    summaries return ``None`` rather than raising: a comparison over a folder of
+    runs must not be stopped by one bad sidecar.
+    """
+    _, metadata_path = resolve_run_paths(target)
+    if metadata_path is None:
+        return None
+    metadata = read_run_metadata(metadata_path)
+    payload = metadata.get("summary") if isinstance(metadata, dict) else None
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        return RunSummary.model_validate(dict(payload))
+    except ValidationError as exc:
+        logger.warning("Ignoring an unreadable summary in %s: %s", metadata_path, exc)
+        return None
+
+
+def write_comparison_result(result, path: str | Path) -> Path:
+    """Write a comparison to YAML: the changes, the verdicts and the audit trail.
+
+    The component pairings are written out in full. A claim that an uncertainty
+    cancelled is the load-bearing part of a paired comparison, so the file has
+    to carry the evidence for it rather than only the conclusion.
+    """
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def group(side) -> dict[str, Any]:
+        return {
+            "label": side.label,
+            "sample_id": side.sample_id,
+            "runs": side.run_count,
+            "mean_pressures_atm": side.mean_pressures_atm,
+            "methods": side.methods,
+            "gases": side.gases,
+            "flowmeters": side.flowmeters,
+            "liquid_permeability_D": side.liquid_permeability_darcy,
+            "liquid_permeability_mD": (
+                units.darcy_to(side.liquid_permeability_darcy, "mD")
+                if side.liquid_permeability_darcy is not None
+                else None
+            ),
+            "slippage_factor_atm": side.slippage_factor_atm,
+            "r_squared": side.r_squared,
+            "porosity_fraction": side.porosity_fraction,
+            "started_at": side.started_at.isoformat() if side.started_at else None,
+            "ended_at": side.ended_at.isoformat() if side.ended_at else None,
+        }
+
+    payload = {
+        "comparison": {
+            "paired": result.paired,
+            "coverage_probability": result.coverage_probability,
+            "before": group(result.before),
+            "after": group(result.after),
+            "warnings": result.warnings,
+        },
+        "changes": [
+            {
+                "name": change.name,
+                "symbol": change.symbol,
+                "unit": change.unit,
+                "before": change.before,
+                "after": change.after,
+                "difference": change.difference,
+                "ratio": _finite_or_none(change.ratio),
+                "percent_change": _finite_or_none(change.percent_change),
+                "relative_standard_uncertainty": _finite_or_none(
+                    change.relative_standard_uncertainty
+                ),
+                "expanded_uncertainty_percent": _finite_or_none(
+                    change.relative_expanded_uncertainty * 100.0
+                ),
+                "coverage_factor": _finite_or_none(change.coverage_factor),
+                "effective_degrees_of_freedom": _finite_or_none(
+                    change.effective_degrees_of_freedom
+                ),
+                "minimum_detectable_percent": _finite_or_none(
+                    change.minimum_detectable_percent
+                ),
+                "significant": change.significant,
+                "verdict": change.verdict,
+                "notes": change.notes,
+            }
+            for change in result.changes
+        ],
+        "conditions": [
+            {
+                "check": check.label,
+                "before": check.before,
+                "after": check.after,
+                "matched": check.matched,
+                "blocking": check.blocking,
+                "advice": check.advice,
+            }
+            for check in result.conditions
+        ],
+        "uncertainty_pairing": [
+            {
+                "symbol": pairing.symbol,
+                "name": pairing.name,
+                "shared": pairing.shared,
+                "reason": pairing.reason,
+                "relative_contribution_before": pairing.relative_contribution_before,
+                "relative_contribution_after": pairing.relative_contribution_after,
+                "variance_contribution": pairing.variance_contribution,
+                "cancelled_fraction": pairing.cancelled_fraction,
+            }
+            for pairing in result.component_pairings
+        ],
+    }
+    output_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return output_path
+
+
+def _finite_or_none(value: float) -> float | None:
+    """YAML-safe: infinities and NaN become null rather than unparseable words."""
+    return value if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 
 def write_klinkenberg_result(result, path: str | Path) -> Path:

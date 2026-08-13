@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LivePlot",
     "PreviewPlot",
+    "plot_comparison",
     "plot_klinkenberg",
     "plot_pulse_decay",
     "PlottingUnavailable",
@@ -949,6 +950,167 @@ def plot_klinkenberg(
     else:
         plt.close(figure)
     return saved
+
+
+def plot_comparison(
+    result,
+    before: KlinkenbergResult | None = None,
+    after: KlinkenbergResult | None = None,
+    *,
+    path: str | Path | None = None,
+    show: bool = False,
+    permeability_unit: str = "mD",
+    pressure_unit: str = "atm",
+) -> Path | None:
+    """Plot two campaigns against each other: the fits, and the change.
+
+    Two stacked axes:
+
+    **Top** -- both Klinkenberg series on one ``1/P_mean`` axis, extended to
+    zero so the two intercepts are visible side by side. Reading the change off
+    the plot is then the same operation as reading either ``k_L``.
+
+    **Bottom** -- the change itself, per matched pressure point, as a percentage
+    with its expanded uncertainty. A zero line is drawn: bars that straddle it
+    did not resolve a change, and the picture says so before any number is
+    read. Points are ordered as they are reported, so the leftmost bar is the
+    headline ``k_L``.
+
+    Args:
+        result: A :class:`~gasperm.models.ComparisonResult`.
+        before: The baseline fit, if there was one.
+        after: The comparison fit, if there was one.
+        path: Where to save the PNG. ``None`` skips saving.
+        show: Open an interactive window as well.
+        permeability_unit: Display unit for the permeability axis.
+        pressure_unit: Pressure unit the ``1/P`` axis is expressed in.
+    """
+    plt = _pyplot(interactive=show)
+    figure, (top, bottom) = plt.subplots(
+        2, 1, figsize=(8.5, 8.0), gridspec_kw={"height_ratios": [3, 2]}
+    )
+
+    units_per_atm = units.from_atm(1.0, pressure_unit)
+    x_max = 0.0
+    for fit, label, color in (
+        (before, result.before.label, "tab:blue"),
+        (after, result.after.label, "tab:red"),
+    ):
+        if fit is None:
+            continue
+        xs = [p.inverse_mean_pressure / units_per_atm for p in fit.points]
+        ys = [
+            units.darcy_to(p.apparent_permeability_darcy, permeability_unit)
+            for p in fit.points
+        ]
+        errors = [
+            units.darcy_to(p.standard_uncertainty_darcy, permeability_unit)
+            if p.standard_uncertainty_darcy is not None
+            else 0.0
+            for p in fit.points
+        ]
+        if any(errors):
+            top.errorbar(
+                xs, ys, yerr=errors, fmt="none", ecolor=color, elinewidth=1.1,
+                capsize=3, zorder=2,
+            )
+        top.scatter(xs, ys, color=color, zorder=3, label=f"{label} runs")
+        x_max = max(x_max, max(xs, default=0.0))
+
+    x_max = x_max * 1.08 if x_max else 1.0
+    for fit, label, color in (
+        (before, result.before.label, "tab:blue"),
+        (after, result.after.label, "tab:red"),
+    ):
+        if fit is None:
+            continue
+        intercept = units.darcy_to(fit.liquid_permeability_darcy, permeability_unit)
+        top.plot(
+            [0.0, x_max],
+            [
+                intercept,
+                units.darcy_to(
+                    fit.intercept + fit.slope * x_max * units_per_atm, permeability_unit
+                ),
+            ],
+            color=color, linestyle="--",
+            label=f"{label}: k_L = {intercept:.4g} {permeability_unit}",
+        )
+        expanded = fit.liquid_permeability_expanded_uncertainty_darcy
+        if expanded is not None:
+            top.errorbar(
+                [0.0], [intercept],
+                yerr=[units.darcy_to(expanded, permeability_unit)],
+                fmt="none", ecolor=color, elinewidth=1.6, capsize=6, zorder=4,
+            )
+        top.scatter([0.0], [intercept], color=color, marker="*", s=140, zorder=5)
+
+    top.set_xlim(left=0.0)
+    top.set_xlabel(f"1 / mean pressure (1/{pressure_unit})")
+    top.set_ylabel(f"apparent gas permeability ({permeability_unit})")
+    top.set_title(f"{result.before.label}   ->   {result.after.label}")
+    top.grid(True, alpha=0.3)
+    if before is not None or after is not None:
+        top.legend(loc="best", fontsize="x-small")
+    else:
+        _corner_note(top, "no Klinkenberg fit on either side", "0.45")
+
+    # -- the change itself -------------------------------------------------
+    changes = [c for c in result.changes if math.isfinite(c.percent_change)]
+    if changes:
+        positions = list(range(len(changes)))
+        values = [c.percent_change for c in changes]
+        errors = [
+            c.relative_expanded_uncertainty * 100.0
+            if math.isfinite(c.relative_expanded_uncertainty)
+            else 0.0
+            for c in changes
+        ]
+        colors = [
+            "tab:green" if c.significant else "tab:orange" for c in changes
+        ]
+        bottom.bar(positions, values, color=colors, alpha=0.55, zorder=2)
+        bottom.errorbar(
+            positions, values, yerr=errors, fmt="none", ecolor="black",
+            elinewidth=1.3, capsize=5, zorder=3,
+        )
+        # No change is the reference, not zero-on-an-arbitrary-axis: a bar whose
+        # interval crosses this line did not resolve anything.
+        bottom.axhline(0.0, color="black", linewidth=1.0, zorder=1)
+        bottom.set_xticks(positions)
+        bottom.set_xticklabels(
+            [c.symbol if len(changes) > 6 else f"{c.symbol}\n{_short_label(c)}"
+             for c in changes],
+            fontsize="x-small",
+        )
+        bottom.set_ylabel("change (%)")
+        bottom.grid(True, axis="y", alpha=0.3)
+        _corner_note(
+            bottom,
+            "green = resolved   amber = inside the uncertainty",
+            "0.35",
+        )
+    else:
+        _corner_note(bottom, "nothing comparable", "0.45")
+
+    figure.tight_layout()
+    saved: Path | None = None
+    if path is not None:
+        saved = Path(path)
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(saved, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return saved
+
+
+def _short_label(change) -> str:
+    """A tick label for one change: the pressure for a k_g point, else the unit."""
+    if change.symbol == "k_g" and " at " in change.name:
+        return change.name.split(" at ", 1)[1]
+    return change.unit
 
 
 def plot_pulse_decay(

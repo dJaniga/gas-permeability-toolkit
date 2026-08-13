@@ -227,6 +227,178 @@ def fake_run_writer():
     return write_fake_run
 
 
+#: A plausible steady-state budget: two plug-geometry terms, three rig terms and
+#: one Type A. ``(symbol, name, u_rel, sensitivity, type, source, dof)``.
+BUDGET_TEMPLATE = (
+    ("L", "sample length", 0.004, 1.0, "B", "caliper specification", math.inf),
+    ("d", "sample diameter", 0.002, -2.0, "B", "caliper specification", math.inf),
+    ("Q", "gas flow rate", 0.010, 1.0, "B", "flowmeter specification", math.inf),
+    ("mu", "gas viscosity", 0.010, 1.0, "B", "coolprop viscosity for Nitrogen", math.inf),
+    ("P1", "inlet pressure", 0.006, 2.0, "B", "inlet transducer", math.inf),
+    ("rep", "repeatability", 0.008, 1.0, "A", "scatter of the steady window", 9.0),
+)
+
+
+def build_budget(permeability_darcy: float, *, geometry=None, template=BUDGET_TEMPLATE):
+    """A real :class:`UncertaintyBudget` with components, for comparison tests.
+
+    Built through the model rather than as a dict, so a fixture can never drift
+    into a shape the product would reject.
+
+    ``geometry`` overrides the recorded *values* of the plug terms, which is how
+    a test says "this plug was measured again between campaigns" -- the values
+    are what :mod:`gasperm.comparison` reads to decide whether caliper error
+    still cancels.
+    """
+    from gasperm.models import UncertaintyBudget, UncertaintyComponent
+
+    values = {"L": 5.0, "d": 3.81, "Q": 1.5, "mu": 0.0178, "P1": 3.0, "rep": 1.0}
+    values.update(geometry or {})
+
+    components = []
+    for symbol, name, u_rel, sensitivity, kind, source, dof in template:
+        value = values.get(symbol, 1.0)
+        components.append(
+            UncertaintyComponent(
+                name=name, symbol=symbol, evaluation_type=kind, value=value, unit="",
+                standard_uncertainty=abs(u_rel * value),
+                relative_standard_uncertainty=u_rel,
+                relative_sensitivity=sensitivity,
+                relative_contribution=abs(sensitivity * u_rel),
+                degrees_of_freedom=dof, source=source,
+            )
+        )
+    variance = sum(c.relative_contribution**2 for c in components)
+    u_rel_total = math.sqrt(variance)
+    return UncertaintyBudget(
+        value_darcy=permeability_darcy,
+        combined_standard_uncertainty_darcy=u_rel_total * permeability_darcy,
+        relative_combined_standard_uncertainty=u_rel_total,
+        effective_degrees_of_freedom=math.inf,
+        coverage_factor=2.0,
+        coverage_probability=0.95,
+        expanded_uncertainty_darcy=2.0 * u_rel_total * permeability_darcy,
+        components=components,
+    )
+
+
+def write_measured_run(
+    runs_dir,
+    sample_id: str,
+    started_at: datetime,
+    *,
+    mean_pressure_atm: float,
+    permeability_darcy: float,
+    gas_name: str = "Nitrogen",
+    flowmeter: str = "low_range",
+    method: str = "steady_state",
+    purpose: str = "measurement",
+    downstream_pressure: float | str = "measured",
+    porosity_fraction: float | None = None,
+    porosity_uncertainty: float | None = None,
+    length_cm: float = 5.0,
+    diameter_cm: float = 3.81,
+    budget=None,
+) -> Path:
+    """A run directory carrying a **complete** :class:`RunSummary`.
+
+    :func:`write_fake_run` writes only the keys run *discovery* reads, which is
+    all that Klinkenberg needs. A comparison needs the individual components of
+    each run's uncertainty budget -- deciding what cancels is a per-component
+    question -- so this writes the whole model.
+    """
+    import yaml
+
+    from gasperm.models import ExperimentMetadata, RunSummary
+    from gasperm.storage import (
+        METADATA_FILENAME,
+        READING_COLUMNS,
+        READINGS_FILENAME,
+        run_directory_name,
+    )
+
+    directory = Path(runs_dir) / run_directory_name(sample_id, started_at)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    row = {name: "" for name in READING_COLUMNS}
+    row.update(
+        mean_pressure_atm=f"{mean_pressure_atm:g}",
+        inlet_pressure_atm=f"{mean_pressure_atm * 1.5:g}",
+        outlet_pressure_atm=f"{mean_pressure_atm * 0.5:g}",
+        downstream_pressure_atm=f"{mean_pressure_atm * 0.5:g}",
+        permeability_D=f"{permeability_darcy:g}", temperature_C="22.0",
+        flow_cm3_s="1.5", steady_state="1",
+    )
+    with (directory / READINGS_FILENAME).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(READING_COLUMNS))
+        writer.writeheader()
+        for index in (0, 1):
+            writer.writerow({**row, "index": index, "elapsed_s": f"{index:.1f}"})
+
+    summary = RunSummary(
+        sample_id=sample_id,
+        gas_name=gas_name,
+        started_at=started_at,
+        ended_at=started_at,
+        duration_s=120.0,
+        sample_count=1200,
+        method=method,
+        purpose=purpose,
+        steady_state_reached=method == "steady_state",
+        measurement_confirmed=True,
+        mean_pressure_atm=mean_pressure_atm,
+        permeability_darcy=permeability_darcy,
+        permeability_stddev_darcy=permeability_darcy * 0.005,
+        mean_temperature_c=22.0,
+        mean_flow_cm3_s=1.5,
+        averaged_samples=50,
+        uncertainty=budget if budget is not None else build_budget(
+            permeability_darcy, geometry={"L": length_cm, "d": diameter_cm}
+        ),
+        metadata=ExperimentMetadata(
+            flowmeter=flowmeter,
+            sample_id=sample_id,
+            gas_name=gas_name,
+            length_cm=length_cm,
+            diameter_cm=diameter_cm,
+            porosity_fraction=porosity_fraction,
+        ),
+    )
+
+    payload = {
+        "gasperm_run": {
+            "started_at": started_at.isoformat(),
+            "readings_csv": READINGS_FILENAME,
+            "rows": 2,
+        },
+        "metadata": {"sample_id": sample_id, "flowmeter": flowmeter},
+        "config": {
+            "sample": {
+                "id": sample_id,
+                "porosity_fraction": porosity_fraction,
+                "porosity_uncertainty": porosity_uncertainty,
+            },
+            "run": {
+                "method": method,
+                "purpose": purpose,
+                "downstream_pressure": downstream_pressure,
+                "downstream_pressure_unit": "kPa",
+            },
+        },
+        "summary": summary.model_dump(mode="json"),
+    }
+    (directory / METADATA_FILENAME).write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    return directory
+
+
+@pytest.fixture
+def measured_run_writer():
+    """Factory for :func:`write_measured_run`."""
+    return write_measured_run
+
+
 @pytest.fixture
 def fixed_gas_provider() -> FixedPropertyProvider:
     """A constant 0.0178 cP -- nitrogen at room temperature, to 3 figures.

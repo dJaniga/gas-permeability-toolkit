@@ -1811,6 +1811,414 @@ def _print_budget(budget) -> None:
 
 
 # --------------------------------------------------------------------------
+# compare
+# --------------------------------------------------------------------------
+
+
+def _looks_like_a_run(path: Path) -> bool:
+    from gasperm.storage import METADATA_FILENAME, READINGS_FILENAME
+
+    return (path / METADATA_FILENAME).is_file() or (path / READINGS_FILENAME).is_file()
+
+
+def _records_for_selector(selector: str, runs_dir: Path) -> tuple[list, str]:
+    """Runs named by one side of a comparison, plus a label for it.
+
+    A selector is a run directory, a directory of runs, or a sample id -- the
+    same three things an operator already has in hand, rather than a fourth
+    syntax to learn.
+    """
+    from gasperm.storage import _record_from_directory, find_runs, runs_for_sample
+
+    path = Path(selector)
+    if path.is_dir() and _looks_like_a_run(path):
+        return [_record_from_directory(path)], path.name
+    if path.is_dir():
+        records = find_runs(path)
+        if not records:
+            _fail(f"No runs found under {path}.")
+        return records, path.name
+
+    sample_id = _resolve_sample_id(selector)
+    records = runs_for_sample(find_runs(runs_dir), sample_id)
+    if not records:
+        _fail(
+            f"No runs found for {sample_id!r} under {runs_dir}. Use --runs-dir if they "
+            "are somewhere else."
+        )
+    return records, sample_id
+
+
+def _split_records(records: list, split: str) -> tuple[list, list]:
+    """Divide one plug's runs at an instant: everything before it, everything after.
+
+    The natural discriminator for a before/after study when the two campaigns
+    are the same plug under the same id -- which is the ordinary case, since a
+    plug does not get a new name because it spent a month in hydrogen.
+    """
+    from datetime import datetime, timezone
+
+    text = split.strip()
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        _fail(
+            f"--split {split!r} is not a date or timestamp. Use an ISO form such as "
+            "2026-06-01 or 2026-06-01T12:00:00."
+        )
+        raise
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+
+    undated = [r for r in records if r.started_at is None]
+    if undated:
+        _fail(
+            f"{len(undated)} run(s) have no recorded start time, so --split cannot "
+            "place them: " + ", ".join(r.name for r in undated[:5])
+        )
+    before = [r for r in records if r.started_at < moment]
+    after = [r for r in records if r.started_at >= moment]
+    if not before or not after:
+        _fail(
+            f"--split {split} puts {len(before)} run(s) before and {len(after)} after. "
+            "Both sides need at least one."
+        )
+    return before, after
+
+
+def _build_group(
+    records: list,
+    label: str,
+    *,
+    window: float | None,
+    allow_unsteady: bool,
+    allow_mixed_methods: bool,
+):
+    """Assemble one side: its confirmed runs, their budgets, and a fit if possible."""
+    from gasperm.comparison import MeasurementGroup
+    from gasperm.klinkenberg import fit_klinkenberg
+    from gasperm.storage import read_run_metadata, summary_from_run
+
+    usable = [r for r in records if r.purpose != "leak_test"]
+    dropped_leak = len(records) - len(usable)
+
+    summaries, conventions, skipped, kept = [], [], [], []
+    porosity = porosity_uncertainty = None
+    for record in usable:
+        summary = summary_from_run(record.directory)
+        if summary is None:
+            skipped.append((record.name, "no stored summary"))
+            continue
+        if not summary.measurement_confirmed and not allow_unsteady:
+            skipped.append((record.name, "never confirmed a measurement"))
+            continue
+        summaries.append(summary)
+        kept.append(record)
+        conventions.append(record.downstream_convention or "measured")
+        if porosity is None and summary.metadata is not None:
+            porosity = summary.metadata.porosity_fraction
+        if porosity_uncertainty is None and record.metadata_path is not None:
+            stored = read_run_metadata(record.metadata_path)
+            sample = (stored.get("config") or {}).get("sample") or {}
+            porosity_uncertainty = sample.get("porosity_uncertainty")
+
+    if not summaries:
+        _fail(
+            f"{label}: none of its {len(records)} run(s) produced a usable "
+            "measurement. Pass --allow-unsteady to include runs that never "
+            "confirmed one."
+        )
+
+    # A fit needs spread in mean pressure; a single-pressure campaign is a
+    # perfectly good thing to compare, just at the k_g level rather than k_L.
+    fit = None
+    if len({round(s.mean_pressure_atm, 6) for s in summaries}) >= 2:
+        points, _ = _discover_points(
+            kept, window=window, allow_unsteady=allow_unsteady
+        )
+        if len(points) >= 2:
+            try:
+                fit = fit_klinkenberg(points, allow_mixed_methods=allow_mixed_methods)
+            except ValueError as exc:
+                logger.debug("No Klinkenberg fit for %s: %s", label, exc)
+
+    group = MeasurementGroup(
+        label=label,
+        sample_id=summaries[0].sample_id,
+        summaries=tuple(summaries),
+        klinkenberg=fit,
+        porosity_fraction=porosity,
+        porosity_uncertainty=porosity_uncertainty,
+        downstream_conventions=tuple(conventions),
+    )
+    return group, skipped, dropped_leak
+
+
+@app.command("compare")
+def compare_command(
+    before: str = typer.Argument(
+        ..., metavar="BEFORE",
+        help="Baseline: a sample id, a run directory, or a directory of runs.",
+    ),
+    after: Optional[str] = typer.Argument(
+        None, metavar="AFTER",
+        help="What to compare against it. Omit and pass --split to divide one "
+             "plug's own runs into a before and an after.",
+    ),
+    split: Optional[str] = typer.Option(
+        None, "--split", metavar="DATE",
+        help="Split BEFORE's runs at this instant instead of taking a second "
+             "selector, e.g. --split 2026-06-01. For a plug measured, treated, "
+             "and measured again under the same id.",
+    ),
+    config_dir: Path = typer.Option(
+        Path("."), "--config-dir", "-c", help="Rig folder holding run.yaml."
+    ),
+    runs_dir: Optional[Path] = typer.Option(
+        None, "--runs-dir", help="Where the runs are. Defaults to run.yaml's output_dir."
+    ),
+    label_before: Optional[str] = typer.Option(
+        None, "--label-before", help="Name for the baseline in the report."
+    ),
+    label_after: Optional[str] = typer.Option(
+        None, "--label-after", help="Name for the comparison in the report."
+    ),
+    paired: Optional[bool] = typer.Option(
+        None, "--paired/--unpaired",
+        help="Force the same-plug treatment on or off. By default it is decided "
+             "from the sample ids, which is right unless you have renamed a plug "
+             "between campaigns.",
+    ),
+    allow_mismatched_conditions: bool = typer.Option(
+        False, "--allow-mismatched-conditions",
+        help="Report a comparison whose campaigns were not run alike. The "
+             "mismatch is still shown, and the affected uncertainties stop "
+             "cancelling.",
+    ),
+    allow_mixed_methods: bool = typer.Option(
+        False, "--allow-mixed-methods",
+        help="Permit each side's own Klinkenberg fit to mix methods.",
+    ),
+    allow_unsteady: bool = typer.Option(
+        False, "--allow-unsteady", help="Include runs that never confirmed a measurement."
+    ),
+    coverage: float = typer.Option(
+        0.95, "--coverage", min=0.5, max=0.999,
+        help="Level of confidence for every expanded uncertainty.",
+    ),
+    pressure_tolerance: float = typer.Option(
+        0.05, "--pressure-tolerance", min=0.0, max=1.0,
+        help="How close two runs' mean pressures must be to be treated as the "
+             "same point, as a fraction.",
+    ),
+    window: Optional[float] = typer.Option(
+        None, "--window", metavar="SECONDS", help="Override the stored averaging window."
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Write the full comparison to a YAML file."
+    ),
+    plot: bool = typer.Option(False, "--plot", help="Plot both fits and the change."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Compare two sets of runs and report every difference with its uncertainty.
+
+    The measurand is the **change**, not either value, and that is what makes
+    this worth a command of its own. Errors common to both measurements -- the
+    same plug's geometry, the same transducer, the same meter, the same
+    viscosity model -- move both results the same way and cancel out of their
+    ratio. What survives is the scatter, which is usually far smaller. A rig
+    reporting 20% on each of two permeabilities can still resolve a 5% change
+    between them.
+
+    Every cancellation is itemised, because a claim that an uncertainty went
+    away is the load-bearing part of the result.
+    """
+    from gasperm.comparison import ComparisonError, compare_groups
+    from gasperm.storage import write_comparison_result
+
+    _configure_logging(verbose)
+    resolved_runs_dir = _resolve_runs_dir(runs_dir, config_dir)
+
+    if split is not None and after is not None:
+        _fail(
+            "Pass either a second selector or --split, not both: they are two ways "
+            "of saying which runs form the 'after' side."
+        )
+        return
+    if split is None and after is None:
+        _fail(
+            "Nothing to compare against. Give a second selector "
+            "('gasperm compare core-041 core-042'), or --split DATE to divide one "
+            "plug's runs into a before and an after."
+        )
+        return
+
+    if split is not None:
+        records, name = _records_for_selector(before, resolved_runs_dir)
+        before_records, after_records = _split_records(records, split)
+        before_name, after_name = f"{name} before {split}", f"{name} from {split}"
+    else:
+        before_records, before_name = _records_for_selector(before, resolved_runs_dir)
+        after_records, after_name = _records_for_selector(after, resolved_runs_dir)
+
+    before_group, before_skipped, before_leaks = _build_group(
+        before_records, label_before or before_name,
+        window=window, allow_unsteady=allow_unsteady,
+        allow_mixed_methods=allow_mixed_methods,
+    )
+    after_group, after_skipped, after_leaks = _build_group(
+        after_records, label_after or after_name,
+        window=window, allow_unsteady=allow_unsteady,
+        allow_mixed_methods=allow_mixed_methods,
+    )
+
+    for label, skipped, leaks in (
+        (before_group.label, before_skipped, before_leaks),
+        (after_group.label, after_skipped, after_leaks),
+    ):
+        if leaks:
+            typer.secho(
+                f"{label}: {leaks} leak test(s) excluded -- a leak belongs to the rig, "
+                "not to any plug.",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+        for name, reason in skipped:
+            typer.secho(f"{label}: skipped {name} ({reason})", fg=typer.colors.YELLOW)
+
+    try:
+        result = compare_groups(
+            before_group, after_group,
+            coverage_probability=coverage,
+            paired=paired,
+            allow_mismatched_conditions=allow_mismatched_conditions,
+            pressure_tolerance=pressure_tolerance,
+        )
+    except ComparisonError as exc:
+        _fail(str(exc))
+        return
+
+    _print_comparison(result)
+
+    if output is not None:
+        saved = write_comparison_result(result, output)
+        typer.secho(f"\nComparison written to {saved}", fg=typer.colors.GREEN)
+
+    if plot:
+        try:
+            from gasperm.plotting import PlottingUnavailable, plot_comparison
+
+            path = (output.with_suffix(".png") if output else None)
+            saved_plot = plot_comparison(
+                result, before_group.klinkenberg, after_group.klinkenberg, path=path,
+                show=path is None,
+            )
+            if saved_plot is not None:
+                typer.secho(f"Plot written to {saved_plot}", fg=typer.colors.GREEN)
+        except PlottingUnavailable as exc:
+            typer.secho(f"warning: {exc}", fg=typer.colors.YELLOW)
+
+    # Exit 2 when nothing measurable changed: a script driving a screening study
+    # can then branch on "this plug moved" without parsing the report.
+    headline = result.change("k_L") or result.change("k_g")
+    if headline is not None and not headline.significant:
+        raise typer.Exit(code=2)
+
+
+def _print_comparison(result) -> None:
+    """The report. Ordered so the answer comes first and its basis follows."""
+    typer.secho(
+        f"\nComparison   {result.before.label}   ->   {result.after.label}", bold=True
+    )
+    kind = "PAIRED (same plug)" if result.paired else "UNPAIRED (different plugs)"
+    typer.secho(
+        f"  {kind}   coverage {result.coverage_probability:.0%}", fg=typer.colors.CYAN
+    )
+
+    for side, tag in ((result.before, "before"), (result.after, "after ")):
+        detail = f"{side.run_count} run(s)"
+        if side.mean_pressures_atm:
+            detail += "   P_mean " + ", ".join(
+                f"{p:.3g}" for p in sorted(side.mean_pressures_atm)
+            ) + " atm"
+        if side.liquid_permeability_darcy is not None:
+            detail += (
+                f"   k_L {units.darcy_to(side.liquid_permeability_darcy, 'mD'):.4g} mD"
+                f"   b {side.slippage_factor_atm:.3g} atm   R2 {side.r_squared:.4f}"
+            )
+        typer.echo(f"  {tag}  {side.sample_id or '(unknown)'}   {detail}")
+
+    typer.secho("\n  Conditions", bold=True)
+    for check in result.conditions:
+        mark = "match" if check.matched else ("BLOCKING" if check.blocking else "DIFFER")
+        color = (
+            typer.colors.GREEN if check.matched
+            else (typer.colors.RED if check.blocking else typer.colors.YELLOW)
+        )
+        typer.secho(
+            f"    {check.label:<24} {check.before[:22]:<22} -> "
+            f"{check.after[:22]:<22} {mark}",
+            fg=color,
+        )
+        if check.advice:
+            typer.secho(f"      {check.advice}", fg=typer.colors.BRIGHT_BLACK)
+
+    typer.secho("\n  Changes", bold=True)
+    for change in result.changes:
+        _print_change(change)
+
+    cancelled = [p for p in result.component_pairings if p.shared]
+    retained = [p for p in result.component_pairings if not p.shared]
+    if cancelled:
+        typer.secho("\n  What cancelled between the two measurements", bold=True)
+        for pairing in sorted(cancelled, key=lambda p: -p.cancelled_fraction):
+            typer.secho(
+                f"    {pairing.symbol:<8} {pairing.name[:26]:<26} "
+                f"{pairing.cancelled_fraction:>6.1%} removed   {pairing.reason}",
+                fg=typer.colors.GREEN,
+            )
+    if retained:
+        typer.secho("\n  What did not, and therefore sets the detection limit", bold=True)
+        for pairing in sorted(retained, key=lambda p: -p.variance_contribution):
+            typer.echo(
+                f"    {pairing.symbol:<8} {pairing.name[:26]:<26} "
+                f"{math.sqrt(pairing.variance_contribution):>6.2%} of the ratio   "
+                f"{pairing.reason}"
+            )
+
+    for warning in result.warnings:
+        typer.secho(f"\n  note: {warning}", fg=typer.colors.YELLOW)
+
+
+def _print_change(change) -> None:
+    scale, unit = (
+        (units.darcy_to(1.0, "mD"), "mD") if change.unit == "darcy" else (1.0, change.unit)
+    )
+    color = typer.colors.GREEN if change.significant else typer.colors.YELLOW
+    typer.secho(f"    {change.symbol}   {change.name}", bold=True)
+    typer.echo(
+        f"        {change.before * scale:.6g} -> {change.after * scale:.6g} {unit}"
+        f"   (delta {change.difference * scale:+.4g})"
+    )
+    typer.secho(f"        {change.verdict}", fg=color)
+    if math.isfinite(change.minimum_detectable_percent):
+        dof = change.effective_degrees_of_freedom
+        dof_text = "inf" if not math.isfinite(dof) else f"{dof:.1f}"
+        # Both uncertainties, because they can move in opposite directions: an
+        # input that stops cancelling raises u_c but, being Type B, also raises
+        # v_eff -- which lowers k and can shrink U. Showing only U would make
+        # that read as an improvement.
+        typer.secho(
+            f"        u_c = {change.relative_standard_uncertainty * 100.0:.2f}%,"
+            f" k = {change.coverage_factor:.2f} (v_eff = {dof_text});"
+            f" smallest change this could resolve: "
+            f"{change.minimum_detectable_percent:.2f}%",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+    for note in change.notes:
+        typer.secho(f"        {note}", fg=typer.colors.BRIGHT_BLACK)
+
+
+# --------------------------------------------------------------------------
 # klinkenberg
 # --------------------------------------------------------------------------
 

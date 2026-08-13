@@ -711,6 +711,193 @@ class KlinkenbergResult(BaseModel):
         return self.intercept + self.slope / mean_pressure_atm
 
 
+# --------------------------------------------------------------------------
+# Comparing two measurements
+# --------------------------------------------------------------------------
+
+
+class ComponentPairing(BaseModel):
+    """One input quantity, matched across two measurements.
+
+    The audit trail for a cancellation claim. When ``shared`` is true the same
+    physical error produced both readings, so only the *difference* of their
+    contributions survives into the ratio -- see :mod:`gasperm.comparison`.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    name: str
+    #: Whether one physical error produced both readings.
+    shared: bool
+    #: Why it was or was not treated as shared, in words.
+    reason: str
+    #: GUM Type A on either side, i.e. statistical scatter. Kept because a
+    #: comparison of two *fitted* quantities already carries the scatter through
+    #: the fit's own standard error, so counting these again would double it.
+    type_a: bool = False
+    relative_contribution_before: float
+    relative_contribution_after: float
+    #: What this input contributes to the **ratio's** relative variance: the
+    #: squared difference of contributions when shared, their squared sum when
+    #: independent.
+    variance_contribution: float
+    degrees_of_freedom_before: float = float("inf")
+    degrees_of_freedom_after: float = float("inf")
+
+    @property
+    def degrees_of_freedom(self) -> float:
+        """The limiting dof of this input, for display."""
+        return min(self.degrees_of_freedom_before, self.degrees_of_freedom_after)
+
+    @property
+    def welch_terms(self) -> list[tuple[float, float]]:
+        """``(variance, dof)`` terms this input adds to Welch-Satterthwaite.
+
+        An **independent** pairing contributes *two* terms, one per side, each
+        with its own degrees of freedom -- collapsing them into a single term
+        at the smaller dof understates the effective degrees of freedom and so
+        inflates the coverage factor. A **shared** pairing is one physical
+        quantity and therefore one term.
+        """
+        if self.shared:
+            return [(self.variance_contribution, self.degrees_of_freedom)]
+        return [
+            (self.relative_contribution_before**2, self.degrees_of_freedom_before),
+            (self.relative_contribution_after**2, self.degrees_of_freedom_after),
+        ]
+
+    @property
+    def cancelled_fraction(self) -> float:
+        """How much of this input's contribution the pairing removed, in [0, 1]."""
+        independent = (
+            self.relative_contribution_before**2 + self.relative_contribution_after**2
+        )
+        if independent <= 0.0:
+            return 0.0
+        return max(0.0, 1.0 - self.variance_contribution / independent)
+
+
+class QuantityChange(BaseModel):
+    """A before/after pair, its change, and whether that change is real.
+
+    ``significant`` is the whole point: a percentage on its own reads as a
+    finding whether or not the measurement could have resolved it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    symbol: str
+    unit: str
+    before: float
+    after: float
+    difference: float
+    ratio: float
+    percent_change: float
+    #: Of the **ratio**, after the shared inputs have cancelled.
+    relative_standard_uncertainty: float
+    relative_expanded_uncertainty: float
+    standard_uncertainty: float
+    coverage_factor: float
+    coverage_probability: float
+    effective_degrees_of_freedom: float
+    #: The smallest change this comparison could have resolved, in percent. A
+    #: null result means nothing without it.
+    minimum_detectable_percent: float
+    significant: bool
+    #: Whether the same-plug treatment was applied.
+    paired: bool
+    notes: list[str] = Field(default_factory=list)
+
+    @property
+    def verdict(self) -> str:
+        """One line an operator can read without decoding the numbers."""
+        if not math.isfinite(self.percent_change):
+            return "not computable"
+        if not math.isfinite(self.relative_expanded_uncertainty):
+            return f"{self.percent_change:+.2f}% (no uncertainty available)"
+        direction = "increased" if self.percent_change > 0 else "decreased"
+        if not self.significant:
+            return (
+                f"{self.percent_change:+.2f}% +/- "
+                f"{self.relative_expanded_uncertainty * 100.0:.2f}% -- NOT "
+                "distinguishable from no change"
+            )
+        return (
+            f"{direction} {abs(self.percent_change):.2f}% +/- "
+            f"{self.relative_expanded_uncertainty * 100.0:.2f}% -- SIGNIFICANT"
+        )
+
+
+class ConditionCheck(BaseModel):
+    """One thing that had to match for a difference to mean anything."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    label: str
+    before: str
+    after: str
+    matched: bool
+    #: A mismatch that makes the comparison meaningless rather than noisier.
+    blocking: bool = False
+    #: Budget symbols whose cancellation this mismatch invalidates.
+    voids_symbols: list[str] = Field(default_factory=list)
+    advice: str = ""
+
+
+class GroupSummary(BaseModel):
+    """What one side of a comparison consisted of."""
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    sample_id: str | None
+    run_count: int
+    mean_pressures_atm: list[float] = Field(default_factory=list)
+    methods: list[str] = Field(default_factory=list)
+    gases: list[str] = Field(default_factory=list)
+    flowmeters: list[str] = Field(default_factory=list)
+    liquid_permeability_darcy: float | None = None
+    slippage_factor_atm: float | None = None
+    r_squared: float | None = None
+    porosity_fraction: float | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class ComparisonResult(BaseModel):
+    """Everything that differs between two sets of runs, with its uncertainty."""
+
+    model_config = ConfigDict(frozen=True)
+
+    before: GroupSummary
+    after: GroupSummary
+    #: Whether both sides measured the same core plug, which decides whether
+    #: the plug's own inputs cancel.
+    paired: bool
+    coverage_probability: float
+    changes: list[QuantityChange] = Field(default_factory=list)
+    conditions: list[ConditionCheck] = Field(default_factory=list)
+    component_pairings: list[ComponentPairing] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    def change(self, symbol: str) -> QuantityChange | None:
+        """The first reported change for ``symbol``, if there is one."""
+        return next((c for c in self.changes if c.symbol == symbol), None)
+
+    @property
+    def mismatched_conditions(self) -> list[ConditionCheck]:
+        """Conditions that differed between the two campaigns."""
+        return [c for c in self.conditions if not c.matched]
+
+    @property
+    def cancelled(self) -> list[ComponentPairing]:
+        """Inputs whose error the pairing removed from the comparison."""
+        return [p for p in self.component_pairings if p.shared]
+
+
 def is_finite(value: float | None) -> bool:
     """True when ``value`` is a real, usable number (not ``None``/NaN/inf)."""
     return value is not None and math.isfinite(value)

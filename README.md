@@ -4,7 +4,7 @@ Gas permeability measurement for core plugs on a lab rig built around an
 **NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
 temperature probe on USB serial.
 
-Five commands:
+Six commands:
 
 | command | what it does |
 |---|---|
@@ -13,6 +13,7 @@ Five commands:
 | `gasperm preview` | watch the raw signals in configured units, on the console and optionally a live plot — computes nothing, stores nothing |
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
+| `gasperm compare` | compare two campaigns — before/after a treatment, or two plugs — with a paired uncertainty and a significance verdict |
 
 ## Install
 
@@ -395,6 +396,109 @@ append, and the figure redraws on a timer rather than once per sample. If the
 window is closed mid-run, or no display is available, the plot disables itself
 and the run carries on — the console output and the CSV are the primary record,
 and `--plot` only adds a view on top.
+
+## Comparing two campaigns: `gasperm compare`
+
+For a plug measured, treated, and measured again — or simply two plugs against
+each other:
+
+```bash
+# one plug, before and after a treatment, split at the date it happened
+gasperm compare core-041 --split 2026-06-01 \
+    --label-before as-received --label-after "after 720 h H2"
+
+gasperm compare core-041 core-042            # two plugs
+gasperm compare runs/core-041_2026... runs/core-041_2026...   # explicit runs
+gasperm compare core-041 --split 2026-06-01 --output change.yaml --plot
+```
+
+### The measurand is the change, not either value
+
+This is the whole reason it is a command rather than a mental subtraction.
+Errors **common to both measurements** move both results the same way and are
+absent from their ratio: the same plug's geometry, the same transducer on the
+same calibration, the same flowmeter, the same viscosity model. What survives
+is the scatter — and that is usually far smaller.
+
+So a rig reporting `U(k) = 20 %` on each of two runs can still resolve a 5 %
+change between them. The report says so explicitly:
+
+```
+    k_L   liquid-equivalent permeability
+        0.5 -> 0.545 mD   (delta +0.045)
+        increased 9.00% +/- 3.53% -- SIGNIFICANT
+        u_c = 1.27%, k = 2.78 (v_eff = 4.0); smallest change this could resolve: 3.53%
+        For reference the ABSOLUTE uncertainties are 2.14% and 2.14%; the ratio is
+        better determined than either because the shared inputs cancel.
+```
+
+Formally, for a ratio `R = k_B/k_A` built from the same inputs (GUM 5.2):
+
+```
+u_rel²(R) = Σ [ c_i,A·u_i,A − c_i,B·u_i,B ]²          over SHARED inputs
+          + Σ [ (c_j,A·u_j,A)² + (c_j,B·u_j,B)² ]     over INDEPENDENT inputs
+```
+
+Note what the shared term does when the two readings differ: it is a
+*difference* of contributions, not zero. Two runs at 10.0 and 10.2 atm on a
+percent-of-full-scale transducer share an absolute error, so the formula
+charges exactly that residue — automatically, with no special case. **Matched
+conditions are not a precondition this command asserts; they are a quantity it
+prices.**
+
+### Every cancellation is itemised
+
+A claim that an uncertainty went away is the load-bearing part of the result,
+so it comes with its evidence — in the report and in the `--output` file:
+
+```
+  What cancelled between the two measurements
+    L        sample length              100.0% removed   same plug, same recorded value
+    Q        gas flow rate              100.0% removed   same instrument/model (flowmeter specification)
+    mu       gas viscosity              100.0% removed   same instrument/model (coolprop viscosity)
+
+  What did not, and therefore sets the detection limit
+    rep      repeatability                1.13% of the ratio   Type A -- an independent draw each run
+```
+
+Three rules decide sharing, per component rather than by one global switch:
+
+- **Type A never cancels.** Scatter is an independent draw each run, however
+  alike the runs were. It is what sets the detection limit.
+- **Plug inputs** (`L`, `d`, `phi`) cancel only for the same plug *and* only
+  while the recorded value is unchanged. If the plug was measured again between
+  campaigns, those are two independent caliper readings and the cancellation is
+  void — detected from the values themselves, not from an assertion, and said
+  out loud.
+- **Rig inputs** cancel even between *different* plugs, because both were
+  measured on the same bench with the same instruments.
+
+### It refuses what it cannot honestly compare
+
+A different method, gas, or `P2` convention between the two campaigns is
+blocking: the difference would be that mismatch plus whatever the sample did,
+and nothing can separate the two. `--allow-mismatched-conditions` reports it
+anyway, still flagged. A changed flowmeter is survivable but voids the meter's
+cancellation, so it is charged to the comparison in full, on both sides.
+
+### What it reports
+
+`k_L` and the slippage factor `b` when both sides have a Klinkenberg fit;
+apparent `k_g` for every matched mean pressure; and porosity when both sides
+recorded it. Two details worth knowing:
+
+**`b` is a second observable, and often the sharper one.** It depends on pore
+throat size relative to the gas mean free path, so it can move before `k` does
+when pore structure changes. It is also immune to anything that merely scales
+the series, so its uncertainty comes from the two regressions alone.
+
+**A mean-pressure mismatch is quantified rather than hoped away.** Where two
+matched runs sat at different pressures, the fitted `b` says how much of the
+apparent change that alone accounts for — the difference between "permeability
+fell 12 %" and "fell 12 %, of which 3 % is the pressure mismatch".
+
+Exit code 2 means nothing measurable changed, so a screening study can branch
+on "this plug moved" without parsing the report.
 
 ## Uncertainty (ISO/IEC Guide 98-3, the GUM)
 
