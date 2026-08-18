@@ -1811,6 +1811,11 @@ def summarize_pulse_decay_run(
                     fit.relative_standard_uncertainty or 0.0
                 ),
                 decay_rate_dof=fit.degrees_of_freedom,
+                # Under Dicker-Smits porosity is an input to the measurement,
+                # so its uncertainty is a term in the budget. Omitting it left
+                # the budget reporting that it was unrecorded even when the
+                # config had it.
+                porosity_uncertainty=config.sample.porosity_uncertainty,
                 viscosity_temperature_exponent=(
                     processor.gas_provider.viscosity_temperature_exponent(
                         units.celsius_to_kelvin(mean_t), mean_p * units.ATM_IN_PA

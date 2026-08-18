@@ -1811,6 +1811,360 @@ def _print_budget(budget) -> None:
 
 
 # --------------------------------------------------------------------------
+# reprocess
+# --------------------------------------------------------------------------
+
+
+def _stored_config(record) -> GaspermConfig:
+    """The configuration a run was recorded under, from its own sidecar.
+
+    The snapshot rather than the current files: reprocessing has to start from
+    what the run actually used, or the "before" half of the comparison would be
+    a result nobody ever produced.
+    """
+    from gasperm.storage import read_run_metadata
+
+    if record.metadata_path is None:
+        raise ConfigError(
+            f"{record.name} has no metadata sidecar, so the configuration it ran "
+            "under is unknown and it cannot be reprocessed."
+        )
+    stored = read_run_metadata(record.metadata_path)
+    snapshot = stored.get("config") if isinstance(stored, dict) else None
+    if not isinstance(snapshot, dict):
+        raise ConfigError(
+            f"{record.name} has no stored config snapshot. It was recorded before "
+            "runs became self-describing, so there is nothing to reprocess against."
+        )
+    try:
+        return GaspermConfig.model_validate(snapshot)
+    except Exception as exc:  # noqa: BLE001 - pydantic's own hierarchy
+        raise ConfigError(
+            f"{record.name}: its stored config no longer validates ({exc}). The "
+            "schema has moved on since it was recorded."
+        ) from exc
+
+
+@app.command("reprocess")
+def reprocess_command(
+    targets: Optional[list[str]] = typer.Argument(
+        None, metavar="[RUN...]",
+        help="Run directories to re-derive. Omit and use --sample to take every "
+             "run recorded for one plug.",
+    ),
+    sample: Optional[str] = typer.Option(
+        None, "--sample", "-s",
+        help="Re-derive every run for this plug -- the usual case, since a "
+             "corrected uncertainty applies to a whole campaign, not one run.",
+    ),
+    set_values: Optional[list[str]] = typer.Option(
+        None, "--set", metavar="KEY=VALUE",
+        help="Override a config field, e.g. --set sample.porosity_uncertainty=0.005. "
+             "Repeatable. Applied to each run's own stored snapshot.",
+    ),
+    from_config: bool = typer.Option(
+        False, "--from-config",
+        help="Start from the config files currently on disk instead of each run's "
+             "stored snapshot. For when the rig file itself has been corrected.",
+    ),
+    sample_file: Optional[Path] = typer.Option(
+        None, "--sample-file",
+        help="Replace the stored sample section with this file, e.g. after "
+             "re-measuring a plug's porosity.",
+    ),
+    write: bool = typer.Option(
+        False, "--write",
+        help="Write each re-derived run to a NEW run directory beside the "
+             "original, which is never modified. Without this, nothing is "
+             "written and the change is only reported.",
+    ),
+    config_dir: Path = typer.Option(
+        Path("."), "--config-dir", "-c", help="Rig folder holding run.yaml."
+    ),
+    runs_dir: Optional[Path] = typer.Option(
+        None, "--runs-dir", help="Where the runs are. Defaults to run.yaml's output_dir."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Re-derive stored runs from their raw voltages under a changed config.
+
+    Every run keeps its raw voltages and probe readings, so a measurement can be
+    **re-costed** -- a calibration certificate arrives, a porosity is finally
+    measured with a stated uncertainty -- without repeating an experiment that
+    may have taken hours.
+
+    Changes fall into three classes, and the command says which you made.
+    Touching an *uncertainty* field moves ``U(k)`` and leaves ``k`` exactly
+    where it was; touching a *result* field (geometry, calibration, gas, vessel
+    volumes) moves ``k`` itself, which is a correction rather than a re-costing;
+    metadata moves neither. The prediction is checked against the arithmetic,
+    and a disagreement is reported rather than trusted.
+
+    Reports only, unless --write. The raw record is never modified.
+    """
+    from gasperm.reprocess import (
+        ReprocessError,
+        ReprocessResult,
+        diff_configs,
+        reprocess_run,
+    )
+    from gasperm.storage import (
+        _record_from_directory,
+        find_runs,
+        runs_for_sample,
+        summary_from_run,
+    )
+
+    _configure_logging(verbose)
+
+    records = []
+    if targets:
+        for target in targets:
+            path = Path(target)
+            if not path.is_dir():
+                _fail(f"No such run directory: {target}")
+            records.append(_record_from_directory(path))
+    if sample is not None:
+        resolved_runs = _resolve_runs_dir(runs_dir, config_dir)
+        sample_id = _resolve_sample_id(sample)
+        found = runs_for_sample(find_runs(resolved_runs), sample_id)
+        if not found:
+            _fail(f"No runs found for {sample_id!r} under {resolved_runs}.")
+        records.extend(found)
+    if not records:
+        _fail(
+            "Nothing to reprocess. Give one or more run directories, or --sample "
+            "to take every run for a plug."
+        )
+        return
+
+    overrides = list(set_values or [])
+    replacement_sample = None
+    if sample_file is not None:
+        from gasperm.config import load_sample_config
+
+        try:
+            replacement_sample = load_sample_config(sample_file)
+        except ConfigError as exc:
+            _fail(str(exc))
+            return
+
+    on_disk = None
+    if from_config:
+        on_disk = _load_or_fail(config_dir, None, None, None)
+
+    results: list[ReprocessResult] = []
+    failures: list[tuple[str, str]] = []
+    for record in records:
+        try:
+            base = on_disk if on_disk is not None else _stored_config(record)
+        except ConfigError as exc:
+            failures.append((record.name, str(exc)))
+            continue
+
+        before_config = config_to_dict(base)
+        data = config_to_dict(base)
+        if replacement_sample is not None:
+            data["sample"] = replacement_sample.model_dump(mode="json", by_alias=True)
+        try:
+            for assignment in overrides:
+                key, _, raw = assignment.partition("=")
+                if not raw:
+                    raise ConfigError(
+                        f"--set {assignment!r} should be KEY=VALUE, e.g. "
+                        "sample.porosity_uncertainty=0.005"
+                    )
+                _set_dotted(data, key.strip(), raw)
+            updated = GaspermConfig.model_validate(data)
+        except (ConfigError, ValueError) as exc:
+            _fail(str(exc))
+            return
+
+        changes = tuple(diff_configs(before_config, config_to_dict(updated)))
+        original = summary_from_run(record.directory)
+        try:
+            redone = reprocess_run(
+                record.directory, updated,
+                started_at=original.started_at if original else None,
+                ended_at=original.ended_at if original else None,
+            )
+        except (ReprocessError, ValueError, KeyError) as exc:
+            failures.append((record.name, str(exc)))
+            continue
+
+        results.append(
+            ReprocessResult(
+                directory=record.directory, before=original, after=redone,
+                changes=changes,
+            )
+        )
+
+    for name, reason in failures:
+        typer.secho(f"skipped {name}: {reason}", fg=typer.colors.YELLOW, err=True)
+    if not results:
+        _fail("Nothing could be reprocessed.")
+        return
+
+    _print_reprocess(results, wrote=write)
+
+    if write:
+        for result in results:
+            base = _stored_config(_record_from_directory(result.directory))
+            data = config_to_dict(base)
+            if replacement_sample is not None:
+                data["sample"] = replacement_sample.model_dump(mode="json", by_alias=True)
+            for assignment in overrides:
+                key, _, raw = assignment.partition("=")
+                _set_dotted(data, key.strip(), raw)
+            updated = GaspermConfig.model_validate(data)
+            updated.config_dir = base.config_dir
+            saved = _write_reprocessed(result, updated)
+            typer.secho(f"  wrote {saved}", fg=typer.colors.GREEN)
+
+
+def _write_reprocessed(result, config: GaspermConfig) -> Path:
+    """Copy the raw record into a new run directory beside the original.
+
+    A new directory, never an edit in place: the original is the record of a
+    measurement, and a tool that silently rewrote one would make every report
+    already issued from it unreproducible.
+
+    The name is the original's plus ``_reprocessed`` rather than a fresh
+    timestamp. A derived run must be obvious at a glance in a directory
+    listing, and stamping it with the moment of *recomputation* would put it in
+    the wrong place chronologically -- it describes an experiment that happened
+    when its parent did.
+
+    The copy carries the same raw CSV, so it is as self-describing as its
+    parent, plus a ``derived_from`` block naming what it came from and exactly
+    what was changed.
+    """
+    import shutil
+    from datetime import datetime, timezone
+
+    import yaml
+
+    from gasperm.config import experiment_metadata
+    from gasperm.storage import (
+        METADATA_FILENAME,
+        READINGS_FILENAME,
+        _unique_directory,
+    )
+
+    target = _unique_directory(
+        result.directory.with_name(f"{result.directory.name}_reprocessed")
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    source_csv = result.directory / READINGS_FILENAME
+    shutil.copy2(source_csv, target / READINGS_FILENAME)
+
+    payload = {
+        "gasperm_run": {
+            "started_at": result.after.started_at.isoformat(),
+            "readings_csv": READINGS_FILENAME,
+            "rows": result.after.sample_count,
+        },
+        "metadata": experiment_metadata(config).model_dump(mode="json"),
+        "config": config_to_dict(config),
+        "summary": result.after.model_dump(mode="json"),
+        "derived_from": {
+            "run": result.directory.name,
+            "path": str(result.directory),
+            "reprocessed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "changes": [
+                {
+                    "field": change.key,
+                    "before": change.before,
+                    "after": change.after,
+                    "predicted": change.predicted,
+                }
+                for change in result.changes
+            ],
+            "permeability_moved": result.permeability_moved,
+            "uncertainty_moved": result.uncertainty_moved,
+        },
+    }
+    (target / METADATA_FILENAME).write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return target
+
+
+def _print_reprocess(results, *, wrote: bool) -> None:
+    """What changed, grouped by whether it moved the answer or only its cost."""
+    from gasperm.reprocess import summarise_changes
+
+    changes = results[0].changes
+    typer.secho(f"\nReprocessing {len(results)} run(s) from raw voltages", bold=True)
+    if not changes:
+        typer.secho(
+            "  No configuration change -- this is a re-derivation check, and every "
+            "value below should be unchanged.",
+            fg=typer.colors.CYAN,
+        )
+    grouped = summarise_changes(changes)
+    labels = {
+        "result": ("moves k -- this is a CORRECTION, not a re-costing", typer.colors.RED),
+        "uncertainty": ("moves U(k) only -- k is untouched", typer.colors.CYAN),
+        "metadata": ("moves neither", typer.colors.BRIGHT_BLACK),
+    }
+    for kind in ("result", "uncertainty", "metadata"):
+        entries = grouped.get(kind, [])
+        if not entries:
+            continue
+        text, color = labels[kind]
+        typer.secho(f"  {kind}: {text}", fg=color)
+        for change in entries:
+            typer.echo(f"    {change.describe()}")
+
+    typer.echo("")
+    typer.echo(
+        f"  {'run':<34} {'k (mD)':>22}  {'U(k) (mD)':>22}   verdict"
+    )
+    for result in results:
+        before, after = result.before, result.after
+        k_before = (
+            f"{units.darcy_to(before.permeability_darcy, 'mD'):.6g}" if before else "--"
+        )
+        k_after = f"{units.darcy_to(after.permeability_darcy, 'mD'):.6g}"
+        u_before = _expanded_text(before)
+        u_after = _expanded_text(after)
+
+        if result.permeability_moved:
+            verdict, color = (
+                f"k moved {(result.permeability_ratio - 1.0) * 100.0:+.3f}%",
+                typer.colors.RED,
+            )
+        elif result.uncertainty_moved:
+            verdict, color = "k unchanged, U re-costed", typer.colors.GREEN
+        else:
+            verdict, color = "unchanged", typer.colors.BRIGHT_BLACK
+        typer.secho(
+            f"  {result.directory.name[:34]:<34} "
+            f"{k_before:>10} -> {k_after:>10}  "
+            f"{u_before:>10} -> {u_after:>10}   {verdict}",
+            fg=color,
+        )
+        if result.surprise:
+            typer.secho(f"    ! {result.surprise}", fg=typer.colors.RED)
+        elif result.note:
+            typer.secho(f"    {result.note}", fg=typer.colors.BRIGHT_BLACK)
+
+    if not wrote:
+        typer.secho(
+            "\n  Nothing was written. Pass --write to save each re-derived run to a "
+            "new directory beside its original.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _expanded_text(summary) -> str:
+    if summary is None or summary.uncertainty is None:
+        return "--"
+    return f"{units.darcy_to(summary.uncertainty.expanded_uncertainty_darcy, 'mD'):.4g}"
+
+
+# --------------------------------------------------------------------------
 # compare
 # --------------------------------------------------------------------------
 

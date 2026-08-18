@@ -4,7 +4,7 @@ Gas permeability measurement for core plugs on a lab rig built around an
 **NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
 temperature probe on USB serial.
 
-Six commands:
+Seven commands:
 
 | command | what it does |
 |---|---|
@@ -14,6 +14,7 @@ Six commands:
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
 | `gasperm compare` | compare two campaigns — before/after a treatment, or two plugs — with a paired uncertainty and a significance verdict |
+| `gasperm reprocess` | re-derive stored runs from their raw voltages under a changed config — re-cost an uncertainty, or correct a calibration, without repeating the experiment |
 
 ## Install
 
@@ -396,6 +397,75 @@ append, and the figure redraws on a timer rather than once per sample. If the
 window is closed mid-run, or no display is available, the plot disables itself
 and the run carries on — the console output and the CSV are the primary record,
 and `--plot` only adds a view on top.
+
+## Re-deriving a stored run: `gasperm reprocess`
+
+Every run keeps its **raw voltages** and the raw probe temperature alongside the
+derived values, so a measurement can be recomputed without repeating it. A
+calibration certificate arrives; a porosity is finally measured with a stated
+uncertainty; a plug is re-measured with better calipers. None of that needs a
+fourteen-hour pulse decay run again.
+
+```bash
+gasperm reprocess runs/core-041_2026...                       # check it re-derives
+gasperm reprocess --sample core-041 --set sample.porosity_uncertainty=0.005
+gasperm reprocess --sample core-041 --set sample.length=50.4 --write
+gasperm reprocess --sample core-041 --from-config             # after fixing hardware.yaml
+```
+
+### Three classes of change, and only two move the answer
+
+This is the distinction the command exists to make:
+
+| class | example | effect |
+|---|---|---|
+| **result** | geometry, calibration constants, gas, vessel volumes, fit window | `k` itself moves — a **correction** |
+| **uncertainty** | `porosity_uncertainty`, any `*.uncertainty` spec, coverage probability | only `U(k)` moves — a **re-costing** |
+| **metadata** | operator, notes, lithology, display units | neither moves |
+
+```
+Reprocessing 6 run(s) from raw voltages
+  uncertainty: moves U(k) only -- k is untouched
+    sample.porosity_uncertainty: None -> 0.005
+
+  run                                    k (mD)              U(k) (mD)   verdict
+  core-041_20260110T090000Z    0.525982 -> 0.525982     0.1024 -> 0.1149   k unchanged, U re-costed
+```
+
+**The prediction is checked against the arithmetic.** If a field predicted
+`uncertainty` turns out to move `k`, that is reported loudly rather than
+trusted — it means either the classification table is wrong or the field is
+coupled to the physics in a way nobody noticed. The table is advisory; the
+recomputation is authoritative. Conversely, a change that did nothing says why:
+porosity enters the budget only through the Dicker–Smits storage correction, so
+changing its uncertainty on a *steady-state* run is a legitimate no-op — and
+saying so is the difference between that and a typo.
+
+### It never edits the original
+
+Reports only, unless `--write`. With `--write`, each re-derived run goes to a
+**new** directory named `<original>_reprocessed`, carrying a copy of the same
+raw CSV plus a `derived_from` block naming its parent and every field that
+changed. The original is the record of a measurement; silently rewriting one
+would make every report already issued from it unreproducible.
+
+```yaml
+derived_from:
+  run: core-041_20260110T090000Z
+  reprocessed_at: '2026-08-17T19:31:42+00:00'
+  changes:
+    - field: sample.porosity_uncertainty
+      before: 0.01
+      after: 0.03
+      predicted: uncertainty
+  permeability_moved: false
+  uncertainty_moved: true
+```
+
+Reprocessing starts from each run's **own stored config snapshot**, not from
+whatever the config files say today — otherwise the "before" half would be a
+result nobody ever produced. `--from-config` opts into the current files, for
+when the rig file itself is what was corrected.
 
 ## Comparing two campaigns: `gasperm compare`
 

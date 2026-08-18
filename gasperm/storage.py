@@ -148,11 +148,18 @@ def _reading_row(reading: Reading) -> dict[str, Any]:
         "index": reading.index,
         "timestamp_utc": reading.timestamp.astimezone(timezone.utc).isoformat(),
         "elapsed_s": f"{reading.elapsed_s:.4f}",
-        "inlet_voltage_V": f"{reading.inlet_voltage:.6f}",
-        "outlet_voltage_V": f"{reading.outlet_voltage:.6f}",
+        # Voltages are the RAW record -- the one thing a reprocess is entitled
+        # to start from -- so they are stored at full precision rather than at a
+        # display resolution. Six decimals looks generous against a 16-bit DAQ's
+        # 76 uV, but a pulse-decay differential is a small difference between two
+        # large pressures: on a 0-68.95 MPa transducer, 1 uV is 14 Pa, and
+        # re-fitting a decay from that costs ~0.2% in alpha. Ten significant
+        # figures makes a re-derivation exact for a few bytes a row.
+        "inlet_voltage_V": f"{reading.inlet_voltage:.10g}",
+        "outlet_voltage_V": f"{reading.outlet_voltage:.10g}",
         # The flow columns are blank, not zero, in a pulse-decay run: no meter
         # was read, and a zero would read as one that measured nothing.
-        "flow_voltage_V": _optional(reading.flow_voltage, ".6f"),
+        "flow_voltage_V": _optional(reading.flow_voltage, ".10g"),
         "inlet_pressure_atm": f"{reading.inlet_pressure_atm:.8g}",
         "outlet_pressure_atm": f"{reading.outlet_pressure_atm:.8g}",
         "downstream_pressure_atm": f"{reading.downstream_pressure_atm:.8g}",
