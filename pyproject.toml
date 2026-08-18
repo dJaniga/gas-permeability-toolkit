@@ -9,7 +9,7 @@ description = "Gas permeability measurement for core samples on an NI USB-6421 r
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
-authors = [{ name = "Damian" }]
+authors = [{ name = "Damian Janiga", email = "janiga@agh.edu.pl" }]
 keywords = ["permeability", "core-analysis", "klinkenberg", "petrophysics", "nidaqmx"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -33,7 +33,7 @@ dependencies = [
 # Instruments. It is optional here so the physics test suite installs and runs
 # on a machine that has never seen a DAQ.
 daq = ["nidaqmx>=0.8"]
-dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.6"]
 
 [project.scripts]
 gasperm = "gasperm.cli:app"

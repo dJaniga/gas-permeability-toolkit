@@ -24,14 +24,45 @@ every result.
 
 ## Install
 
+The project is managed with [uv](https://docs.astral.sh/uv/), and `uv.lock` is
+committed — so an install resolves to exactly the versions this was tested
+against, on any machine.
+
 ```bash
-pip install -e .          # add [daq] for the nidaqmx driver bindings
+uv sync                   # create .venv and install; no DAQ bindings
+uv sync --extra daq       # ...plus nidaqmx, for the real rig
+```
+
+`uv` fetches a suitable Python itself if you have not got one (the project needs
+≥ 3.10). Then either prefix commands with `uv run`, or activate the environment
+once and drop the prefix:
+
+```bash
+uv run gasperm --help
+
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+gasperm --help
+```
+
+**Every example below assumes one of those two** — either an activated `.venv`,
+or a `uv run` in front.
+
+`nidaqmx` is an extra because it also needs NI-DAQmx itself, a system-level
+driver from National Instruments. Leaving it out is deliberate: the whole test
+suite installs and runs on a machine that has never seen a DAQ, and so does
+everything except `collect` and `preview`.
+
+<details>
+<summary>Using pip instead</summary>
+
+```bash
+pip install -e .
 pip install -e ".[daq]"
 ```
 
-`nidaqmx` also needs NI-DAQmx itself, a system-level driver from National
-Instruments. It is an optional extra, so the test suite installs and runs on a
-machine that has never seen a DAQ.
+This works, but resolves fresh rather than from `uv.lock`, so you may not get
+the versions the suite was tested against.
+</details>
 
 ## Quick start
 
@@ -283,8 +314,18 @@ modes:
 ## Development
 
 ```bash
-pytest                    # no hardware required
-ruff check gasperm tests
+uv sync --extra dev              # pytest, pytest-cov, ruff
+uv run pytest                    # no hardware required
+uv run ruff check gasperm tests
+uv run pytest tests/test_pulse_decay.py -k brace_limit    # one test
+```
+
+Dependencies are edited through `uv`, which keeps `uv.lock` in step:
+
+```bash
+uv add scipy                     # runtime dependency
+uv add --optional dev mypy       # into the dev extra
+uv lock --upgrade                # refresh the lock
 ```
 
 `gasperm/hardware/` is the only package allowed to import `nidaqmx` or `serial`.
