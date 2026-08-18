@@ -57,12 +57,14 @@ __all__ = [
     "describe_convention",
     "describe_method",
     "downstream_convention",
+    "drop_superseded",
     "find_leak_test",
     "run_method",
     "run_purpose",
     "safe_sample_id",
     "summary_from_run",
     "write_comparison_result",
+    "write_sample_summary",
     "write_klinkenberg_result",
 ]
 
@@ -416,6 +418,11 @@ class RunRecord:
     flowmeter: str | None = None
     #: How this run obtained P2; see :func:`downstream_convention`.
     downstream_convention: str | None = None
+    #: Directory name of the run this one was re-derived from, when it came
+    #: from ``gasperm reprocess --write``. Such a run **supersedes** its parent:
+    #: both describe the same measurement, so reducing both would use one
+    #: experiment twice. See :func:`drop_superseded`.
+    derived_from: str | None = None
 
     @property
     def name(self) -> str:
@@ -593,6 +600,7 @@ def _record_from_directory(directory: Path) -> RunRecord:
         purpose=run_purpose(stored_config) or summary.get("purpose") or "measurement",
         flowmeter=experiment.get("flowmeter"),
         downstream_convention=downstream_convention(stored_config),
+        derived_from=(metadata.get("derived_from") or {}).get("run"),
     )
 
 
@@ -643,6 +651,37 @@ def runs_for_sample(records: Sequence[RunRecord], sample_id: str) -> list[RunRec
             else record.sample_id == wanted_safe
         )
     ]
+
+
+def drop_superseded(
+    records: Sequence[RunRecord],
+) -> tuple[list[RunRecord], list[tuple[RunRecord, str]]]:
+    """Keep one record per measurement, preferring the re-derived one.
+
+    ``gasperm reprocess --write`` leaves a corrected run beside its original,
+    both carrying the same sample id and the same raw data. Reducing both would
+    put one experiment into a regression twice -- and, being at the same mean
+    pressure, would also make the fit look better determined than it is.
+
+    The derived run wins: it exists because someone decided it was the better
+    derivation. Nothing is deleted, and the caller is told what was set aside.
+
+    Returns:
+        ``(kept, [(dropped, reason), ...])``.
+    """
+    superseded: dict[str, str] = {}
+    for record in records:
+        if record.derived_from:
+            superseded[record.derived_from] = record.name
+
+    kept, dropped = [], []
+    for record in records:
+        replacement = superseded.get(record.name)
+        if replacement is None:
+            kept.append(record)
+        else:
+            dropped.append((record, f"superseded by {replacement}"))
+    return kept, dropped
 
 
 def resolve_run_paths(target: str | Path) -> tuple[Path, Path | None]:
@@ -851,6 +890,104 @@ def summary_from_run(target: str | Path) -> RunSummary | None:
     except ValidationError as exc:
         logger.warning("Ignoring an unreadable summary in %s: %s", metadata_path, exc)
         return None
+
+
+def write_sample_summary(report, path: str | Path) -> Path:
+    """Write one plug's summary to YAML: its history, its result, and its gaps.
+
+    The findings are written out with everything else. They are the part a
+    machine-readable summary is *for* -- a downstream script can tell a plug
+    that is one pressure short of a fit from one that is finished.
+    """
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def run(line) -> dict[str, Any]:
+        return {
+            "run": line.name,
+            "started_at": line.started_at.isoformat() if line.started_at else None,
+            "method": line.method,
+            "purpose": line.purpose,
+            "confirmed": line.confirmed,
+            "mean_pressure_atm": line.mean_pressure_atm,
+            "permeability_D": line.permeability_darcy,
+            "permeability_mD": (
+                units.darcy_to(line.permeability_darcy, "mD")
+                if line.permeability_darcy is not None
+                else None
+            ),
+            "expanded_uncertainty_D": line.expanded_uncertainty_darcy,
+            "relative_expanded_uncertainty": line.relative_uncertainty,
+            "flowmeter": line.flowmeter,
+            "downstream_pressure": describe_convention(line.downstream_convention),
+            "gas": line.gas_name,
+            "mean_temperature_C": line.temperature_c,
+            "duration_s": line.duration_s,
+            "derived_from": line.derived_from,
+            "excluded_reason": line.excluded_reason or None,
+        }
+
+    fit = report.klinkenberg
+    payload = {
+        "sample": {
+            "id": report.sample_id,
+            "description": report.description or None,
+            "lithology": report.lithology or None,
+            "formation": report.formation or None,
+            "well": report.well or None,
+            "depth": report.depth,
+            "depth_unit": report.depth_unit or None,
+            "length_cm": report.length_cm,
+            "diameter_cm": report.diameter_cm,
+            "porosity_fraction": report.porosity_fraction,
+            "porosity_method": report.porosity_method or None,
+        },
+        "history": {
+            "confirmed_runs": report.run_count,
+            "excluded_runs": len(report.excluded),
+            "leak_tests": len(report.leak_tests),
+            "distinct_mean_pressures": report.distinct_pressures,
+            "mean_pressure_range_atm": list(report.pressure_range_atm or ()),
+            "methods": list(report.methods),
+            "gases": list(report.gases),
+            "flowmeters": list(report.flowmeters),
+            "downstream_conventions": [
+                describe_convention(c) for c in report.conventions
+            ],
+            "first_run": report.first_run.isoformat() if report.first_run else None,
+            "last_run": report.last_run.isoformat() if report.last_run else None,
+            "campaign_split": (
+                report.campaign_split.isoformat() if report.campaign_split else None
+            ),
+        },
+        "klinkenberg": (
+            {
+                "liquid_permeability_D": fit.liquid_permeability_darcy,
+                "liquid_permeability_mD": units.darcy_to(
+                    fit.liquid_permeability_darcy, "mD"
+                ),
+                "expanded_uncertainty_D": (
+                    fit.liquid_permeability_expanded_uncertainty_darcy
+                ),
+                "coverage_factor": fit.coverage_factor,
+                "slippage_factor_atm": fit.slippage_factor_atm,
+                "r_squared": fit.r_squared,
+                "point_count": fit.point_count,
+                "weighted": fit.weighted,
+                "warnings": fit.warnings,
+            }
+            if fit is not None
+            else None
+        ),
+        "runs": [run(line) for line in report.measurements],
+        "excluded": [run(line) for line in report.excluded],
+        "leak_tests": [run(line) for line in report.leak_tests],
+        "findings": list(report.findings),
+    }
+    output_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return output_path
 
 
 def write_comparison_result(result, path: str | Path) -> Path:

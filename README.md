@@ -4,7 +4,7 @@ Gas permeability measurement for core plugs on a lab rig built around an
 **NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
 temperature probe on USB serial.
 
-Seven commands:
+Eight commands:
 
 | command | what it does |
 |---|---|
@@ -13,6 +13,7 @@ Seven commands:
 | `gasperm preview` | watch the raw signals in configured units, on the console and optionally a live plot — computes nothing, stores nothing |
 | `gasperm collect` | sample in real time, detect steady state, compute apparent gas permeability with a full uncertainty budget |
 | `gasperm klinkenberg` | regress runs at different mean pressures to recover liquid-equivalent permeability `k_L` and slippage factor `b` |
+| `gasperm summarize` | one plug's whole history on a page — every run, the fit across them, and what is missing |
 | `gasperm compare` | compare two campaigns — before/after a treatment, or two plugs — with a paired uncertainty and a significance verdict |
 | `gasperm reprocess` | re-derive stored runs from their raw voltages under a changed config — re-cost an uncertainty, or correct a calibration, without repeating the experiment |
 
@@ -397,6 +398,58 @@ append, and the figure redraws on a timer rather than once per sample. If the
 window is closed mid-run, or no display is available, the plot disables itself
 and the run carries on — the console output and the CSV are the primary record,
 and `--plot` only adds a view on top.
+
+## One plug's whole history: `gasperm summarize`
+
+A plug accumulates history — several pressure steps, a leak test, an aborted
+run, a re-derivation after a calibration was corrected, and for an exposure
+study the whole lot again months later. That is the right way to *store* it and
+a poor way to *read* it.
+
+```bash
+gasperm summarize                       # every plug the runs directory holds
+gasperm summarize core-041              # one plug, in full
+gasperm summarize core-041 -o core-041.yaml
+```
+
+```
+core-041
+  5.000 x 3.810 cm   porosity 0.101
+  8 confirmed run(s), 1 not   2026-01-10 to 2026-06-14
+
+  Runs
+    run                        date        method         P_mean       k     U(k)   meter
+    core-041_20260110T090000Z  2026-01-10  steady_state        5     0.9  0.03776   low_range
+    ...
+    core-041_20260111T000000Z  2026-01-11  steady_state       12     0.9  0.03776   low_range   never confirmed
+
+  Klinkenberg correction
+    k_L = 0.520566 mD +/- 0.02125 (k = 2.45)
+    b   = 4 atm    R^2 = 0.9373    8 points   weighted
+
+  Findings
+    - These runs fall into two groups either side of 2026-06-14. ...
+    - core-041_20260111T000000Z is not a measurement: never confirmed a measurement.
+```
+
+**The findings are the point; the table is the evidence.** A summary that only
+restated what is on disk would leave you to notice that a run never confirmed,
+that two meters were used where one should have been, that a series is one
+pressure short of a fit, or that a pulse-decay campaign has no leak test behind
+it. Each of those is reported with what it means for the result.
+
+It also **notices when the history is two campaigns rather than one**. Runs
+cluster in time — a day of pressure steps, a month of nothing, another day — and
+when that gap is unmistakable the summary names the date and points at
+`compare --split`, because a plug measured either side of a treatment is a
+paired experiment whose result is the *difference*. A fit spanning both is
+regressing two states as one, which is usually what a poor R² is telling you.
+The thresholds are deliberately conservative (several times the plug's own
+typical spacing, and at least three days), so pressure steps hours apart never
+read as two campaigns and monthly monitoring never does either.
+
+A **re-derived run supersedes the original it came from**, so one measurement is
+never counted twice — in the summary or in the Klinkenberg fit.
 
 ## Re-deriving a stored run: `gasperm reprocess`
 

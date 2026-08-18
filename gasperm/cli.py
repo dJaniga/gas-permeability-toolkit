@@ -1811,6 +1811,252 @@ def _print_budget(budget) -> None:
 
 
 # --------------------------------------------------------------------------
+# summarize
+# --------------------------------------------------------------------------
+
+
+@app.command("summarize")
+def summarize_command(
+    sample: Optional[str] = typer.Argument(
+        None, metavar="[SAMPLE]",
+        help="The plug to summarise, by id or by its sample file. Omit to list "
+             "every plug the runs directory holds.",
+    ),
+    config_dir: Path = typer.Option(
+        Path("."), "--config-dir", "-c", help="Rig folder holding run.yaml."
+    ),
+    runs_dir: Optional[Path] = typer.Option(
+        None, "--runs-dir", help="Where the runs are. Defaults to run.yaml's output_dir."
+    ),
+    window: Optional[float] = typer.Option(
+        None, "--window", metavar="SECONDS", help="Override the stored averaging window."
+    ),
+    allow_unsteady: bool = typer.Option(
+        False, "--allow-unsteady",
+        help="Count runs that never confirmed a measurement. Off by default: "
+             "such a run describes the transient, not the rock.",
+    ),
+    allow_mixed_methods: bool = typer.Option(
+        False, "--allow-mixed-methods",
+        help="Let the Klinkenberg fit mix steady-state and pulse-decay points.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Write the summary to a YAML file."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Everything one core plug has been through, on one page.
+
+    Its geometry and provenance, every run with its result and uncertainty, the
+    Klinkenberg fit across them, any leak tests behind them -- and, more useful
+    than the table, **what is missing**: a run that never confirmed, a series
+    one pressure short of a fit, two meters where there should be one, a
+    pulse-decay campaign with no leak test behind it.
+
+    A re-derived run supersedes the original it came from, so one measurement is
+    never counted twice.
+
+    With no plug named, lists every one the runs directory holds.
+    """
+    from gasperm.klinkenberg import fit_klinkenberg
+    from gasperm.storage import (
+        drop_superseded,
+        find_runs,
+        runs_for_sample,
+        summary_from_run,
+        write_sample_summary,
+    )
+    from gasperm.summary import build_report
+
+    _configure_logging(verbose)
+    resolved_runs_dir = _resolve_runs_dir(runs_dir, config_dir)
+    everything = find_runs(resolved_runs_dir)
+    if not everything:
+        _fail(f"No runs found under {resolved_runs_dir}.")
+        return
+
+    if sample is None:
+        _print_plug_roster(everything, resolved_runs_dir)
+        return
+
+    sample_id = _resolve_sample_id(sample)
+    records = runs_for_sample(everything, sample_id)
+    if not records:
+        present = sorted({r.sample_id for r in everything if r.sample_id})
+        _fail(
+            f"No runs found for {sample_id!r} in {resolved_runs_dir}."
+            + (f" Plugs recorded there: {', '.join(present)}." if present else "")
+        )
+        return
+
+    records, superseded = drop_superseded(records)
+    records = sorted(records, key=lambda r: (r.started_at is None, r.started_at))
+    summaries = [summary_from_run(record.directory) for record in records]
+
+    fit = None
+    usable = [
+        record
+        for record, summary in zip(records, summaries)
+        if record.purpose != "leak_test"
+        and (allow_unsteady or (summary and summary.measurement_confirmed))
+    ]
+    if len(usable) >= 2:
+        points, _ = _discover_points(
+            usable, window=window, allow_unsteady=allow_unsteady
+        )
+        if len(points) >= 2:
+            try:
+                fit = fit_klinkenberg(points, allow_mixed_methods=allow_mixed_methods)
+            except ValueError as exc:
+                logger.debug("No Klinkenberg fit for %s: %s", sample_id, exc)
+
+    report = build_report(sample_id, records, summaries, klinkenberg=fit)
+    _print_sample_summary(report, resolved_runs_dir, superseded)
+
+    if output is not None:
+        saved = write_sample_summary(report, output)
+        typer.secho(f"\nSummary written to {saved}", fg=typer.colors.GREEN)
+
+
+def _print_plug_roster(records, runs_dir: Path) -> None:
+    """One line per plug: what exists, so a plug can be named to look at it."""
+    from gasperm.storage import drop_superseded
+
+    by_plug: dict[str, list] = {}
+    for record in records:
+        by_plug.setdefault(record.sample_id or "(unknown)", []).append(record)
+
+    typer.secho(f"\n{len(by_plug)} plug(s) in {runs_dir}", bold=True)
+    typer.echo(
+        f"  {'plug':<20} {'runs':>5} {'confirmed':>10} {'leak':>5}  "
+        f"{'first':<11} {'last':<11}  methods"
+    )
+    for plug in sorted(by_plug):
+        kept, _ = drop_superseded(by_plug[plug])
+        measurements = [r for r in kept if r.purpose != "leak_test"]
+        confirmed = [r for r in measurements if r.measurement_confirmed]
+        leaks = [r for r in kept if r.purpose == "leak_test"]
+        stamps = sorted(r.started_at for r in kept if r.started_at)
+        methods = sorted({r.method or "steady_state" for r in measurements})
+        typer.echo(
+            f"  {plug[:20]:<20} {len(measurements):>5} {len(confirmed):>10} "
+            f"{len(leaks):>5}  "
+            f"{(stamps[0].date().isoformat() if stamps else '--'):<11} "
+            f"{(stamps[-1].date().isoformat() if stamps else '--'):<11}  "
+            f"{', '.join(methods)}"
+        )
+    typer.secho(
+        "\nName a plug to see its full history: gasperm summarize <plug>",
+        fg=typer.colors.CYAN,
+    )
+
+
+def _print_sample_summary(report, runs_dir: Path, superseded) -> None:
+    """The report. Identity, then the runs, then the result, then the gaps."""
+    typer.secho(f"\n{report.sample_id}", bold=True)
+
+    identity = []
+    if report.length_cm and report.diameter_cm:
+        identity.append(f"{report.length_cm:.3f} x {report.diameter_cm:.3f} cm")
+    if report.porosity_fraction is not None:
+        method = f" ({report.porosity_method})" if report.porosity_method else ""
+        identity.append(f"porosity {report.porosity_fraction:.4g}{method}")
+    for label, value in (
+        ("lithology", report.lithology), ("formation", report.formation),
+        ("well", report.well),
+    ):
+        if value:
+            identity.append(f"{label} {value}")
+    if report.depth is not None:
+        identity.append(f"depth {report.depth:g} {report.depth_unit}".strip())
+    if identity:
+        typer.secho("  " + "   ".join(identity), fg=typer.colors.CYAN)
+    if report.description:
+        typer.secho(f"  {report.description}", fg=typer.colors.CYAN)
+
+    span = ""
+    if report.first_run and report.last_run:
+        span = (
+            f"   {report.first_run.date().isoformat()} to "
+            f"{report.last_run.date().isoformat()}"
+        )
+    typer.secho(
+        f"  {report.run_count} confirmed run(s)"
+        + (f", {len(report.excluded)} not" if report.excluded else "")
+        + (f", {len(report.leak_tests)} leak test(s)" if report.leak_tests else "")
+        + span,
+        fg=typer.colors.CYAN,
+    )
+
+    if report.measurements or report.excluded:
+        typer.secho("\n  Runs", bold=True)
+        typer.echo(
+            f"    {'run':<30} {'date':<11} {'method':<13} {'P_mean':>9} "
+            f"{'k':>11} {'U(k)':>10}  {'meter':<11}"
+        )
+        for line in (*report.measurements, *report.excluded, *report.leak_tests):
+            _print_run_line(line)
+
+    if report.klinkenberg is not None:
+        fit = report.klinkenberg
+        typer.secho("\n  Klinkenberg correction", bold=True)
+        k_l = units.darcy_to(fit.liquid_permeability_darcy, "mD")
+        expanded = fit.liquid_permeability_expanded_uncertainty_darcy
+        text = f"    k_L = {k_l:.6g} mD"
+        if expanded is not None:
+            text += (
+                f" +/- {units.darcy_to(expanded, 'mD'):.4g}"
+                f" (k = {fit.coverage_factor:.2f})"
+            )
+        typer.echo(text)
+        typer.echo(
+            f"    b   = {fit.slippage_factor_atm:.4g} atm"
+            f"    R^2 = {fit.r_squared:.4f}"
+            f"    {fit.point_count} points"
+            + ("   weighted" if fit.weighted else "")
+        )
+        for warning in fit.warnings:
+            typer.secho(f"    ! {warning}", fg=typer.colors.YELLOW)
+
+    for record, reason in superseded:
+        typer.secho(f"\n  {record.name}: {reason}", fg=typer.colors.BRIGHT_BLACK)
+
+    if report.findings:
+        typer.secho("\n  Findings", bold=True)
+        for finding in report.findings:
+            typer.secho(f"    - {finding}", fg=typer.colors.YELLOW)
+
+
+def _print_run_line(line) -> None:
+    pressure = (
+        f"{line.mean_pressure_atm:.4g}" if line.mean_pressure_atm is not None else "--"
+    )
+    permeability = (
+        f"{units.darcy_to(line.permeability_darcy, 'mD'):.5g}"
+        if line.permeability_darcy is not None
+        else "--"
+    )
+    expanded = (
+        f"{units.darcy_to(line.expanded_uncertainty_darcy, 'mD'):.4g}"
+        if line.expanded_uncertainty_darcy is not None
+        else "--"
+    )
+    if line.purpose == "leak_test":
+        colour, tail = typer.colors.BRIGHT_BLACK, "  LEAK TEST"
+    elif not line.confirmed:
+        colour, tail = typer.colors.YELLOW, f"  {line.excluded_reason}"
+    else:
+        colour, tail = None, ""
+    typer.secho(
+        f"    {line.name[:30]:<30} "
+        f"{(line.started_at.date().isoformat() if line.started_at else '--'):<11} "
+        f"{line.method:<13} {pressure:>9} {permeability:>11} {expanded:>10}  "
+        f"{(line.flowmeter or '--')[:11]:<11}{tail}",
+        fg=colour,
+    )
+
+
+# --------------------------------------------------------------------------
 # reprocess
 # --------------------------------------------------------------------------
 
@@ -2182,7 +2428,12 @@ def _records_for_selector(selector: str, runs_dir: Path) -> tuple[list, str]:
     same three things an operator already has in hand, rather than a fourth
     syntax to learn.
     """
-    from gasperm.storage import _record_from_directory, find_runs, runs_for_sample
+    from gasperm.storage import (
+        _record_from_directory,
+        drop_superseded,
+        find_runs,
+        runs_for_sample,
+    )
 
     path = Path(selector)
     if path.is_dir() and _looks_like_a_run(path):
@@ -2194,7 +2445,7 @@ def _records_for_selector(selector: str, runs_dir: Path) -> tuple[list, str]:
         return records, path.name
 
     sample_id = _resolve_sample_id(selector)
-    records = runs_for_sample(find_runs(runs_dir), sample_id)
+    records, _ = drop_superseded(runs_for_sample(find_runs(runs_dir), sample_id))
     if not records:
         _fail(
             f"No runs found for {sample_id!r} under {runs_dir}. Use --runs-dir if they "
@@ -2785,6 +3036,7 @@ def klinkenberg_command(
     from gasperm.klinkenberg import MIN_POINTS, fit_klinkenberg, load_points_from_csv
     from gasperm.storage import (
         collect_points,
+        drop_superseded,
         find_runs,
         runs_for_sample,
         write_klinkenberg_result,
@@ -2825,6 +3077,12 @@ def klinkenberg_command(
             sample_id = _resolve_sample_id(sample)
             discovered_dir = _resolve_runs_dir(runs_dir, config_dir)
             matching = runs_for_sample(find_runs(discovered_dir), sample_id)
+            # A reprocessed run and its parent describe the SAME measurement.
+            # Regressing both would use one experiment twice, and at the same
+            # mean pressure it would also make the fit look better determined.
+            matching, superseded = drop_superseded(matching)
+            for record, reason in superseded:
+                typer.secho(f"  {record.name}: {reason}", fg=typer.colors.BRIGHT_BLACK)
             if not matching:
                 present = sorted(
                     {r.sample_id for r in find_runs(discovered_dir) if r.sample_id}
