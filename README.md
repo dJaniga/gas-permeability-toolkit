@@ -1,30 +1,26 @@
 # gas-permeability-toolkit
 
-Gas permeability measurement for core plugs on a lab rig built around an
-**NI USB-6421** DAQ (inlet/outlet pressure, gas flow) and an **Arduino**
-temperature probe on USB serial.
+Gas permeability of core plugs on a lab rig built around an **NI USB-6421** DAQ
+(inlet/outlet pressure, gas flow) and an **Arduino** temperature probe on USB
+serial.
 
 Two measurement methods — steady-state Darcy flow, and pulse decay for rock too
 tight to measure by flow — with a full ISO/IEC Guide 98-3 uncertainty budget on
 every result.
 
+> **This file is the usage guide.** The physics, the metrology and the reasoning
+> behind the defaults are in **[MANUAL.md](MANUAL.md)**.
+
 | command | what it does |
 |---|---|
-| [`init`](#gasperm-init) | write the rig and experiment configuration — once per bench |
-| [`new-sample`](#gasperm-new-sample) | add a core plug — one file per plug, rig config untouched |
-| [`preview`](#gasperm-preview) | watch the raw signals in configured units — computes nothing, stores nothing |
-| [`collect`](#gasperm-collect) | sample in real time, detect steady state, compute permeability with its budget |
-| [`klinkenberg`](#gasperm-klinkenberg) | regress runs at different mean pressures for `k_L` and slippage factor `b` |
-| [`summarize`](#gasperm-summarize) | one plug's whole history on a page — every run, the fit, and what is missing |
-| [`compare`](#gasperm-compare) | before/after a treatment, or two plugs, with a paired uncertainty and a verdict |
-| [`reprocess`](#gasperm-reprocess) | re-derive stored runs from their raw voltages under a changed config |
-
-Beyond the commands above: [Install](#install) ·
-[Quick start](#quick-start) · [Configuration](#configuration) ·
-[Uncertainty](#uncertainty) ·
-[Low-permeability rock](#low-permeability-rock) ·
-[Pulse decay](#pulse-decay) · [Reference](#reference) ·
-[Development](#development)
+| `init` | write the rig and experiment configuration — once per bench |
+| `new-sample` | add a core plug — one file per plug, rig config untouched |
+| `preview` | watch the raw signals — computes nothing, stores nothing |
+| `collect` | acquire, detect steady state, compute permeability with its budget |
+| `klinkenberg` | regress runs at different mean pressures for `k_L` and `b` |
+| `summarize` | one plug's whole history — every run, the fit, and what is missing |
+| `compare` | before/after a treatment, or two plugs, with a paired uncertainty |
+| `reprocess` | re-derive stored runs from raw voltages under a changed config |
 
 ## Install
 
@@ -34,13 +30,13 @@ pip install -e ".[daq]"
 ```
 
 `nidaqmx` also needs NI-DAQmx itself, a system-level driver from National
-Instruments. It is an optional extra so the physics test suite installs and
-runs on a machine that has never seen a DAQ.
+Instruments. It is an optional extra, so the test suite installs and runs on a
+machine that has never seen a DAQ.
 
 ## Quick start
 
-The rig is configured **once**. After that a new plug is one file and a run is
-one command:
+The rig is configured **once**. After that a new plug is one file, and a run is
+one command.
 
 ```bash
 gasperm init tight-gas-rig                       # once per bench; creates the folder
@@ -61,9 +57,26 @@ gasperm summarize core-041                       # everything this plug has been
 `init` prints the exact `new-sample` and `collect` lines for the folder you
 named, so the paths are never guesswork.
 
-For rock below about ten microdarcy, steady-state flow cannot measure it at all
-— see [Low-permeability rock](#low-permeability-rock) and
-[Pulse decay](#pulse-decay).
+### Rock below ~10 µD
+
+Steady-state flow cannot measure it — the flow is smaller than the flowmeter's
+own zero offset, and the symptom is a *negative* `k_L` from runs that every
+check passed. Use pulse decay, which measures no flow at all:
+
+```bash
+gasperm collect --sample samples/core-041.yaml --leak-test          # do this first
+gasperm collect --sample samples/core-041.yaml --method pulse_decay
+```
+
+See [Low-permeability rock](MANUAL.md#low-permeability-rock) and
+[Pulse decay](MANUAL.md#pulse-decay).
+
+### Before and after a treatment
+
+```bash
+gasperm summarize core-041                             # notices two campaigns
+gasperm compare core-041 --split 2026-06-01 --plot     # reports the change
+```
 
 ## Configuration
 
@@ -83,366 +96,123 @@ tight-gas-rig/
     core-041_20260803T142530Z/    readings.csv, run_metadata.yaml, run.log
 ```
 
-They are split because they change on completely different timescales: the rig
-on recalibration, the run on every pressure step, the plug whenever a new one is
-loaded. Each run lands in its own timestamped directory: `readings.csv` (every
-sample, **raw voltages included**, in internal CGS units), `run_metadata.yaml`
-(a full config snapshot plus the summary and uncertainty budget) and `run.log`.
+Three files because they change on completely different timescales: the rig on
+recalibration, the run on every pressure step, the plug whenever a new one is
+loaded. `examples/` holds a generated set in this layout.
 
-Keeping the raw voltages is what makes [`reprocess`](#gasperm-reprocess)
-possible: a measurement can be re-derived under a corrected calibration without
-repeating it.
+Each run directory is self-describing: `readings.csv` holds every sample
+**including the raw voltages**, and `run_metadata.yaml` holds a full config
+snapshot plus the summary and uncertainty budget. That is what lets
+`reprocess` re-derive a result under a corrected calibration without repeating
+the experiment.
 
-`examples/` holds a generated set in exactly this layout.
+Every pressure-bearing field carries its **own** unit from
+`Pa, kPa, MPa, bar, psi, atm`, and plug dimensions likewise
+(`mm | cm | m | in | ft`, defaulting to `mm` because that is what a caliper
+reads). Nothing has to be converted by hand.
 
-### Every field carries its own unit
+## Commands
 
-Pressure units are drawn from `Pa, kPa, MPa, bar, psi, atm`, and each
-pressure-bearing field chooses independently. A rig whose transducers read kPa,
-an operator who thinks in bar, and a confining pressure naturally quoted in MPa
-coexist without anyone converting anything by hand.
+Every command takes `-c/--config-dir` to point at a rig folder from anywhere,
+and `--help` for the full option list. Only the options you reach for often are
+listed here.
 
-Plug dimensions work the same way. `sample.dimension_unit` defaults to `mm`,
-because that is what a caliper reads, and the shipped default plug is a 1.5 in
-core at 38.1 mm:
+### `init`
 
-```yaml
-dimension_unit: mm      # mm | cm | m | in | ft
-length: 50.0
-diameter: 38.1          # 1.5 in
+```bash
+gasperm init <folder> [--non-interactive] [--set section.field=value] [--force]
 ```
 
----
+Writes **only** `hardware.yaml` and `run.yaml`. Plugs come from `new-sample`,
+because a sample describes one plug and a rig measures many. Interactive by
+default.
 
-# Commands
-
-## `gasperm init`
-
-Writes **only** `hardware.yaml` and `run.yaml`. A sample describes one plug and
-a rig measures many, so plugs come from `new-sample` instead.
-
-Interactive by default; `--non-interactive` with `--set section.field=value`
-for scripted setup.
-
-## `gasperm new-sample`
-
-One file per core plug, in `samples/`.
+### `new-sample`
 
 ```bash
 gasperm new-sample core-041 --dir samples
-gasperm new-sample --dir samples --from samples/core-041.yaml   # asks id, then this plug
+gasperm new-sample --dir samples --from samples/core-041.yaml
 ```
 
 `--from` carries over what describes the **core** — lithology, formation, well,
-depth, grain density, porosity method, who prepared it. It never carries the
-id, the geometry, or the per-plug porosity and bulk density: every plug is cut
-and measured individually, and inheriting another plug's length or diameter
-would put a wrong number straight into the Darcy equation. Those are always
-asked for.
+depth, grain density, porosity method. It never carries the id, the geometry or
+the per-plug porosity: those are always asked for, because inheriting another
+plug's length would put a wrong number straight into the Darcy equation.
 
-## `gasperm preview`
-
-Watch what the transducers are actually doing, with no plug in the holder and
-nothing being measured — before a run, or in the middle of chasing a wiring
-fault.
+### `preview`
 
 ```bash
 gasperm preview                                  # every signal this rig defines
-gasperm preview --list                           # what it can show, touching no hardware
+gasperm preview --list                           # what it can show; touches no hardware
 gasperm preview -s pulse --plot                  # both pulse-decay transducers
-gasperm preview -s inlet_pressure -s flow --plot # two signals, live window
-gasperm preview -s inlet_pressure:bar            # in a unit of your choosing
-gasperm preview --volts                          # what the wire is doing, uncalibrated
+gasperm preview -s inlet_pressure:bar            # one signal, in a unit you choose
+gasperm preview --volts                          # raw volts, uncalibrated
 gasperm preview -s ai7 -d 30                     # an input the config says nothing about
 ```
 
-```
-     time       P1 (kPa)       P2 (kPa)  Q:low_range (sccm)        ai7 (V)
-     4.5s      1.013e+04           101.3               0.412          3.301
-```
+| option | |
+|---|---|
+| `-s, --signal NAME[:UNIT]` | repeatable; `pulse` and `pressure` select a pair |
+| `--list` | the signal catalogue, with each channel and range |
+| `--volts` | raw voltage instead of the calibrated value |
+| `--plot`, `--plot-window`, `--plot-from-start` | live stacked panels |
+| `--rate`, `-d/--duration`, `-n/--samples` | sampling and stop conditions |
 
-**It computes nothing and stores nothing** — no permeability, no gas lookup, no
-run directory, no CSV. That is what makes it a signal check rather than a
-measurement: a command that also derived a permeability would have to invent a
-sample, a gas and a geometry to do it. It never asks for a sample file either; it
-describes the **bench**, reading `hardware.yaml` and `run.yaml` and stopping
-there.
+Computes nothing and stores nothing — no permeability, no run directory, no
+CSV. Only the channels you name are opened, which is what lets you watch the
+flowmeter a run is *not* using, or a bare `ai7`, without editing a config file.
+Details: [preview](MANUAL.md#preview).
 
-**Only the channels you select are opened**, which is what lets you watch the
-flowmeter a run is *not* using (`-s flow.high_range`), or a bare input with no
-calibration at all (`-s ai7`, raw volts over the widest range the 6421 supports),
-without editing a config file.
-
-Signals are shown in their **configured display unit**
-(`run.display_pressure_unit`, `display_flow_unit`, °C), overridable per signal as
-`NAME:UNIT`. Pressures are shown **absolute** — the same number `collect` would
-compute from the same voltage — with the banner saying so when the transducer is
-a gauge type. For checking a zero, `--volts` is the better tool: it shows the
-reading before any calibration has an opinion on it.
-
-**`-s pulse` picks the pulse-decay transducers automatically**, resolving the
-pair exactly as a pulse-decay run does: the dedicated low-range pair when
-`hardware.pulse_transducers` defines one, the steady-state inlet/outlet pair
-when it does not. Either way the banner says which you got:
-
-```
-  pulse_upstream        kPa   ai4  0-10 V -> 0-100 bar (absolute)  [dedicated pulse transducer]
-  pulse_upstream        kPa   ai0  0-5 V -> 0-68.95 MPa (absolute)  [NO dedicated pulse pair -- falls back to the steady-state transducer]
-```
-
-A pulse pair that silently turned out to be the 0–68.95 MPa transducers is the
-failure the whole method exists to avoid — they cannot resolve a 100 kPa pulse
-(see [Sizing the transducers](#sizing-the-transducers)) and the run would look
-healthy while measuring nothing. `--list` warns about it up front. Unlike
-`collect`, this ignores `run.method`: you check the dedicated pair on a rig whose
-`run.yaml` still says `steady_state`, usually because you are about to change it.
-`pressure` is a pair the same way, and a unit on a pair applies to both halves.
-
-With `--plot`, each signal gets its own stacked panel, with the same
-`--plot-window` / `--plot-from-start` choice `collect` offers. **Nothing is
-drawn on top of the traces** — preview runs no detector, so any criterion band
-would assert something never tested. The DAQ is sampled at `daq.sample_rate_hz`
-(or `--rate`) so the plot sees the real noise; the console refreshes at 2 Hz in
-place, and the final sample is always printed so a preview never ends on a stale
-line.
-
-The temperature probe is opened **only** if `temperature` is among the selected
-signals. Asked for explicitly and failing is fatal; merely part of the default
-set and failing drops its column with a warning, and the DAQ half carries on.
-
-## `gasperm collect`
-
-Acquire pressure, flow and temperature; compute permeability live; write a run
-directory.
+### `collect`
 
 ```bash
 gasperm collect --sample samples/core-041.yaml
-gasperm collect --sample samples/core-041.yaml --method pulse_decay
+gasperm collect --sample samples/core-041.yaml --method pulse_decay --spacer wide:50
 gasperm collect --sample samples/core-041.yaml --leak-test
 ```
 
-### Steady state is required, not optional
+| option | |
+|---|---|
+| `--sample FILE` | the plug being measured |
+| `--method steady_state\|pulse_decay` | overrides `run.yaml` for this run |
+| `--flowmeter NAME` | which meter, by name from `hardware.yaml` |
+| `--stop-after-steady SECONDS` | end the run once steady state has held that long |
+| `-d/--duration`, `-n/--samples` | other stop conditions |
+| `--outlet-pressure VALUE` | supply P2 instead of reading the transducer |
+| `--leak-test` | the pulse-decay pre-step: measure the *apparatus* |
+| `--spacer TYPE:LENGTH` | repeatable; upstream spacers, pulse decay only |
+| `--plot`, `--plot-window`, `--plot-from-start`, `--plot-panels` | live view |
 
-Darcy's law describes *steady* flow. A permeability computed while the rig is
-still pressurising describes the transient, and it will look perfectly
-plausible. So `collect` gates its result on a detector that requires, over
-several consecutive non-overlapping windows and on every monitored signal:
+The result comes from the **detected steady-state window**; a run that never
+settles is written in full but marked not representative, and `klinkenberg`
+refuses it unless you pass `--allow-unsteady`. Exit code 2 means the run
+produced no confirmed measurement.
 
-- **scatter** — coefficient of variation within the window below tolerance;
-- **drift** — the fractional change an OLS line predicts across the window
-  below tolerance.
+Details: [steady state](MANUAL.md#steady-state-is-required-not-optional),
+[the live plot](MANUAL.md#watching-it-live),
+[a supplied P2](MANUAL.md#a-supplied-downstream-pressure),
+[pulse decay](MANUAL.md#pulse-decay).
 
-The drift criterion is the one that matters. A slowly ramping signal has small
-scatter inside any short window and would pass a scatter-only test forever.
-
-The reported permeability is the mean over the detected steady window. A run
-that never settles still produces a full CSV and summary, clearly marked **not
-representative**, and `klinkenberg` refuses it unless you pass
-`--allow-unsteady`.
-
-### Stopping once it has held
-
-`stop_after_steady_s` ends the run after steady state has held that long, so a
-pressure step can be left to finish itself:
-
-```bash
-gasperm collect --sample samples/core-041.yaml --stop-after-steady 120
-```
-
-```yaml
-stop_after_steady_s: 120    # null = run until Ctrl+C; 0 = stop on confirmation
-```
-
-The clock starts when steady state is **confirmed**, not when the plateau began
-— the latter is only known in hindsight, and by then a plateau is already
-several windows old. So with the default 3×30 s criteria and a 120 s soak, a run
-confirming at 90 s stops at 210 s and reports the mean over the whole 210 s
-plateau.
-
-If the rig leaves steady state the clock restarts: a hold that was interrupted
-did not last. Pair it with `steady_state.max_wait_s` so a rig that never settles
-gives up instead of running forever.
-
-### Choosing a flowmeter
-
-A rig usually has more than one meter wired — a low-range and a high-range — and
-which one suits a given pressure step is an *experiment* decision, not a change
-to the bench. So every meter is defined once in `hardware.yaml`:
-
-```yaml
-flowmeters:
-  low_range:
-    channel: ai2
-    flow_max: 500.0
-    unit: sccm
-  high_range:
-    channel: ai3
-    flow_max: 5000.0
-    unit: sccm
-default_flowmeter: low_range
-```
-
-and each run picks one, in `run.yaml` (`flowmeter: high_range`) or on the
-command line (`--flowmeter high_range`). Only the selected meter's analog input
-is added to the DAQ task; the others are never read. The meter used is recorded
-in every run's metadata, because two runs on the same plug routinely differ in
-nothing else.
-
-Sizing the meter to the flow is the single most important choice for tight rock
-— see [The flow is below the meter's resolution](#the-flow-is-below-the-meters-resolution).
-
-### A supplied downstream pressure
-
-P2 is the outlet transducer by default. When the outlet vents to atmosphere and
-that transducer reads noise around zero — or is not fitted — supply the value
-instead:
-
-```bash
-gasperm collect --sample samples/core-041.yaml --outlet-pressure 101.8
-```
-
-```yaml
-downstream_pressure: 101.8        # measured | a number
-downstream_pressure_unit: kPa
-```
-
-The outlet transducer is **still recorded** in every reading, and the run summary
-compares it against the value you declared:
-
-```
-! The supplied downstream pressure (101.8 kPa) disagrees with the outlet
-  transducer, which read 4.003 kPa over the same window (96.1%). Either the
-  declared value is wrong, or the outlet is not actually open to it.
-```
-
-That check is the point of keeping both numbers: declaring a pressure while a
-valve is quietly shut would otherwise scale every permeability with nothing to
-show for it.
-
-P2 sets the apparent permeability *and* the mean pressure, which is the
-Klinkenberg regression's own x-axis, so `klinkenberg` **refuses** to mix runs
-that obtained it differently — `--allow-mixed-conditions` overrides. In the
-budget a supplied value carries its own `downstream_pressure_uncertainty` rather
-than the transducer's specification, and the P1/P2 covariance term is dropped: a
-stated constant shares no calibration error with the inlet.
-
-### Watching it live
-
-`--plot` opens a window alongside the console output. Every quantity gets its
-**own** panel, stacked and sharing a time axis — pressures are not overlaid,
-because the point is watching one signal settle at a time.
-
-```bash
-gasperm collect --sample samples/core-041.yaml --plot
-gasperm collect --sample samples/core-041.yaml --plot-window 120   # trailing 2 min
-gasperm collect --sample samples/core-041.yaml --plot-from-start   # whole run
-gasperm collect --sample samples/core-041.yaml --plot-panels inlet_pressure,flow,permeability
-```
-
-The last three imply `--plot`. Defaults live in `run.yaml`:
-
-```yaml
-plot:
-  panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability]
-  window_s: null          # null = whole run from t0; a number = trailing window
-  show_criteria: true     # the steady-state bands and the fitted drift line
-  redraw_interval_s: 0.5
-  max_points: 3600        # per series; the from-t0 view decimates to fit
-```
-
-**The two views answer different questions.** A trailing window fills the axis
-with the last few minutes, so small movements are visible while you wait for a
-plateau. From t0 shows how far the rig has come since pressure was applied,
-which on tight rock is the question that matters. Neither loses data: the from-t0
-view decimates to `max_points` with a stride that doubles as the run grows, so a
-multi-hour run spans the whole axis at fixed memory rather than silently starting
-late.
-
-**Each monitored panel carries the detector's own criteria**, so a signal
-creeping out of tolerance is visible long before the console says anything: a
-solid line at the window mean, dashed lines at
-`mean × (1 ± relative_stddev_tolerance)`, a dotted segment showing the OLS line
-the drift criterion is computed from, and the current scatter and drift in the
-corner — green passing, amber not. Once a run settles the band is often tens of
-times wider than the signal, and letting it set the y-axis would flatten the
-trace and hide the drift, so it is left off-scale and the corner says
-`(band off-scale)`. The numbers are always shown.
-
-Panels the detector does not watch say **"not a steady-state signal"** rather
-than just having no lines: the outlet transducer is never a criterion, and
-`steady_state.signals` leaves temperature out by default. The permeability panel
-draws the instantaneous value (faint — what the detector tests) over the rolling
-mean (bold — what the console reports), and the confirmed steady stretch is
-shaded green on every panel.
-
-**The panel set follows the method.** A pulse-decay run drops the flow panel and
-gains `delta_pressure` and `decay_fraction`, the latter on a log axis where an
-exponential decay straightens into a line and a leak or thermal ramp does not.
-No criterion annotations appear there — no detector runs in pulse mode, so
-drawing them would assert something never tested.
-
-Plotting never blocks acquisition: samples go into a bounded buffer with an O(1)
-append and the figure redraws on a timer. If the window is closed mid-run, or no
-display is available, the plot disables itself and the run carries on.
-
-## `gasperm klinkenberg`
-
-Apparent gas permeability depends on mean pore pressure through slippage;
-extrapolating to infinite pressure recovers the liquid-equivalent value. The fit
-is linear in `1/P̄`:
-
-```
-k_g = k_L + (k_L b) / P_mean
-```
+### `klinkenberg`
 
 ```bash
 gasperm klinkenberg --sample core-041 --plot
+gasperm klinkenberg runs/core-041_2026... runs/core-041_2026...
+gasperm klinkenberg --csv points.csv
 ```
 
-`--sample` finds **every** run recorded for that plug and regresses them — no
-globbing, no typing directory names. It reports what it found first:
+`--sample` finds **every** run for that plug and regresses `k_g` against
+`1/P_mean`; the intercept is `k_L` and `slope/intercept` is the slippage factor
+`b`. Results go to `runs/klinkenberg_<plug>.yaml` and its `.png`.
 
-```
-Found 4 runs for core-041 in runs
-  core-041_20260804T091200Z        2026-08-04 09:12Z
-  core-041_20260804T095100Z        2026-08-04 09:51Z
-  core-041_20260804T102300Z        2026-08-04 10:23Z
-  core-041_20260804T110400Z        2026-08-04 11:04Z   skipped: never reached steady state
-1 run skipped. Pass --allow-unsteady to include them.
-```
+It refuses three things unless told otherwise, because each mistake would
+otherwise be silent: more than one plug (`--allow-mixed-samples`), mixed P2
+conventions (`--allow-mixed-conditions`), and mixed methods
+(`--allow-mixed-methods`). Runs that never settled are skipped with a reason;
+`--allow-unsteady` includes them. Details:
+[Klinkenberg](MANUAL.md#the-klinkenberg-correction).
 
-A run that never settled is skipped with its reason rather than failing the
-whole regression — a plug's history legitimately includes aborted attempts.
-
-`--sample` takes a bare id or the sample file you passed to `collect`, whichever
-is to hand. The runs directory comes from `run.yaml`; `--runs-dir` overrides it,
-and `-c <rig folder>` works from anywhere. Results are written per plug —
-`runs/klinkenberg_core-041.yaml` and its `.png` — so measuring the next plug
-never overwrites the last.
-
-Three refusals, each because the mistake would otherwise be silent:
-
-- **more than one plug** in a regression, without `--allow-mixed-samples`;
-- **mixed P2 conventions**, without `--allow-mixed-conditions`, since P2 sets
-  the x-axis;
-- **mixed methods**, without `--allow-mixed-methods` — steady-state `k_g` is
-  averaged over a large P1→P2 span while pulse-decay `k_g` is at essentially a
-  single pressure, so a systematic offset between them would masquerade as
-  slippage and land in `b`.
-
-Leak tests are excluded from discovery: a leak is a property of the bench, not a
-point on any plug's curve. A [re-derived run](#gasperm-reprocess) supersedes the
-original it came from, so one measurement is never regressed twice.
-
-How many points to take is your call; nothing here nags about it. After each run
-`collect` simply says how many that plug now has, and prints the command.
-
-## `gasperm summarize`
-
-A plug accumulates history — several pressure steps, a leak test, an aborted
-run, a re-derivation after a calibration was corrected, and for an exposure
-study the whole lot again months later. That is the right way to *store* it and
-a poor way to *read* it.
+### `summarize`
 
 ```bash
 gasperm summarize                       # every plug the runs directory holds
@@ -450,718 +220,65 @@ gasperm summarize core-041              # one plug, in full
 gasperm summarize core-041 -o core-041.yaml
 ```
 
-```
-core-041
-  5.000 x 3.810 cm   porosity 0.101
-  8 confirmed run(s), 1 not   2026-01-10 to 2026-06-14
+Identity, every run with its result and uncertainty, the fit across them, the
+leak tests behind them — and **the gaps**: a run that never confirmed, a series
+one pressure short of a fit, two meters where there should be one, a
+pulse-decay campaign with no leak test. It also notices when a plug's history is
+two campaigns rather than one and points at `compare --split`. Details:
+[summarize](MANUAL.md#summarize-and-its-findings).
 
-  Runs
-    run                        date        method         P_mean       k     U(k)   meter
-    core-041_20260110T090000Z  2026-01-10  steady_state        5     0.9  0.03776   low_range
-    ...
-    core-041_20260111T000000Z  2026-01-11  steady_state       12     0.9  0.03776   low_range   never confirmed
-
-  Klinkenberg correction
-    k_L = 0.520566 mD +/- 0.02125 (k = 2.45)
-    b   = 4 atm    R^2 = 0.9373    8 points   weighted
-
-  Findings
-    - These runs fall into two groups either side of 2026-06-14. ...
-    - core-041_20260111T000000Z is not a measurement: never confirmed a measurement.
-```
-
-**The findings are the point; the table is the evidence.** A summary that only
-restated what is on disk would leave you to notice that a run never confirmed,
-that two meters were used where one should have been, that a series is one
-pressure short of a fit, or that a pulse-decay campaign has no leak test behind
-it. Each is reported with what it means for the result.
-
-It also **notices when the history is two campaigns rather than one**. Runs
-cluster in time — a day of pressure steps, a month of nothing, another day — and
-when that gap is unmistakable the summary names the date and points at
-[`compare --split`](#gasperm-compare), because a plug measured either side of a
-treatment is a paired experiment whose result is the *difference*. A fit spanning
-both is regressing two states as one, which is usually what a poor R² is telling
-you. The thresholds are deliberately conservative — several times the plug's own
-typical spacing **and** at least three days, with two runs either side — so
-pressure steps hours apart never read as two campaigns, and neither does monthly
-monitoring.
-
-## `gasperm compare`
-
-For a plug measured, treated, and measured again — or two plugs against each
-other:
+### `compare`
 
 ```bash
-# one plug, before and after a treatment, split at the date it happened
-gasperm compare core-041 --split 2026-06-01 \
+gasperm compare core-041 --split 2026-06-01 --plot
+gasperm compare core-041 core-042
+gasperm compare core-041 --split 2026-06-01 -o change.yaml \
     --label-before as-received --label-after "after 720 h H2"
-
-gasperm compare core-041 core-042            # two plugs
-gasperm compare runs/core-041_2026... runs/core-041_2026...   # explicit runs
-gasperm compare core-041 --split 2026-06-01 --output change.yaml --plot
 ```
 
-### The measurand is the change, not either value
+The measurand is the **change**, not either value. Errors common to both
+measurements cancel out of their ratio, so a rig reporting `U(k) = 20 %` on each
+of two runs can still resolve a 5 % change between them — and every cancellation
+is itemised. Exit code 2 means nothing measurable changed. Details:
+[comparing two campaigns](MANUAL.md#comparing-two-campaigns).
 
-This is the whole reason it is a command rather than a mental subtraction.
-Errors **common to both measurements** move both results the same way and are
-absent from their ratio: the same plug's geometry, the same transducer on the
-same calibration, the same flowmeter, the same viscosity model. What survives is
-the scatter — usually far smaller.
-
-So a rig reporting `U(k) = 20 %` on each of two runs can still resolve a 5 %
-change between them. The report says so explicitly:
-
-```
-    k_L   liquid-equivalent permeability
-        0.5 -> 0.545 mD   (delta +0.045)
-        increased 9.00% +/- 3.53% -- SIGNIFICANT
-        u_c = 1.27%, k = 2.78 (v_eff = 4.0); smallest change this could resolve: 3.53%
-        For reference the ABSOLUTE uncertainties are 2.14% and 2.14%; the ratio is
-        better determined than either because the shared inputs cancel.
-```
-
-Formally, for a ratio `R = k_B/k_A` built from the same inputs (GUM 5.2):
-
-```
-u_rel²(R) = Σ [ c_i,A·u_i,A − c_i,B·u_i,B ]²          over SHARED inputs
-          + Σ [ (c_j,A·u_j,A)² + (c_j,B·u_j,B)² ]     over INDEPENDENT inputs
-```
-
-Note what the shared term does when the two readings differ: it is a
-*difference* of contributions, not zero. Two runs at 10.0 and 10.2 atm on a
-percent-of-full-scale transducer share an absolute error, so the formula charges
-exactly that residue — automatically, with no special case. **Matched conditions
-are not a precondition this command asserts; they are a quantity it prices.**
-
-### Every cancellation is itemised
-
-A claim that an uncertainty went away is the load-bearing part of the result, so
-it comes with its evidence, in the report and in the `--output` file:
-
-```
-  What cancelled between the two measurements
-    L        sample length              100.0% removed   same plug, same recorded value
-    Q        gas flow rate              100.0% removed   same instrument/model (flowmeter specification)
-    mu       gas viscosity              100.0% removed   same instrument/model (coolprop viscosity)
-
-  What did not, and therefore sets the detection limit
-    rep      repeatability                1.13% of the ratio   Type A -- an independent draw each run
-```
-
-Three rules decide sharing, per component rather than by one global switch:
-
-- **Type A never cancels.** Scatter is an independent draw each run, however
-  alike the runs were. It is what sets the detection limit.
-- **Plug inputs** (`L`, `d`, `phi`) cancel only for the same plug *and* only
-  while the recorded value is unchanged. If the plug was measured again between
-  campaigns, those are two independent caliper readings and the cancellation is
-  void — detected from the values themselves, not from an assertion, and said
-  out loud.
-- **Rig inputs** cancel even between *different* plugs, because both were
-  measured on the same bench with the same instruments.
-
-### What it refuses, and what it reports
-
-A different method, gas, or P2 convention between the two campaigns is
-**blocking**: the difference would be that mismatch plus whatever the sample
-did, and nothing can separate the two. `--allow-mismatched-conditions` reports it
-anyway, still flagged. A changed flowmeter is survivable but voids the meter's
-cancellation, so it is charged to the comparison in full, on both sides.
-
-It reports `k_L` and `b` when both sides have a Klinkenberg fit, apparent `k_g`
-for every matched mean pressure, and porosity when both sides recorded it. Two
-details worth knowing:
-
-**`b` is a second observable, and often the sharper one.** It depends on pore
-throat size relative to the gas mean free path, so it can move before `k` does
-when pore structure changes. It is also immune to anything that merely scales the
-series, so its uncertainty comes from the two regressions alone.
-
-**A mean-pressure mismatch is quantified rather than hoped away.** Where two
-matched runs sat at different pressures, the fitted `b` says how much of the
-apparent change that alone accounts for — the difference between "permeability
-fell 12 %" and "fell 12 %, of which 3 % is the pressure mismatch".
-
-Exit code 2 means nothing measurable changed, so a screening study can branch on
-"this plug moved" without parsing the report.
-
-## `gasperm reprocess`
-
-Every run keeps its **raw voltages** and the raw probe temperature alongside the
-derived values, so a measurement can be recomputed without repeating it. A
-calibration certificate arrives; a porosity is finally measured with a stated
-uncertainty; a plug is re-measured with better calipers. None of that needs a
-fourteen-hour pulse-decay run again.
+### `reprocess`
 
 ```bash
-gasperm reprocess runs/core-041_2026...                       # check it re-derives
+gasperm reprocess runs/core-041_2026...                        # check it re-derives
 gasperm reprocess --sample core-041 --set sample.porosity_uncertainty=0.005
 gasperm reprocess --sample core-041 --set sample.length=50.4 --write
-gasperm reprocess --sample core-041 --from-config             # after fixing hardware.yaml
+gasperm reprocess --sample core-041 --from-config              # after fixing hardware.yaml
 ```
 
-### Three classes of change, and only two move the answer
-
-| class | example | effect |
-|---|---|---|
-| **result** | geometry, calibration constants, gas, vessel volumes, fit window | `k` itself moves — a **correction** |
-| **uncertainty** | `porosity_uncertainty`, any `*.uncertainty` spec, coverage probability | only `U(k)` moves — a **re-costing** |
-| **metadata** | operator, notes, lithology, display units | neither moves |
-
-```
-Reprocessing 6 run(s) from raw voltages
-  uncertainty: moves U(k) only -- k is untouched
-    sample.porosity_uncertainty: None -> 0.005
-
-  run                                    k (mD)              U(k) (mD)   verdict
-  core-041_20260110T090000Z    0.525982 -> 0.525982     0.1024 -> 0.1149   k unchanged, U re-costed
-```
-
-**The prediction is checked against the arithmetic.** If a field predicted
-`uncertainty` turns out to move `k`, that is reported loudly rather than trusted
-— it means either the classification is wrong or the field is coupled to the
-physics in a way nobody noticed. The table is advisory; the recomputation is
-authoritative. Conversely, a change that did nothing says why: porosity enters
-the budget only through the Dicker–Smits storage correction, so changing its
-uncertainty on a *steady-state* run is a legitimate no-op, and saying so is the
-difference between that and a typo.
-
-### It never edits the original
-
-Reports only, unless `--write`. With `--write`, each re-derived run goes to a
-**new** directory named `<original>_reprocessed`, carrying a copy of the same raw
-CSV plus a `derived_from` block naming its parent and every field that changed.
-The original is the record of a measurement; silently rewriting one would make
-every report already issued from it unreproducible.
-
-```yaml
-derived_from:
-  run: core-041_20260110T090000Z
-  reprocessed_at: '2026-08-17T19:31:42+00:00'
-  changes:
-    - field: sample.porosity_uncertainty
-      before: 0.01
-      after: 0.03
-      predicted: uncertainty
-  permeability_moved: false
-  uncertainty_moved: true
-```
-
-A derived run **supersedes** its parent everywhere runs are reduced to
-measurements — in `klinkenberg`, `compare` and `summarize` alike — so one
-experiment is never counted twice.
-
-Reprocessing starts from each run's **own stored config snapshot**, not from
-whatever the config files say today, or the "before" half would be a result
-nobody ever produced. `--from-config` opts into the current files, for when the
-rig file itself is what was corrected.
-
----
-
-# Uncertainty
-
-Every result carries a full ISO/IEC Guide 98-3 (GUM) budget. The measurand is
-
-```
-k = 2 Q P_ref mu L / (A (P1^2 - P2^2)),   A = pi d^2 / 4
-```
-
-a product of powers, so each input's relative sensitivity coefficient is simply
-its exponent: `+1` for flow, reference pressure, viscosity and length; `-2` for
-diameter (area goes as `d^2`, which is why the caliper term is usually the
-largest in the budget); and for the pressures
-
-```
-c_P1 = -2 P1^2 / (P1^2 - P2^2)      c_P2 = +2 P2^2 / (P1^2 - P2^2)
-```
-
-which diverge as the differential closes — the quantitative statement of why a
-low-differential measurement is a bad measurement.
-
-Type B terms come from the instrument specifications in `hardware.yaml` (a
-specification limit divided by its distribution factor: `sqrt(3)` rectangular,
-`sqrt(6)` triangular, or the stated `k`); the Type A term is the standard
-deviation of the mean over the steady window. `pressure_calibration.correlation`
-carries the covariance between the two transducers — because P1 and P2 enter
-with opposite signs, positive correlation *reduces* the combined uncertainty.
-The coverage factor comes from Student-t at the Welch–Satterthwaite effective
-degrees of freedom.
-
-`collect` prints the whole budget ranked by contribution, so it is obvious which
-term to improve next. Pulse decay has its own budget with
-[no flow term at all](#sizing-the-transducers).
-
----
-
-# Low-permeability rock
-
-Below roughly ten microdarcy this rig stops measuring the rock and starts
-measuring itself. The symptom is a Klinkenberg fit with a **negative** `k_L` and
-a negative slippage factor at a respectable R², from runs that every steady-state
-check passed. Nothing is broken; the flow is simply too small for the meter.
-
-## The flow is below the meter's resolution
-
-A 1 µD plug (38.1 mm × 50 mm, nitrogen, venting to atmosphere) passes:
-
-| inlet | flow | on a 500 sccm meter | `u(Q)/Q` at ±0.5 % FS |
-|---|---|---|---|
-| 5 atm | 0.09 sccm | 0.018 % FS | 1600 % |
-| 10 atm | 0.38 sccm | 0.076 % FS | 380 % |
-| 30 atm | 3.45 sccm | 0.69 % FS | 42 % |
-
-A thermal meter down there reports its own zero offset. That offset is genuinely
-stable, so the detector confirms steady state and is right to — the quantity it
-confirmed just is not the sample. A constant `Q0` makes `k_g ∝ 1/(P̄(P̄−1))`,
-which is convex in `1/P̄` rather than the straight line Klinkenberg assumes, and
-a straight fit through it lands on a negative intercept. A 0.25 sccm offset and
-no sample flow at all reproduces the field symptom exactly: `k_L = −0.78 µD`,
-`b = −12.7 atm`, `R² = 0.94`.
-
-**Size the meter to the flow.** For a relative flow uncertainty of `target` at a
-flow `Q`, a `±0.5 %` full-scale meter needs
-
-```
-FS <= Q * target * sqrt(3) / 0.005
-```
-
-At 30 atm and 1 µD (3.45 sccm) that is ≤ 60 sccm for 5 % flow accuracy, or
-≤ 240 sccm for 20 %. The shipped 500 sccm meter cannot do better than 42 % there.
-
-This is why `flowmeters.*.uncertainty.kind` defaults to `percent_full_scale`:
-thermal meters are specified that way, and declaring `percent_reading` instead
-understates the flow term by around seventy times — enough to make a
-non-measurement look precise. Change it only if your datasheet really says so.
-
-## Equilibration takes hours, not seconds
-
-Pressure diffuses through a plug on a timescale
-
-```
-t ~ phi mu L^2 / (k P_mean)
-```
-
-At 1 µD and 10 % porosity that is **2.2 h** at 5.5 atm mean pressure and 48 min
-at 15.5 atm, against shipped criteria that can confirm a plateau in 90 s. Both
-are correct at once: the signal is flat because the core is still filling at a
-steady rate. Note the `1/P_mean` — raising the pore pressure shortens
-equilibration proportionally, which is the cheapest lever available.
-
-Recording `porosity_fraction` in the sample file lets the tool check this
-properly; without it the check falls back to a 5 % porosity as a lower bound and
-says so.
-
-## What the tool does about it
-
-Three guards, all after the fact, all reported in the run summary or the fit:
-
-- **A dominated budget.** Any input whose relative contribution exceeds
-  `run.uncertainty.max_component_contribution` (default 0.25) is named, and for
-  the flowmeter the message gives where the meter sits on its own scale.
-- **Too short a run.** `run.steady_state.equilibration_factor` (default 1.0)
-  compares the elapsed time against `t` above.
-- **A meter stuck at its offset.** `klinkenberg` warns when flow varies by less
-  than 5 % across a series whose mean pressure spans more than 2×. This is what
-  makes already-recorded runs self-diagnosing: re-run `gasperm klinkenberg
-  --sample <id>` and it will say so.
-
-## The real fix is a different method
-
-Those guards tell you the steady-state measurement is not a measurement. They
-cannot make it one — below about 10 µD no flowmeter sized for a normal plug can
-resolve the flow. **Use [pulse decay](#pulse-decay) instead**, which measures no
-flow at all.
-
-One caveat that remains in steady-state mode: the outlet vents to atmosphere, so
-`P̄ ≈ P1/2` — mean pressure cannot be varied independently of the differential
-without a back-pressure regulator. Pulse decay does not have this problem, since
-both vessels sit at the same mean pressure.
-
----
-
-# Pulse decay
-
-```bash
-gasperm collect --sample samples/core-041.yaml --method pulse_decay
-```
-
-A core plug between two **closed** vessels, upstream `V1` and downstream `V2`,
-both at pore pressure `P̄`. A small pulse `dP0` is applied to `V1`; the
-differential decays through the plug, and permeability comes from the decay
-*rate*. **No flow is measured**, which is what makes it work at a microdarcy.
-
-Set `method: pulse_decay` in `run.yaml` to make it the default for a rig. It
-requires `downstream_pressure: measured` — a declared constant P2 asserts the
-outlet is open to something, which contradicts a closed vessel, and `collect`
-refuses the combination at config load rather than three minutes in.
-
-## The physics
-
-Two models, both implemented and both exact in the package's CGS-Darcy units —
-`k` in darcy, `A` in cm², `µ` in cP, `L` in cm, `V` in cm³ and gas
-compressibility in **1/atm** give `alpha` in 1/s with no conversion constant at
-all.
-
-**Zero storage (Brace et al. 1968)**, when the plug's pore volume is small
-against the vessels:
-
-```
-alpha = k*A / (mu*c_g*L) * (1/V1 + 1/V2)
-```
-
-**Sample storage (Dicker & Smits 1988)**, when it is not — the usual case once
-the vessels are small enough to give a workable run time. With `V_p = phi*A*L`,
-`a1 = V_p/V1`, `a2 = V_p/V2` and `theta_1` the first root of the storage
-equation:
-
-```
-alpha = theta_1^2 * k / (phi*mu*c_g*L^2)
-```
-
-Applied automatically whenever `sample.porosity_fraction` is recorded
-(`storage_correction: auto`). Without it the zero-storage form reads **low** — by
-1.8 % on the shipped 400/75 cm³ vessels, and by 20 % on 5 cm³ ones.
-
-## How long a run takes
-
-`k` and `tau` are inversely proportional, and `tau` also scales as `1/P̄`. For a
-38.1 × 50 mm plug at 10 % porosity in nitrogen at 10 atm, on 400/75 cm³ vessels:
-
-| k | time constant | run to dP/dP₀ = 0.4 |
-|---|---|---|
-| 1 µD | 13.9 h | 12.8 h |
-| 3 µD | 4.6 h | 4.3 h |
-| 10 µD | 1.4 h | 1.3 h |
-
-`collect` prints this prediction at startup when
-`pulse_decay.expected_permeability` is set — nobody should discover a
-fourteen-hour run by starting one. Two levers shorten it: **charge to a higher
-pore pressure** (exactly proportional), and **shrink the vessels**. Note the
-decay rate is set by `V1·V2/(V1+V2)`, which the *smaller* vessel dominates —
-enlarging only the big one changes almost nothing.
-
-**Running the decay to 5 % is wasted time, and slightly worse.** Simulated fits
-at 1 µD, treating the full 0.25 % FS accuracy spec as scatter:
-
-| stop at dP/dP₀ | run length | σ(α)/α | bias |
-|---|---|---|---|
-| 0.9 | 1.5 h | 7.4 % | +2.1 % |
-| 0.7 | 5.0 h | 2.1 % | +0.1 % |
-| **0.5** | **9.7 h** | **0.9 %** | −0.1 % |
-| 0.3 | 16.8 h | 0.5 % | +0.1 % |
-| 0.05 | 41.8 h | 0.7 % | +3.2 % |
-
-Late samples are noise-dominated, so they add scatter rather than information.
-Hence the shipped fit window of 0.90 → 0.50 and a stop at 0.40, not the textbook
-0.05.
-
-## Configuration
-
-The vessels and the transducers are bench hardware, so they live in
-`hardware.yaml`:
-
-```yaml
-reservoirs:
-  upstream:
-    vessel: 380.0     # the calibrated vessel itself
-    dead: 20.0        # tubing + ports + valve internals to the plug face
-    unit: cm3
-    method: gas expansion
-  downstream:
-    vessel: 65.0
-    dead: 10.0
-    unit: cm3
-  spacer_types:       # the bores this rig owns; lengths are per-run
-    wide:
-      internal_diameter: 25.4
-      dimension_unit: mm
-    narrow:
-      internal_diameter: 12.7
-      dimension_unit: mm
-  correlation: 0.0    # both sensitivities are POSITIVE, unlike P1/P2
-
-pulse_transducers:    # null reuses the inlet/outlet pair
-  upstream:
-    channel: ai4
-    volts_max: 10.0
-    value_max: 100.0
-    unit: bar
-  downstream:
-    channel: ai5
-    volts_max: 10.0
-    value_max: 100.0
-    unit: bar
-```
-
-**Dead volume, not nameplate volume.** `vessel` and `dead` are separate because
-they are established by different means and change independently — the vessel is
-a calibrated object, while the dead volume is the tubing, transducer port and
-valve internals up to the plug face, which changes whenever the rig is
-replumbed. Both go into V1 identically, and the dead volume is the one routinely
-forgotten. Measure both by gas expansion against a reference vessel, not from a
-drawing.
-
-The run-level knobs live in `run.yaml`:
-
-```yaml
-method: pulse_decay
-pulse_decay:
-  min_pulse_pressure: 20.0
-  pulse_pressure_unit: kPa
-  max_pulse_fraction: 0.10     # largest dP0/P_mean the linearisation allows
-  stop_below_fraction: 0.40    # end the run here
-  fit_start_fraction: 0.90     # fit from here ...
-  fit_end_fraction: 0.50       # ... down to here
-  fit_bin_s: 1.0               # bin before fitting; null = every sample
-  fit_offset: true
-  storage_correction: auto     # auto | brace | dicker_smits
-  expected_permeability: 1.0
-  expected_permeability_unit: uD
-```
-
-## Spacers
-
-A hollow spacer fitted upstream of the core face is part of the flow path, so
-its internal volume adds to V1.
-
-A spacer is characterised by **two** measurements, established in different
-places. The **internal diameter** belongs to a set of parts bored to one size, so
-it is bench hardware and lives in `spacer_types`. The **length** differs from
-spacer to spacer even within a type, so it is given per fitted spacer at run time
-— the stack is made up to suit the plug in the holder and changes between runs
-without the bench changing. Same split as the flowmeters: defined once, selected
-per run.
-
-```bash
-gasperm collect --sample samples/core-041.yaml --method pulse_decay \
-    --spacer wide:50 --spacer wide:25 --spacer narrow:30
-```
-
-Repeat `--spacer` to stack; the length is in the type's own `dimension_unit`.
-`--spacer none` declares an empty holder, which is how you override a stack that
-`run.yaml` sets by default:
-
-```yaml
-pulse_decay:
-  upstream_spacers:
-    - {type: wide, length: 50.0}
-    - {type: narrow, length: 30.0}
-```
-
-Volume is the cylinder `π(d/2)²·L` plus each type's `end_correction_cm3`, which
-covers chamfers, o-ring grooves and counterbores the plain cylinder misses.
-**Bore enters squared**, so its caliper uncertainty counts double — the same
-reason the plug's diameter dominates the steady-state budget. An unknown type
-name is fatal at startup and names the bores you do have, so a typo never becomes
-a quietly wrong V1.
-
-How much a miscounted stack costs you **depends on the rig**, so `collect` prints
-the figure at startup rather than asserting a rule. What scales the permeability
-is the *effective* volume `V1·V2/(V1+V2)`, which the **smaller** side dominates:
-
-| | 3 × 5 cm³ spacers shift k by |
-|---|---|
-| V1 = 400, V2 = 75 cm³ | **0.6 %** |
-| V1 = V2 = 20 cm³ | **27 %** |
-
-So on a large upstream vessel the stack barely matters — but it matters a great
-deal once you shrink the vessels to get the run time down, which is exactly the
-change you would make for a microdarcy plug. The stack is recorded in every run's
-summary as `type:length` entries, so a series measured at different stack heights
-is never confused with one measured at the same.
-
-Their uncertainty follows how the two measurements actually correlate. **Bore
-error is shared** by every spacer of a type — they are bored to one spec — so it
-sums within a type and adds in quadrature across types. **Length error is
-independent**, since each spacer is measured separately, so those grow as
-`sqrt(n)`. Treating the bore as independent too would understate the stack by
-roughly `sqrt(n)`.
-
-## Sizing the transducers
-
-This is the decisive question, and it is the same trap as the flowmeter wearing
-different clothes. At 10 atm mean with a 101 kPa pulse:
-
-| | u(P) | as a fraction of the pulse |
-|---|---|---|
-| 0–68.95 MPa at 0.25 % FS | 99.5 kPa | **139 %** |
-| 0–100 bar at 0.25 % FS | 14.4 kPa | 20 % |
-
-`collect` warns at startup when the pulse is small against the transducer's
-specification. But note **what does and does not matter**: `alpha` is a *rate*,
-so a constant gain error leaves it unchanged and the fitted offset absorbs a
-constant zero error exactly. Transducer gain and zero — most of a datasheet
-accuracy figure — cancel out of this measurement. What does not cancel is their
-**noise**, which sets the scatter of the fit and appears directly as the Type A
-`u(alpha)` in the budget. A low-range or differential pair is the fix.
-
-## Reading the result
-
-```
-  method              pulse decay -- Dicker & Smits model
-  pulse               dP0 = 50.73 kPa at t = 1.0 s   (5.01% of P_mean)
-  decay fit           ACCEPTED   1.5-4.5 s, 590 pts
-                      alpha = 1.9991e-01 1/s +/- 0.31%,  tau = 5 s
-                      R^2 = 1.000000,  offset = +0.08093 kPa,  rho_1 = 0.11
-  vessels             V1 = 8 cm3, V2 = 8 cm3    a1 = 0.713, a2 = 0.713
-                      theta_1 = 1.1273   (the zero-storage form would read 10.8% low)
-```
-
-The fitted **offset** is the two transducers' zero mismatch; leaving it out of
-the model biases `alpha` low, by 5 % for a 0.5 kPa offset on a 50 kPa pulse and
-by 33 % for 5 kPa. `rho_1` is the lag-1 residual autocorrelation: consecutive DAQ
-samples are not independent, so the decay is binned before fitting and a `rho_1`
-still above `max_residual_autocorrelation` means `u(alpha)` is understated.
-
-Every run also writes `decay_fit.png` — the decay on a log axis with the fit over
-it, and the residuals below, where a leak or a thermal ramp shows as structure
-long before it shows in R².
-
-Pulse-decay runs feed [`klinkenberg`](#gasperm-klinkenberg) exactly like
-steady-state ones, one run per mean pressure.
-
-## The pre-step: a leak test
-
-**Do this before any measurement.** A leak produces a differential decay
-indistinguishable from a slow sample, so without a bound on it a pulse-decay
-result could be entirely the apparatus. It is the pulse-decay counterpart of
-checking the flowmeter's zero with the inlet closed.
-
-Blank or bypass the plug, charge both vessels to the pressure you will measure
-at, apply the same pulse, and run:
-
-```bash
-gasperm collect --sample samples/core-041.yaml --leak-test
-gasperm collect --sample samples/core-041.yaml --leak-test --plot
-```
-
-`--leak-test` implies `--method pulse_decay`. Unlike a measurement this is a
-**fixed observation, not a decay to be waited out** — on a tight rig the ideal
-outcome is that nothing happens, so there is no completion signal to stop on and
-it runs for `pulse_decay.leak_test_duration_s` (default 1 h). A run without a
-duration is refused rather than left to run forever.
-
-The result is reported as **the permeability the apparatus alone would fake**,
-which is the number your sample has to stand clear of:
-
-```
-  purpose             LEAK TEST -- the apparatus, not the sample
-  leak equivalent     0.031 uD +/- 0.006 uD
-  ! LEAK TEST: the blanked rig decays at 8.4e-06 1/s, which is what a sample of
-    0.031 uD would look like. At pulse_decay.max_leak_fraction (5%) that puts the
-    floor for a trustworthy measurement at about 0.62 uD.
-```
-
-and a tight rig reports the outcome you want:
-
-```
-  leak                NONE MEASURABLE -- the blanked rig held its differential
-```
-
-An hour of watching a differential is where `--plot` earns its place. The window
-is titled `LEAK TEST (the apparatus, not the sample)` and the permeability panel
-is labelled `leak equiv.`, so a plot left on screen is never mistaken for a
-measurement. The `dP/dP0` panel is pinned to the span between
-`stop_below_fraction` and 1 rather than autoscaled: on a rig that is holding the
-differential is constant to a few parts in 10^5, and a log axis fitted to *that*
-would render the flat line you want to see as violent noise. A tight rig reads as
-a line along the top; a leak curves away from it long before the fit confirms it.
-
-**Every later run compares itself against the most recent test automatically** —
-found by rig, not by plug, since the apparatus leaked the same whichever core was
-in it:
-
-```
-  leak test           core-041_20260810T125426Z: 4.28e-02 1/s = 150 uD  (30.0% of this decay)
-  ! The rig's own decay is 30.0% of the one measured here, above
-    pulse_decay.max_leak_fraction (5%) ... at this ratio you are largely
-    measuring the apparatus.
-```
-
-It also warns when **no** leak test has been done at all, and when the one it
-found was at a materially different pore pressure — leak conductance depends on
-pressure, so a test that passed at 3 atm says nothing about 30 atm.
-
-**Subtraction is off by default.** Setting `pulse_decay.leak_correction:
-subtract` takes the leak rate off the measured one, which is defensible for a
-linear, stable leak — the leak path is in parallel with the plug, so the rates
-add. But a leak that changed since the test would move the result with nothing to
-show for it, so the shipped behaviour is to compare and warn, and the correction
-says loudly when it has been applied.
-
-## Two more checks, and one thermal trap
-
-Three pulses at one `P̄` should agree within their combined `u(alpha)` — a
-monotone walk means the plug is still equilibrating from the previous step. And
-the observed `tau` should match the one predicted from the recovered `k`: much
-shorter means a leak, much longer a blocked line or a closed valve.
-
-A 0.1 K room swing moves a closed vessel by `dP/P = dT/T` — 0.34 kPa at 10 atm,
-drifting over hours, which looks exactly like a slow exponential. The fitted
-offset absorbs a constant thermal bias but not a ramp, so `collect` compares the
-temperature drift across the fit window against the fit's own residuals and says
-so when they are comparable.
-
----
-
-# Reference
-
-## Gas properties
-
-Viscosity, density and compressibility come from
-[CoolProp](https://coolprop.org) at the reading's actual temperature and mean
-pore pressure — evaluated per reading, not once at startup, since both drift
-during a run. Switching the working gas is a config string change. A fixed
-viscosity is available as a documented escape hatch, and
-`gas.real_gas_correction` divides the reference flow by `Z` when the gas is far
-enough from ideal to matter.
-
-## A slow temperature probe
-
-A DS18B20 converts in 750 ms at 12-bit resolution while the DAQ samples every
-100 ms, so each temperature is **held** for about eight samples. That is correct,
-not a fault: temperature moves far more slowly than the pressures, and viscosity
-changes roughly 0.2 % per kelvin.
-
-```yaml
-temperature:
-  conversion_time_s: 0.75     # DS18B20 at 12-bit; 0.19 s at 9-bit
-  warmup_timeout_s: 5.0       # startup wait for the first reading
-  stale_after_s: 10.0
-  plausible_min_c: -20.0      # excludes the DS18B20 sentinels
-  plausible_max_c: 60.0
-```
-
-Three things follow from a probe slower than the sample rate:
-
-**The run waits for the first reading** (`Waiting for the temperature probe on
-COM4... 0.8 s`). Otherwise the opening fraction of a second would have no
-temperature and would silently use `fallback_temperature_c` for the viscosity
-lookup — a wrong number, quietly applied.
-
-**A probe that opens but never speaks is fatal** when `temperature.required` is
-true, and is caught before the DAQ is touched. A wrong baud rate or a stopped
-sketch used to cost a whole run on the fallback.
-
-**Implausible readings are discarded**, keeping the last good value. This matters
-specifically for the DS18B20, whose two failure values parse as perfectly
-ordinary numbers: `-127` means the sensor did not answer, and `85` is its
-power-on reset value. Either would otherwise go straight into the viscosity
-lookup. Widen `plausible_min_c` / `plausible_max_c` for a genuinely hot rig.
-
-Every reading records `temperature_age_s`, so the CSV shows the hold directly —
-`0.005, 0.106, 0.205 …` resetting each conversion — and the run summary says so
-if the probe falls further behind than a few conversions.
-
-## Units
-
-All internal physics runs in **CGS-Darcy** (atm, cm, cP, cm³/s), the units the
-Darcy equation was derived in. `gasperm/units.py` is the only module in the
-package allowed to hold a conversion constant; everything else converts by
-calling through it. Display units are decoupled from both the calibration units
-and the internal calculation.
+Re-derives stored runs from their **raw voltages**, so a calibration correction
+or a newly measured uncertainty does not mean repeating a fourteen-hour run. It
+says which class of change you made — one that moves `k` (a correction), one
+that moves only `U(k)` (a re-costing), or neither — and checks that prediction
+against the arithmetic.
+
+Reports only, unless `--write`, which writes a **new** `<original>_reprocessed`
+directory and never touches the original. Details:
+[reprocessing](MANUAL.md#reprocessing-a-stored-run).
+
+## Where the details are
+
+**[MANUAL.md](MANUAL.md)** covers the reasoning, the physics and the failure
+modes:
+
+- [Steady state](MANUAL.md#steady-state-is-required-not-optional) — the detector,
+  the drift criterion, stopping on a soak
+- [Watching it live](MANUAL.md#watching-it-live) — panels, criterion bands, the
+  two time views
+- [Uncertainty](MANUAL.md#uncertainty-isoiec-guide-98-3) — the GUM budget,
+  sensitivity coefficients, correlations
+- [Low-permeability rock](MANUAL.md#low-permeability-rock) — why a negative `k_L`
+  happens and how to size a meter
+- [Pulse decay](MANUAL.md#pulse-decay) — the two models, run times, vessels,
+  spacers, transducer sizing, the leak test
+- [Comparing two campaigns](MANUAL.md#comparing-two-campaigns) — the paired
+  uncertainty and what cancels
+- [Reference](MANUAL.md#reference) — gas properties, the temperature probe, units
 
 ## Development
 
