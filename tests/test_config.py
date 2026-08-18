@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from gasperm import units
 from gasperm.config import (
@@ -74,7 +75,7 @@ class TestSplitConcerns:
 
     def test_the_plug_lives_in_sample_without_test_conditions(self):
         fields = set(SampleConfig.model_fields)
-        assert {"id", "lithology", "length", "diameter", "porosity_fraction"} <= fields
+        assert {"id", "lithology", "length", "diameter", "porosity"} <= fields
         # The same plug is measured at several confining pressures and gases,
         # so neither belongs to the sample.
         assert "confining_pressure" not in fields
@@ -488,6 +489,93 @@ class TestIndependentUnits:
         )
         assert config.run.atmospheric_pressure_atm == pytest.approx(1.0, rel=1e-12)
         assert config.flowmeter.standard_pressure_atm == pytest.approx(1.0, rel=1e-12)
+
+
+class TestPorosityUnits:
+    """Porosity may be written as a fraction or as a percentage.
+
+    A helium pycnometer reports percentage points and every equation wants the
+    fraction, so the pair has to be interchangeable -- and a percentage left
+    labelled ``fraction`` has to be caught, because it is a silent factor of a
+    hundred straight into the storage correction.
+    """
+
+    def test_a_fraction_is_the_default(self):
+        assert SampleConfig().porosity_unit == "fraction"
+
+    def test_both_spellings_give_the_same_porosity(self):
+        as_fraction = SampleConfig(porosity=0.104)
+        as_percent = SampleConfig(porosity=10.4, porosity_unit="%")
+        assert as_fraction.porosity_fraction == pytest.approx(
+            as_percent.porosity_fraction
+        )
+
+    def test_the_uncertainty_follows_the_same_unit(self):
+        """0.5 against a percentage is half a percentage point."""
+        sample = SampleConfig(
+            porosity=10.4, porosity_uncertainty=0.5, porosity_unit="%"
+        )
+        assert sample.porosity_uncertainty_fraction == pytest.approx(0.005)
+
+    def test_the_geometry_always_carries_a_fraction(self):
+        """The physics never sees the configured unit."""
+        sample = SampleConfig(porosity=10.4, porosity_unit="%")
+        assert sample.geometry().porosity_fraction == pytest.approx(0.104)
+
+    def test_a_percentage_left_labelled_a_fraction_is_refused(self):
+        with pytest.raises(ValidationError, match="more than the whole rock"):
+            SampleConfig(porosity=10.4)
+
+    def test_the_refusal_suggests_the_unit(self):
+        with pytest.raises(ValidationError, match="porosity_unit"):
+            SampleConfig(porosity=10.4)
+
+    def test_an_impossible_percentage_is_refused_too(self):
+        with pytest.raises(ValidationError, match="more than the whole rock"):
+            SampleConfig(porosity=140.0, porosity_unit="%")
+
+    def test_an_unknown_unit_is_refused(self):
+        with pytest.raises(ValidationError, match="Unsupported porosity unit"):
+            SampleConfig(porosity_unit="fractions")
+
+    def test_a_unit_alias_is_normalised(self):
+        assert SampleConfig(porosity_unit="p.u.").porosity_unit == "%"
+
+    def test_nothing_recorded_stays_none(self):
+        sample = SampleConfig()
+        assert sample.porosity_fraction is None
+        assert sample.porosity_uncertainty_fraction is None
+
+
+class TestLegacyPorositySpelling:
+    """``porosity_fraction`` was the field name; old files must still load."""
+
+    def test_the_old_name_is_read_as_a_fraction(self):
+        assert SampleConfig(porosity_fraction=0.104).porosity == pytest.approx(0.104)
+
+    def test_it_survives_a_template_dict_that_also_carries_the_new_key(self):
+        """What `--set porosity_fraction=...` produces over a rendered default."""
+        data = SampleConfig().model_dump()
+        data["porosity_fraction"] = 0.18
+        assert SampleConfig.model_validate(data).porosity_fraction == pytest.approx(0.18)
+
+    def test_a_stored_sidecar_round_trips(self):
+        stored = SampleConfig(porosity=10.4, porosity_unit="%").model_dump()
+        assert SampleConfig.model_validate(stored).porosity_fraction == pytest.approx(
+            0.104
+        )
+
+    def test_the_two_spellings_disagreeing_is_refused(self):
+        data = {"porosity": 0.10, "porosity_fraction": 0.18}
+        with pytest.raises(ValidationError, match="both set and disagree"):
+            SampleConfig.model_validate(data)
+
+    def test_the_old_name_with_a_percentage_unit_is_refused(self):
+        """It always meant a fraction, so the pair says two different things."""
+        with pytest.raises(ValidationError, match="ambiguous"):
+            SampleConfig.model_validate(
+                {"porosity_fraction": 0.104, "porosity_unit": "%"}
+            )
 
 
 class TestLinearCalibration:

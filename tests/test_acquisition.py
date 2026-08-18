@@ -951,7 +951,7 @@ class TestEquilibrationWarning:
         # The shipped 0-68.95 MPa transducers put ai0 = 2.5 V at 340 atm, and
         # 200 sccm through this plug at that differential is 0.47 uD -- so the
         # default test rig really does describe a microdarcy sample.
-        quick_steady_config.sample.porosity_fraction = 0.15
+        quick_steady_config.sample.porosity = 0.15
         summary = self._summary(
             quick_steady_config, fake_analog_source, fake_temperature_source
         )
@@ -964,7 +964,7 @@ class TestEquilibrationWarning:
         self, quick_steady_config, fake_analog_source, fake_temperature_source
     ):
         config = self.permeable(quick_steady_config)
-        config.sample.porosity_fraction = 0.15
+        config.sample.porosity = 0.15
         summary = self._summary(config, fake_analog_source, fake_temperature_source)
         assert not any("equilibration" in w for w in summary.warnings)
 
@@ -992,7 +992,7 @@ class TestEquilibrationWarning:
     def test_the_check_can_be_switched_off(
         self, quick_steady_config, fake_analog_source, fake_temperature_source
     ):
-        quick_steady_config.sample.porosity_fraction = 0.15
+        quick_steady_config.sample.porosity = 0.15
         quick_steady_config.run.steady_state.equilibration_factor = None
         summary = self._summary(
             quick_steady_config, fake_analog_source, fake_temperature_source

@@ -683,7 +683,12 @@ def render_sample_yaml(config: GaspermConfig) -> str:
             "Area goes as diameter^2, so the diameter uncertainty enters the budget\n"
             "doubled -- it is usually the largest single term."
         ),
-        "porosity_fraction": "Petrophysics. Informational; not used by the Darcy calc.",
+        "porosity_unit": (
+            "Petrophysics. Informational for steady state, but porosity is a real\n"
+            "input to the pulse-decay storage correction. porosity and its\n"
+            "uncertainty are both in porosity_unit, so 0.5 against a percentage is\n"
+            "half a percentage point -- not half a percent of the reading."
+        ),
         "prepared_by": "Provenance.",
     }
     comments = {
@@ -693,6 +698,9 @@ def render_sample_yaml(config: GaspermConfig) -> str:
         "diameter": f"{unit} (38.1 mm = 1.5 in)",
         "length_uncertainty": f"standard uncertainty, {unit} (caliper)",
         "diameter_uncertainty": f"standard uncertainty, {unit} -- counts double",
+        "porosity_unit": "fraction | % (aliases: v/v, pct, p.u.)",
+        "porosity": "0.104 as a fraction, or 10.4 with porosity_unit: '%'",
+        "porosity_uncertainty": "standard uncertainty, same unit as porosity",
         "porosity_method": "helium pycnometry, MICP, image analysis, ...",
         "prepared_on": "YYYY-MM-DD",
     }

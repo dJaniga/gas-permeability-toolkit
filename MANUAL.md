@@ -368,9 +368,19 @@ equation:
 alpha = theta_1^2 * k / (phi*mu*c_g*L^2)
 ```
 
-Applied automatically whenever `sample.porosity_fraction` is recorded
+Applied automatically whenever `sample.porosity` is recorded
 (`storage_correction: auto`). Without it the zero-storage form reads **low** — by
 1.8 % on the shipped 400/75 cm³ vessels, and by 20 % on 5 cm³ ones.
+
+Porosity is the one place a pulse-decay run takes a *petrophysical* number as a
+measurement input rather than as provenance, so how it is written matters.
+`porosity_unit` accepts `fraction` or `%` (with `v/v`, `pct` and `p.u.` as
+aliases), and `porosity_uncertainty` is in the **same** unit — 0.5 against a
+percentage is half a percentage point, not half a percent of the reading. A
+percentage left labelled `fraction` is refused at load: it would otherwise put a
+porosity of 1040 % into the storage correction and read the permeability wildly
+low. The older field name `porosity_fraction` still loads, and still means a
+fraction.
 
 ### How long a run takes
 

@@ -138,9 +138,18 @@ snapshot plus the summary and uncertainty budget. That is what lets
 the experiment.
 
 Every pressure-bearing field carries its **own** unit from
-`Pa, kPa, MPa, bar, psi, atm`, and plug dimensions likewise
+`Pa, kPa, MPa, bar, psi, atm`; plug dimensions likewise
 (`mm | cm | m | in | ft`, defaulting to `mm` because that is what a caliper
-reads). Nothing has to be converted by hand.
+reads); and porosity may be written either way:
+
+```yaml
+porosity_unit: '%'        # fraction | %  (aliases: v/v, pct, p.u.)
+porosity: 10.4            # or 0.104 with porosity_unit: fraction
+porosity_uncertainty: 0.5 # same unit -- half a percentage POINT, not half a percent
+```
+
+Nothing has to be converted by hand, and a percentage left labelled `fraction`
+is refused rather than quietly measured.
 
 ## Commands
 

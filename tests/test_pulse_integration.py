@@ -177,7 +177,7 @@ class TestRunEndToEnd:
     def test_brace_is_used_when_porosity_is_unrecorded(
         self, pulse_config, fake_analog_source, fake_temperature_source
     ):
-        pulse_config.sample.porosity_fraction = None
+        pulse_config.sample.porosity = None
         rate = 0.2
         loop = run_decay(
             pulse_config, fake_analog_source, fake_temperature_source,
@@ -1051,7 +1051,7 @@ class TestConfigRefusals:
         config = GaspermConfig()
         config.run.method = "pulse_decay"
         config.hardware.temperature.required = False
-        config.sample.porosity_fraction = 0.10
+        config.sample.porosity = 0.10
         config.run.pulse_decay.expected_permeability = 1.0
         warnings = validate_for_collect(config)
         timing = [w for w in warnings if "time constant" in w]

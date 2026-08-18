@@ -245,6 +245,39 @@ class TestPermeability:
             units.darcy_to(1.0, "furlongs")
 
 
+class TestPorosity:
+    """Porosity is dimensionless; the unit only says where the decimal point is."""
+
+    def test_a_fraction_is_already_canonical(self):
+        assert units.porosity_to_fraction(0.104, "fraction") == pytest.approx(0.104)
+
+    def test_a_percentage_is_a_hundredth(self):
+        assert units.porosity_to_fraction(10.4, "%") == pytest.approx(0.104)
+
+    @pytest.mark.parametrize("alias", ["%", "percent", "pct", "pu", "p.u.", "PCT"])
+    def test_percentage_aliases(self, alias):
+        """p.u. is petrophysics for percentage points, and appears on reports."""
+        assert units.porosity_to_fraction(10.4, alias) == pytest.approx(0.104)
+
+    @pytest.mark.parametrize("alias", ["fraction", "frac", "v/v", "-", "FRACTION"])
+    def test_fraction_aliases(self, alias):
+        assert units.porosity_to_fraction(0.104, alias) == pytest.approx(0.104)
+
+    @pytest.mark.parametrize("unit", sorted(units.SUPPORTED_POROSITY_UNITS))
+    def test_round_trip(self, unit):
+        value = units.porosity_from_fraction(0.104, unit)
+        assert units.porosity_to_fraction(value, unit) == pytest.approx(0.104)
+
+    def test_an_unknown_unit_is_refused(self):
+        with pytest.raises(ValueError, match="Unsupported porosity unit"):
+            units.porosity_to_fraction(0.1, "fractions")
+
+    def test_an_uncertainty_converts_like_a_value(self):
+        """u(phi) is quoted in the same unit, so 0.5 % is half a percentage
+        point -- not half a percent of the reading."""
+        assert units.porosity_to_fraction(0.5, "%") == pytest.approx(0.005)
+
+
 class TestTemperature:
     def test_celsius_kelvin(self):
         assert units.celsius_to_kelvin(0.0) == pytest.approx(273.15)

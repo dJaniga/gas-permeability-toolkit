@@ -64,7 +64,7 @@ def pulse_config(base_config: GaspermConfig) -> GaspermConfig:
     base_config.hardware.reservoirs.upstream.dead = 0.0
     base_config.hardware.reservoirs.downstream.vessel = 8.0
     base_config.hardware.reservoirs.downstream.dead = 0.0
-    base_config.sample.porosity_fraction = 0.10
+    base_config.sample.porosity = 0.10
     base_config.run.pulse_decay.fit_bin_s = None
     base_config.run.pulse_decay.min_fit_samples = 10
     return base_config

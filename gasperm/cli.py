@@ -160,8 +160,14 @@ def _set_dotted(data: dict[str, Any], dotted_key: str, raw_value: str) -> None:
         target = nested
     try:
         target[parts[-1]] = yaml.safe_load(raw_value)
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"--set {dotted_key}: could not parse {raw_value!r}: {exc}") from exc
+    except yaml.YAMLError:
+        # A value YAML cannot parse is taken literally rather than refused.
+        # Some perfectly ordinary unit strings are YAML syntax: a bare "%" is a
+        # directive indicator, so `--set sample.porosity_unit=%` would fail on a
+        # value the schema accepts happily. Anything genuinely wrong is still
+        # caught by the model a moment later, with a better message than a YAML
+        # scanner can give.
+        target[parts[-1]] = raw_value
 
 
 # Unit menus, taken from the canonical sets in units.py so a prompt can never
@@ -428,9 +434,23 @@ def _prompt_sample(sample: dict[str, Any], *, inherited: bool = False) -> None:
     )
 
     typer.secho("  Petrophysics (optional, per plug)", bold=True)
-    porosity = _optional_float("    Porosity fraction (blank to skip)")
+    # Ask for the unit before the number. A pycnometer reports percentage
+    # points and every equation wants the fraction, so asking "porosity?" alone
+    # invites a silent factor of 100 -- and the two are only distinguishable by
+    # eye when the value happens to be above 1.
+    porosity_unit = _prompt_unit(
+        "    Porosity unit", sample.get("porosity_unit") or "fraction",
+        "fraction | %", units.normalize_porosity_unit,
+    )
+    sample["porosity_unit"] = porosity_unit
+    porosity = _optional_float(f"    Porosity ({porosity_unit}, blank to skip)")
     if porosity is not None:
-        sample["porosity_fraction"] = porosity
+        sample["porosity"] = porosity
+        uncertainty = _optional_float(
+            f"    Porosity uncertainty ({porosity_unit}, blank to skip)"
+        )
+        if uncertainty is not None:
+            sample["porosity_uncertainty"] = uncertainty
         if not inherited or not sample.get("porosity_method"):
             sample["porosity_method"] = typer.prompt(
                 "    Porosity method", default=sample.get("porosity_method") or "",
@@ -2502,6 +2522,9 @@ def _build_group(
     """Assemble one side: its confirmed runs, their budgets, and a fit if possible."""
     from gasperm.comparison import MeasurementGroup
     from gasperm.klinkenberg import fit_klinkenberg
+    from pydantic import ValidationError
+
+    from gasperm.config.sample import SampleConfig
     from gasperm.storage import read_run_metadata, summary_from_run
 
     usable = [r for r in records if r.purpose != "leak_test"]
@@ -2525,7 +2548,15 @@ def _build_group(
         if porosity_uncertainty is None and record.metadata_path is not None:
             stored = read_run_metadata(record.metadata_path)
             sample = (stored.get("config") or {}).get("sample") or {}
-            porosity_uncertainty = sample.get("porosity_uncertainty")
+            # Through the schema rather than off the raw key: the stored value
+            # is in that run's own porosity_unit, which may be percentage
+            # points, and the comparison works in fractions throughout.
+            try:
+                porosity_uncertainty = SampleConfig.model_validate(
+                    sample
+                ).porosity_uncertainty_fraction
+            except ValidationError:
+                porosity_uncertainty = sample.get("porosity_uncertainty")
 
     if not summaries:
         _fail(

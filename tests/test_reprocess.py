@@ -75,7 +75,7 @@ def record_steady_run(tmp_path) -> tuple[Path, Path, object]:
     config.run.steady_state.min_samples = 3
     config.hardware.daq.sample_rate_hz = 200.0
     config.run.max_samples = 700
-    config.sample.porosity_fraction = 0.10
+    config.sample.porosity = 0.10
 
     provider = build_provider(config.run.gas)
     loop = AcquisitionLoop(
@@ -102,7 +102,7 @@ def record_pulse_run(tmp_path) -> tuple[Path, Path, object]:
     for side in ("upstream", "downstream"):
         getattr(config.hardware.reservoirs, side).vessel = 8.0
         getattr(config.hardware.reservoirs, side).dead = 0.0
-    config.sample.porosity_fraction = 0.10
+    config.sample.porosity = 0.10
     config.sample.porosity_uncertainty = 0.01
     config.run.pulse_decay.fit_bin_s = None
     config.run.pulse_decay.min_fit_samples = 10

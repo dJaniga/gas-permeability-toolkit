@@ -791,6 +791,48 @@ class TestCollectDownstreamFlag:
         assert "neither a number nor 'measured'" in result.output
 
 
+class TestPorosityUnitOnTheCommandLine:
+    """A percentage porosity, end to end through new-sample."""
+
+    def test_a_bare_percent_sign_is_accepted(self, tmp_path):
+        """`%` is a YAML directive indicator, so --set must not parse it as YAML."""
+        rig = tmp_path / "rig"
+        init_config(rig)
+        path = add_sample(
+            rig / "samples", "core-041",
+            "porosity_unit=%", "porosity=10.4", "porosity_uncertainty=0.5",
+        )
+        sample = read_sample(path)
+        assert sample.porosity_unit == "%"
+        assert sample.porosity_fraction == pytest.approx(0.104)
+        assert sample.porosity_uncertainty_fraction == pytest.approx(0.005)
+
+    def test_a_fraction_is_still_the_default(self, tmp_path):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        path = add_sample(rig / "samples", "core-042", "porosity=0.104")
+        assert read_sample(path).porosity_fraction == pytest.approx(0.104)
+
+    def test_a_percentage_left_labelled_a_fraction_is_refused(self, tmp_path):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        result = runner.invoke(
+            app,
+            ["new-sample", "core-043", "--dir", str(rig / "samples"), "-n", "--force",
+             "--set", "porosity=10.4"],
+        )
+        assert result.exit_code == 1
+        assert "more than the whole rock" in strip_ansi(result.output)
+
+    def test_the_template_documents_both_spellings(self, tmp_path):
+        rig = tmp_path / "rig"
+        init_config(rig)
+        path = add_sample(rig / "samples", "core-044")
+        text = path.read_text(encoding="utf-8")
+        assert "fraction | %" in text
+        assert "half a percentage point" in text
+
+
 class TestCollectFooter:
     """The count printed after a run. Deliberately says nothing about targets."""
 

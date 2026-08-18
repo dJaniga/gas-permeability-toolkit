@@ -39,6 +39,7 @@ __all__ = [
     "SUPPORTED_COMPRESSIBILITY_UNITS",
     "SUPPORTED_PERMEABILITY_UNITS",
     "SUPPORTED_TEMPERATURE_UNITS",
+    "SUPPORTED_POROSITY_UNITS",
     "ATM_IN_PA",
     "to_pa",
     "from_pa",
@@ -72,6 +73,9 @@ __all__ = [
     "fahrenheit_to_celsius",
     "circle_area_cm2",
     "normalize_pressure_unit",
+    "normalize_porosity_unit",
+    "porosity_to_fraction",
+    "porosity_from_fraction",
 ]
 
 
@@ -483,6 +487,60 @@ def darcy_to(value_darcy: float, unit: str) -> float:
 def darcy_from(value: float, unit: str) -> float:
     """Convert a permeability expressed in ``unit`` back to darcy."""
     return value / _PER_DARCY[_normalize_permeability_unit(unit)]
+
+
+# --------------------------------------------------------------------------
+# Porosity
+# --------------------------------------------------------------------------
+
+#: Porosity is dimensionless, so the "unit" only says where the decimal point
+#: is. Both spellings are in daily use -- a helium pycnometer reports 10.4 p.u.
+#: while every equation wants 0.104 -- and transcribing between them by hand is
+#: exactly the sort of silent factor-of-100 this package exists to avoid.
+SUPPORTED_POROSITY_UNITS: frozenset[str] = frozenset({"fraction", "%"})
+
+_POROSITY_ALIASES: dict[str, str] = {
+    "fraction": "fraction",
+    "frac": "fraction",
+    "-": "fraction",
+    "": "fraction",
+    "v/v": "fraction",
+    "%": "%",
+    "percent": "%",
+    "pct": "%",
+    # "porosity units" -- petrophysics for percentage points.
+    "pu": "%",
+    "p.u.": "%",
+}
+
+_POROSITY_PER_FRACTION: dict[str, float] = {"fraction": 1.0, "%": 100.0}
+
+
+def normalize_porosity_unit(unit: str) -> str:
+    """Canonical spelling of a porosity unit, or raise."""
+    canonical = _POROSITY_ALIASES.get(unit.strip().lower())
+    if canonical is None:
+        supported = ", ".join(sorted(SUPPORTED_POROSITY_UNITS))
+        raise ValueError(
+            f"Unsupported porosity unit {unit!r}. Supported units: {supported} "
+            "(aliases: frac, v/v, percent, pct, pu, p.u.)."
+        )
+    return canonical
+
+
+def porosity_to_fraction(value: float, unit: str) -> float:
+    """Convert a porosity in ``unit`` to a fraction, the internal form.
+
+    Applies to an **uncertainty** exactly as it does to a value: ``u(phi)`` is
+    quoted in the same unit as ``phi``, so 0.5 alongside a porosity in ``%`` is
+    half a percentage point, not half a percent of the reading.
+    """
+    return value / _POROSITY_PER_FRACTION[normalize_porosity_unit(unit)]
+
+
+def porosity_from_fraction(value_fraction: float, unit: str) -> float:
+    """Convert a fractional porosity out to ``unit``, for display."""
+    return value_fraction * _POROSITY_PER_FRACTION[normalize_porosity_unit(unit)]
 
 
 # --------------------------------------------------------------------------
