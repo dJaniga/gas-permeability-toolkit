@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from gasperm import units
+from gasperm.screens import WindowMode
 from gasperm.config.common import (
     PressureUnit,
     UncertaintySpec,
@@ -389,6 +390,20 @@ class LivePlotConfig(_Base):
     #: to this many; the from-t0 view decimates to stay inside it, so a
     #: multi-hour run still spans the whole x-axis without unbounded memory.
     max_points: int = Field(default=3600, gt=1)
+    #: Which monitor to open the window on, 1-based, or ``null`` to leave it
+    #: wherever the desktop puts it. A rig bench usually has the console on one
+    #: screen and the live plot left running for hours on the other.
+    monitor: int | None = Field(default=None, ge=1)
+    #: How much of that screen to take. ``fullscreen`` covers the monitor
+    #: including the taskbar and drops the title bar; ``maximised`` fills the
+    #: work area and keeps it, which is usually what you want for a window you
+    #: may need to close.
+    window: WindowMode = "normal"
+
+    @field_validator("window", mode="before")
+    @classmethod
+    def _accept_either_spelling(cls, value: str) -> str:
+        return "maximised" if value == "maximized" else value
 
     @field_validator("panels")
     @classmethod

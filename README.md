@@ -223,6 +223,16 @@ gasperm collect --sample samples/core-041.yaml --leak-test
 | `--spacer TYPE:LENGTH` | repeatable; upstream spacers, pulse decay only |
 | `--plot`, `--plot-window`, `--plot-from-start`, `--plot-panels` | live view |
 
+On a two-screen bench, put the live window on the other monitor once in
+`run.yaml` and every plot follows — `collect`, `preview`, `klinkenberg`,
+`compare`:
+
+```yaml
+plot:
+  monitor: 2          # 1-based; null = wherever the desktop puts it
+  window: fullscreen  # normal | maximised | fullscreen
+```
+
 The result comes from the **detected steady-state window**; a run that never
 settles is written in full but marked not representative, and `klinkenberg`
 refuses it unless you pass `--allow-unsteady`. Exit code 2 means the run

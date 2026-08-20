@@ -1417,6 +1417,7 @@ def preview_command(
                 max_points=config.run.plot.max_points,
                 redraw_interval_s=config.run.plot.redraw_interval_s,
                 device_name=config.daq.device_name,
+                plot_config=config.run.plot,
             ).open()
         except PlottingUnavailable as exc:
             typer.secho(f"warning: live plot unavailable: {exc}", fg=typer.colors.YELLOW)
@@ -2743,10 +2744,11 @@ def compare_command(
         try:
             from gasperm.plotting import PlottingUnavailable, plot_comparison
 
+            plot_config = _plot_config_for(config_dir)
             path = (output.with_suffix(".png") if output else None)
             saved_plot = plot_comparison(
                 result, before_group.klinkenberg, after_group.klinkenberg, path=path,
-                show=path is None,
+                show=path is None, plot_config=plot_config,
             )
             if saved_plot is not None:
                 typer.secho(f"Plot written to {saved_plot}", fg=typer.colors.GREEN)
@@ -2881,6 +2883,21 @@ def _resolve_sample_id(value: str) -> str:
     if looks_like_a_path:
         _fail(f"No such sample file: {value}")
     return value
+
+
+def _plot_config_for(config_dir: Path):
+    """``run.yaml``'s plot section, for window placement on a chosen monitor.
+
+    ``klinkenberg`` and ``compare`` work over stored runs and do not otherwise
+    need a rig config, so this is best-effort: no run.yaml means no placement,
+    which is the same as not asking for any.
+    """
+    from gasperm.config import RUN_FILENAME, load_run_config
+
+    try:
+        return load_run_config(config_dir / RUN_FILENAME).plot
+    except ConfigError:
+        return None
 
 
 def _resolve_runs_dir(runs_dir: Path | None, config_dir: Path) -> Path:
@@ -3177,10 +3194,12 @@ def klinkenberg_command(
         if plot:
             base = destination if destination is not None else Path("klinkenberg.yaml")
             image_path = base.with_suffix(".png")
+        plot_config = _plot_config_for(config_dir)
         try:
             saved = plot_klinkenberg(
                 result, path=image_path, show=show,
                 permeability_unit=permeability_unit, pressure_unit=pressure_unit,
+                plot_config=plot_config,
             )
         except PlottingUnavailable as exc:
             typer.secho(f"warning: {exc}", fg=typer.colors.YELLOW)

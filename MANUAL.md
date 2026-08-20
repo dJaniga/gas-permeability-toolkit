@@ -113,6 +113,48 @@ Plotting never blocks acquisition: samples go into a bounded buffer with an O(1)
 append and the figure redraws on a timer. If the window is closed mid-run, or no
 display is available, the plot disables itself and the run carries on.
 
+### Which monitor it opens on
+
+A rig bench usually has the console on one screen and the live plot left running
+for hours on the other. Set it once and every plot window follows — `collect`,
+`preview`, and the interactive `klinkenberg` and `compare` figures:
+
+```yaml
+plot:
+  monitor: 2          # 1-based; null = wherever the desktop puts it
+  window: fullscreen  # normal | maximised | fullscreen
+```
+
+`maximised` fills the work area and keeps the title bar, which is usually what
+you want for a window you may need to close; `fullscreen` covers the monitor
+including the taskbar and drops the frame.
+
+Placement is **best-effort in every direction**, because a plot is additive to a
+run and placement is additive to the plot. An unplugged monitor, a backend
+without geometry control, or a failed OS query all leave the window where it
+would have opened anyway. The one thing that is never silent is asking for a
+screen that is not there:
+
+```
+WARNING plot.monitor is 2 but this machine reports 1 screen(s)
+        (screen 1: 1920x1080 at (0,0) (primary)). Using screen 1 instead --
+        plug the second monitor in, or set plot.monitor: null.
+```
+
+Monitors are enumerated through the Windows API rather than the toolkit, because
+Tk — the backend matplotlib picks by default here — cannot see individual
+monitors at all and reports one merged desktop. On other platforms the query is
+not implemented and placement is skipped rather than guessed at.
+
+**On mixed-DPI desktops** a caveat applies. Python with Tk is normally a
+DPI-unaware process, so both the OS query and the toolkit report *virtualised*
+coordinates. That is harmless while every monitor runs at the same scaling — the
+two agree and placement is self-consistent — but a 150 %-scaled laptop panel
+beside a 100 % external screen makes the virtual rectangles disagree with the
+physical ones, and the window can land short. Making the process DPI-aware would
+fix the coordinates and shrink every plot's text, so it is deliberately not done;
+matching the scaling of the two monitors is the cheaper fix.
+
 ## A supplied downstream pressure
 
 P2 is the outlet transducer by default. When the outlet vents to atmosphere and

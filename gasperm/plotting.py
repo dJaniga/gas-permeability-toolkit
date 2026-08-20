@@ -29,7 +29,7 @@ from bisect import bisect_left
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
 
-from gasperm import units
+from gasperm import screens, units
 from gasperm.config import GaspermConfig
 from gasperm.config.run import METHOD_ONLY_PANELS
 from gasperm.models import KlinkenbergResult, Reading, SteadyStateStatus
@@ -66,6 +66,34 @@ _MAX_BAND_ZOOM = 4.0
 
 class PlottingUnavailable(RuntimeError):
     """matplotlib is not installed or no usable backend is available."""
+
+
+def place_figure(figure: Any, plot_config: Any) -> str:
+    """Move a figure's window onto the configured monitor.
+
+    Best-effort in every direction: no manager, no window, an unsupported
+    backend or an absent monitor all leave the window where it was. A plot is
+    additive to a run and placement is additive to the plot -- neither may take
+    anything down with it.
+
+    Returns what was done, or ``""``, so the caller can log it once.
+    """
+    if plot_config is None:
+        return ""
+    monitor = getattr(plot_config, "monitor", None)
+    mode = getattr(plot_config, "window", "normal")
+    if monitor is None and mode == "normal":
+        return ""
+
+    screen, complaint = screens.choose_screen(screens.list_screens(), monitor)
+    if complaint:
+        logger.warning("%s", complaint)
+    try:
+        window = figure.canvas.manager.window
+    except AttributeError:
+        logger.debug("This backend has no window to place.")
+        return ""
+    return screens.place_window(window, screen, mode)
 
 
 def _pyplot(interactive: bool):
@@ -373,8 +401,11 @@ class _StackedPlot:
         max_points: int,
         redraw_interval_s: float,
         window_title: str,
+        plot_config: Any = None,
     ) -> None:
         self._panels = list(panels)
+        #: Supplies the monitor and window mode; ``None`` places nothing.
+        self._plot_config = plot_config
         self.window_s = window_s
         self.redraw_interval_s = redraw_interval_s
         self._window_title = window_title
@@ -409,6 +440,9 @@ class _StackedPlot:
         # Reserve the strip the status line is written into. Done once, here,
         # rather than re-running tight_layout on every redraw.
         figure.subplots_adjust(top=1.0 - 0.62 / figure.get_figheight())
+        placed = place_figure(figure, self._plot_config)
+        if placed:
+            logger.info("Plot window %s.", placed)
         self._figure = figure
         self._axes = axes
         self._plt = plt
@@ -573,6 +607,7 @@ class LivePlot(_StackedPlot):
                 else plot_config.redraw_interval_s
             ),
             window_title=f"gasperm - {config.sample.id} ({config.gas.name})",
+            plot_config=plot_config,
         )
 
     def open(self) -> LivePlot:
@@ -720,6 +755,7 @@ class PreviewPlot(_StackedPlot):
         max_points: int = DEFAULT_MAX_POINTS,
         redraw_interval_s: float = 0.5,
         device_name: str = "",
+        plot_config: Any = None,
     ) -> None:
         """Args:
         signals: :class:`gasperm.preview.PreviewSignal` objects to stack.
@@ -749,6 +785,7 @@ class PreviewPlot(_StackedPlot):
             max_points=max_points,
             redraw_interval_s=redraw_interval_s,
             window_title=f"gasperm preview{f' - {device_name}' if device_name else ''}",
+            plot_config=plot_config,
         )
 
     def open(self) -> PreviewPlot:
@@ -842,6 +879,7 @@ def plot_klinkenberg(
     show: bool = False,
     permeability_unit: str = "mD",
     pressure_unit: str = "atm",
+    plot_config: Any = None,
 ) -> Path | None:
     """Plot ``k_g`` against ``1 / P_mean`` with the fitted line.
 
@@ -946,6 +984,9 @@ def plot_klinkenberg(
         saved.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(saved, dpi=150)
     if show:
+        # Only an interactive figure has a window to place; a saved-only one
+        # runs on Agg and has none.
+        place_figure(figure, plot_config)
         plt.show()
     else:
         plt.close(figure)
@@ -961,6 +1002,7 @@ def plot_comparison(
     show: bool = False,
     permeability_unit: str = "mD",
     pressure_unit: str = "atm",
+    plot_config: Any = None,
 ) -> Path | None:
     """Plot two campaigns against each other: the fits, and the change.
 
@@ -1100,6 +1142,9 @@ def plot_comparison(
         saved.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(saved, dpi=150)
     if show:
+        # Only an interactive figure has a window to place; a saved-only one
+        # runs on Agg and has none.
+        place_figure(figure, plot_config)
         plt.show()
     else:
         plt.close(figure)
@@ -1120,6 +1165,7 @@ def plot_pulse_decay(
     path: str | Path | None = None,
     show: bool = False,
     pressure_unit: str = "kPa",
+    plot_config: Any = None,
 ) -> Path | None:
     """Plot the fitted decay and its residuals.
 
@@ -1218,6 +1264,9 @@ def plot_pulse_decay(
         saved.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(saved, dpi=150)
     if show:
+        # Only an interactive figure has a window to place; a saved-only one
+        # runs on Agg and has none.
+        place_figure(figure, plot_config)
         plt.show()
     else:
         plt.close(figure)

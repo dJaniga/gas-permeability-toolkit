@@ -841,6 +841,8 @@ def render_run_yaml(config: GaspermConfig) -> str:
         "plot.window_s": "trailing seconds to show; null = whole run from t0",
         "plot.show_criteria": "draw the steady-state bands and drift line",
         "plot.max_points": "per series; the from-t0 view decimates to fit",
+        "plot.monitor": "1-based screen to open on; null = wherever the desktop puts it",
+        "plot.window": "normal | maximised | fullscreen",
         "display_pressure_unit": "console/plot only",
         "display_permeability_unit": "mD | D | uD | um2 | m2",
         "duration_s": "null = run until Ctrl+C",
