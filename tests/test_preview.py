@@ -238,23 +238,28 @@ class TestResolution:
         config.run.flowmeter = "high_range"
         assert [s.key for s in resolve_signals(config, ["flow"])] == ["flow.high_range"]
 
-    def test_pulse_selects_both_halves_of_the_differential(self):
+    def test_pulse_selects_both_halves_of_the_differential_and_the_difference(self):
         from gasperm.config import PulseTransducersConfig
 
         config = GaspermConfig()
         config.hardware.pulse_transducers = PulseTransducersConfig()
         signals = resolve_signals(config, ["pulse"])
-        assert [s.key for s in signals] == ["pulse_upstream", "pulse_downstream"]
-        assert [s.channel for s in signals] == ["ai4", "ai5"]
+        assert [s.key for s in signals] == [
+            "pulse_upstream", "pulse_downstream", "pulse_dp"
+        ]
+        assert [s.channel for s in signals] == ["ai4", "ai5", "ai4"]
+        assert preview_channel_specs(signals) and [
+            spec.name for spec in preview_channel_specs(signals)
+        ] == ["ai4", "ai5"]
 
     def test_pulse_works_on_a_rig_with_no_dedicated_pair(self):
         signals = resolve_signals(GaspermConfig(), ["pulse"])
-        assert [s.channel for s in signals] == ["ai0", "ai1"]
+        assert [s.channel for s in signals] == ["ai0", "ai1", "ai0"]
 
-    def test_a_unit_on_a_pair_applies_to_both(self):
+    def test_a_unit_on_a_group_applies_to_every_member(self):
         """Two halves of one differential in different units is unreadable."""
         signals = resolve_signals(GaspermConfig(), ["pulse:bar"])
-        assert [s.unit for s in signals] == ["bar", "bar"]
+        assert [s.unit for s in signals] == ["bar", "bar", "bar"]
 
     def test_pressure_is_a_pair_too(self):
         signals = resolve_signals(GaspermConfig(), ["pressure"])
@@ -269,7 +274,7 @@ class TestResolution:
         the banner note -- but the DAQ task must still name each input once."""
         signals = resolve_signals(GaspermConfig(), ["pulse", "inlet_pressure"])
         assert [s.key for s in signals] == [
-            "pulse_upstream", "pulse_downstream", "inlet_pressure"
+            "pulse_upstream", "pulse_downstream", "pulse_dp", "inlet_pressure"
         ]
         assert [spec.name for spec in preview_channel_specs(signals)] == ["ai0", "ai1"]
 
@@ -476,6 +481,157 @@ class TestLoop:
     def test_a_non_positive_rate_is_refused(self):
         with pytest.raises(ValueError, match="must be positive"):
             PreviewLoop([], None, None, rate_hz=0.0)
+
+
+def rig_with_pulse_pair():
+    """The shipped rig plus its dedicated 0-100 bar pair on ai4/ai5, 0-10 V."""
+    from gasperm.config import PulseTransducersConfig
+
+    config = GaspermConfig()
+    config.hardware.pulse_transducers = PulseTransducersConfig()
+    return config
+
+
+class TestPulseDifferential:
+    """``pulse_dp``: the quantity pulse decay measures, which neither panel shows.
+
+    A pulse is a fraction of a percent of either absolute trace, so it stays
+    invisible until the difference gets its own panel. These check that the
+    number on that panel really is the difference of the two above it -- and
+    that it never pretends to be a voltage, because no wire carries it.
+    """
+
+    def dp_from(self, config, source_factory, *, up, down, channels=("ai4", "ai5")):
+        """One sample through the real loop; returns its dP."""
+        signals = resolve_signals(config, ["pulse_dp"])
+        clock = _Clock()
+        loop = PreviewLoop(
+            signals,
+            source_factory(dict(zip(channels, (up, down)))),
+            None, rate_hz=10.0, max_samples=1, clock=clock, sleep=clock.sleep,
+        )
+        loop.run(install_signal_handler=False)
+        return loop.latest
+
+    def test_it_is_offered_next_to_the_pair_it_subtracts(self):
+        catalogue = available_signals(rig_with_pulse_pair())
+        keys = list(catalogue)
+        assert keys.index("pulse_dp") == keys.index("pulse_downstream") + 1
+        signal = catalogue["pulse_dp"]
+        assert signal.label == "dP"
+        assert signal.is_differential
+        assert (signal.channel, signal.subtracted.channel) == ("ai4", "ai5")
+
+    def test_it_is_the_difference_of_the_two_panels_above_it(self):
+        """0-10 V over 0-100 bar: 6 V against 5 V is 10 bar, hand-checkable."""
+        config = rig_with_pulse_pair()
+        config.run.display_pressure_unit = "kPa"
+        catalogue = available_signals(config)
+        difference = (
+            catalogue["pulse_upstream"].convert(6.0)
+            - catalogue["pulse_downstream"].convert(5.0)
+        )
+        assert catalogue["pulse_dp"].unit == "kPa"
+        assert difference == pytest.approx(units.from_atm(units.to_atm(10.0, "bar"), "kPa"))
+
+    def test_the_loop_computes_it_from_both_channels(self, fake_analog_source):
+        config = rig_with_pulse_pair()
+        config.run.display_pressure_unit = "bar"
+        sample = self.dp_from(config, fake_analog_source, up=6.0, down=5.0)
+        assert sample.values["pulse_dp"] == pytest.approx(10.0)
+
+    def test_it_shows_the_zero_mismatch_a_holding_rig_still_has(
+        self, fake_analog_source
+    ):
+        """What the pulse-decay fit's free offset exists to absorb; see it first."""
+        config = rig_with_pulse_pair()
+        config.run.display_pressure_unit = "bar"
+        sample = self.dp_from(config, fake_analog_source, up=5.0, down=5.02)
+        assert sample.values["pulse_dp"] == pytest.approx(-0.2)
+
+    def test_a_gauge_pair_does_not_add_atmospheric_twice(self, fake_analog_source):
+        """dP is a difference, so the atmospheric term cancels out of it."""
+        config = rig_with_pulse_pair()
+        absolute = self.dp_from(config, fake_analog_source, up=6.0, down=5.0)
+        for end in ("upstream", "downstream"):
+            getattr(config.hardware.pulse_transducers, end).reading_type = "gauge"
+        gauge = self.dp_from(config, fake_analog_source, up=6.0, down=5.0)
+        assert gauge.values["pulse_dp"] == pytest.approx(absolute.values["pulse_dp"])
+
+    def test_it_carries_no_raw_value(self, fake_analog_source):
+        """A difference of two voltages is not one, so there is nothing to store."""
+        sample = self.dp_from(
+            rig_with_pulse_pair(), fake_analog_source, up=6.0, down=5.0
+        )
+        assert "pulse_dp" not in sample.raw
+        assert "pulse_dp" in sample.values
+
+    def test_selecting_it_alone_still_opens_both_channels(self):
+        signals = resolve_signals(rig_with_pulse_pair(), ["pulse_dp"])
+        specs = preview_channel_specs(signals)
+        assert [spec.name for spec in specs] == ["ai4", "ai5"]
+        assert all((s.min_volts, s.max_volts) == (0.0, 10.0) for s in specs)
+
+    def test_the_whole_group_still_opens_each_input_once(self):
+        signals = resolve_signals(rig_with_pulse_pair(), ["pulse"])
+        assert [spec.name for spec in preview_channel_specs(signals)] == ["ai4", "ai5"]
+
+    def test_it_takes_its_own_unit_not_the_upstream_panels(self):
+        """`pulse_upstream:bar` and `pulse_dp:kPa` must not cross over."""
+        signals = resolve_signals(
+            rig_with_pulse_pair(), ["pulse_upstream:bar", "pulse_dp:kPa"]
+        )
+        dp = signals[1]
+        assert dp.unit == "kPa"
+        assert dp.convert(6.0) - dp.subtracted.convert(5.0) == pytest.approx(
+            units.from_atm(units.to_atm(10.0, "bar"), "kPa")
+        )
+
+    def test_a_unit_from_the_wrong_family_is_refused(self):
+        with pytest.raises(PreviewError, match="pressure unit"):
+            resolve_signals(rig_with_pulse_pair(), ["pulse_dp:sccm"])
+
+    def test_it_stays_in_its_unit_under_volts(self):
+        signals = resolve_signals(rig_with_pulse_pair(), ["pulse_dp"])
+        dp = signals[0]
+        assert dp.calibrated_only is True
+        assert dp.shown_as_volts(volts=True) is False
+        assert "dP (kPa)" in preview_header(signals, volts=True)
+        sample = PreviewSample(0, 0.0, {"pulse_dp": 1000.0}, {})
+        assert "1000" in format_preview_line(sample, signals, volts=True)
+
+    def test_the_default_selection_includes_it_with_a_dedicated_pair(self):
+        assert "pulse_dp" in default_selection(rig_with_pulse_pair())
+        assert "pulse_dp" not in default_selection(GaspermConfig())
+
+    def test_it_can_still_be_asked_for_on_a_rig_without_a_dedicated_pair(self):
+        """The steady-state differential is worth watching too."""
+        signals = resolve_signals(GaspermConfig(), ["pulse_dp"])
+        assert (signals[0].channel, signals[0].subtracted.channel) == ("ai0", "ai1")
+        assert "NO dedicated pulse pair" in signals[0].detail
+
+    def test_it_gets_its_own_plot_panel_in_its_own_unit(self):
+        from gasperm.plotting import PreviewPlot
+
+        signals = resolve_signals(rig_with_pulse_pair(), ["pulse"])
+        plot = PreviewPlot(signals, volts=True).open()
+        try:
+            assert [p.key for p in plot._panels] == [
+                "pulse_upstream", "pulse_downstream", "pulse_dp"
+            ]
+            # --volts relabels the two transducers but not their difference.
+            assert [p.ylabel for p in plot._panels] == ["pP1 (V)", "pP2 (V)", "dP (kPa)"]
+            plot.add(
+                PreviewSample(
+                    0, 0.0,
+                    {"pulse_upstream": 6e5, "pulse_downstream": 5e5, "pulse_dp": 1e5},
+                    {"pulse_upstream": 6.0, "pulse_downstream": 5.0},
+                )
+            )
+            assert plot._history.recent["pulse_upstream"] == [6.0]
+            assert plot._history.recent["pulse_dp"] == [1e5]
+        finally:
+            plot.close()
 
 
 class TestConsole:

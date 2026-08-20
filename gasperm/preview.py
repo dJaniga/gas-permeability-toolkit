@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "PreviewError",
+    "SignalSource",
     "PreviewSignal",
     "PreviewSample",
     "PreviewLoop",
@@ -93,6 +94,23 @@ class PreviewError(ValueError):
 
 
 @dataclass(frozen=True)
+class SignalSource:
+    """One DAQ channel behind a signal: where it is, and how its volts convert.
+
+    Most signals are one channel and carry these fields directly; a
+    *differential* reads a second one, and this is what describes it.
+    """
+
+    channel: str
+    #: The range this channel must be added to the DAQ task at.
+    volts_range: tuple[float, float]
+    #: Volts -> display value.
+    convert: Callable[[float], float]
+    #: Label for DAQ log messages; the signal's own key by default.
+    role: str = ""
+
+
+@dataclass(frozen=True)
 class PreviewSignal:
     """One previewable quantity: where it comes from and how it is displayed.
 
@@ -117,11 +135,54 @@ class PreviewSignal:
     detail: str
     #: ``True`` when this signal has no calibration and can only be volts.
     raw_only: bool = False
+    #: A second channel *subtracted* from this one, making the signal a
+    #: differential: ``convert(volts[channel]) - subtracted.convert(...)``.
+    subtracted: SignalSource | None = None
+    #: ``True`` when this signal exists only in its unit and has no meaningful
+    #: raw value -- the mirror of ``raw_only``. See :func:`_pulse_dp_signal`.
+    calibrated_only: bool = False
 
     @property
     def from_probe(self) -> bool:
         """Whether this signal comes from the serial probe rather than the DAQ."""
         return self.channel is None
+
+    @property
+    def is_differential(self) -> bool:
+        """Whether this signal is the difference of two channels."""
+        return self.subtracted is not None
+
+    def shown_as_volts(self, *, volts: bool) -> bool:
+        """Whether this signal's column shows the raw voltage in this mode.
+
+        ``--volts`` is a request, not a guarantee: an uncalibrated channel is
+        volts whether or not it was asked for, and a differential has no single
+        voltage to show, so it declines.
+        """
+        if self.calibrated_only:
+            return False
+        return volts or self.raw_only
+
+    def display_unit(self, *, volts: bool) -> str:
+        """The unit this signal's column is headed with in this mode."""
+        return "V" if self.shown_as_volts(volts=volts) else self.unit
+
+    def sources(self) -> tuple[SignalSource, ...]:
+        """Every DAQ channel this signal reads, in ``convert``'s order.
+
+        Empty for the probe, which is not on the DAQ at all.
+        """
+        if self.channel is None:
+            return ()
+        primary = SignalSource(
+            channel=self.channel,
+            volts_range=self.volts_range or RAW_CHANNEL_RANGE_V,
+            convert=self.convert,
+            role=self.key,
+        )
+        if self.subtracted is None:
+            return (primary,)
+        return (primary, self.subtracted)
 
 
 @dataclass(frozen=True)
@@ -161,10 +222,10 @@ def _range_text(low: float, high: float) -> str:
     return f"{low:g}-{high:g} V"
 
 
-def _pressure_signal(
-    key: str, label: str, channel: str, channel_config, atmospheric_atm: float, unit: str
-) -> PreviewSignal:
-    """A calibrated transducer, shown as **absolute** pressure.
+def _pressure_source(
+    key: str, channel: str, channel_config, atmospheric_atm: float, unit: str
+) -> tuple[SignalSource, str]:
+    """One calibrated transducer as a DAQ source, with its banner text.
 
     Absolute, not gauge, because that is the number every other part of the
     package works in -- a preview that disagreed with what ``collect`` would
@@ -177,17 +238,73 @@ def _pressure_signal(
     transducer = PressureChannel.from_config(key, channel, channel_config, atmospheric_atm)
     low, high = transducer.voltage_range
     sense = "gauge +atm" if transducer.is_gauge else "absolute"
+    source = SignalSource(
+        channel=channel,
+        volts_range=(low, high),
+        convert=lambda volts: units.from_atm(transducer.volts_to_absolute_atm(volts), unit),
+        role=key,
+    )
+    detail = (
+        f"{channel}  {_range_text(low, high)} -> "
+        f"{channel_config.value_min:g}-{channel_config.value_max:g} "
+        f"{channel_config.unit} ({sense})"
+    )
+    return source, detail
+
+
+def _pressure_signal(
+    key: str, label: str, channel: str, channel_config, atmospheric_atm: float, unit: str
+) -> PreviewSignal:
+    """A calibrated transducer, shown as **absolute** pressure."""
+    source, detail = _pressure_source(key, channel, channel_config, atmospheric_atm, unit)
     return PreviewSignal(
         key=key,
         label=label,
         unit=unit,
-        channel=channel,
-        volts_range=(low, high),
-        convert=lambda volts: units.from_atm(transducer.volts_to_absolute_atm(volts), unit),
+        channel=source.channel,
+        volts_range=source.volts_range,
+        convert=source.convert,
+        detail=detail,
+    )
+
+
+def _pulse_dp_signal(
+    upstream: SignalSource, downstream: SignalSource, unit: str
+) -> PreviewSignal:
+    """``dP``: the pulse differential itself, upstream minus downstream.
+
+    This is the quantity pulse decay actually measures -- ``P1 - P2`` decaying
+    towards zero -- and neither transducer panel shows it. A 100 kPa pulse
+    riding on 5 MPa of pore pressure is a fraction of a percent of either
+    trace, invisible on an axis scaled to the absolute pressure; on its own
+    panel it is the whole height of the plot. Previewing it is how you see the
+    two things that decide whether a run is worth starting: the **zero
+    mismatch** between the pair, which is what
+    :mod:`gasperm.pulse_decay`'s free-offset fit exists to absorb, and the
+    **noise floor** on the difference, which is what the decay has to be
+    resolved against.
+
+    The subtraction is done on the two *converted absolute* pressures, so a
+    gauge pair's atmospheric term cancels rather than being added twice.
+
+    It is deliberately ``calibrated_only``. There is no wire carrying dP, and
+    a difference of two voltages is a pressure only if both transducers happen
+    to share a span -- which the fallback pair, a wide-range inlet against
+    whatever is on the outlet, need not. Under ``--volts`` the two member
+    panels still show their own voltages; this one keeps its unit.
+    """
+    return PreviewSignal(
+        key="pulse_dp",
+        label="dP",
+        unit=unit,
+        channel=upstream.channel,
+        volts_range=upstream.volts_range,
+        convert=upstream.convert,
+        subtracted=downstream,
+        calibrated_only=True,
         detail=(
-            f"{channel}  {_range_text(low, high)} -> "
-            f"{channel_config.value_min:g}-{channel_config.value_max:g} "
-            f"{channel_config.unit} ({sense})"
+            f"{upstream.channel} - {downstream.channel}  differential of the two "
+            f"above, always in {unit} (no wire of its own to show volts for)"
         ),
     )
 
@@ -257,6 +374,7 @@ _FAMILIES: dict[str, str] = {
     "outlet_pressure": "pressure",
     "pulse_upstream": "pressure",
     "pulse_downstream": "pressure",
+    "pulse_dp": "pressure",
     "temperature": "temperature",
 }
 
@@ -310,8 +428,8 @@ def available_signals(
     configured channels, the pulse-decay pair -- **always** offered, resolved
     exactly as a pulse-decay run would resolve it, so it names the dedicated
     transducers when the rig has them and the steady-state pair when it does
-    not -- **every** flowmeter defined rather than only the selected one, and
-    the serial probe.
+    not -- their difference ``pulse_dp``, **every** flowmeter defined rather
+    than only the selected one, and the serial probe.
     """
     overrides = dict(unit_overrides or {})
 
@@ -339,6 +457,14 @@ def available_signals(
     (up_channel, up_config), (down_channel, down_config), dedicated = (
         pulse_transducer_pair(config)
     )
+    # Say which it is. A pulse pair that silently turned out to be the
+    # steady-state transducers is the failure this whole method exists to
+    # avoid -- they cannot resolve a pulse, and the run would look fine.
+    note = (
+        "dedicated pulse transducer"
+        if dedicated
+        else "NO dedicated pulse pair -- falls back to the steady-state transducer"
+    )
     for key, label, channel, channel_config in (
         ("pulse_upstream", "pP1", up_channel, up_config),
         ("pulse_downstream", "pP2", down_channel, down_config),
@@ -347,15 +473,26 @@ def available_signals(
             key, label, channel, channel_config, atmospheric_atm,
             unit_for(key, "pressure"),
         )
-        # Say which it is. A pulse pair that silently turned out to be the
-        # steady-state transducers is the failure this whole method exists to
-        # avoid -- they cannot resolve a pulse, and the run would look fine.
-        note = (
-            "dedicated pulse transducer"
-            if dedicated
-            else "NO dedicated pulse pair -- falls back to the steady-state transducer"
-        )
         signals[key] = replace(signal_, detail=f"{signal_.detail}  [{note}]")
+
+    # dP gets its own pair of sources rather than reusing the two above,
+    # because it has its own unit: `--signal pulse:bar` sets all three, but
+    # `--signal pulse_dp:kPa` sets only this one, and a converter built for
+    # another panel's unit would silently mislabel this one's numbers.
+    dp_unit = unit_for("pulse_dp", "pressure")
+    dp = _pulse_dp_signal(
+        _pressure_source("pulse_upstream", up_channel, up_config, atmospheric_atm, dp_unit)[0],
+        _pressure_source(
+            "pulse_downstream", down_channel, down_config, atmospheric_atm, dp_unit
+        )[0],
+        dp_unit,
+    )
+    dp_note = (
+        "the dedicated pulse pair"
+        if dedicated
+        else "NO dedicated pulse pair -- this is the steady-state differential"
+    )
+    signals["pulse_dp"] = replace(dp, detail=f"{dp.detail}  [{dp_note}]")
 
     for name, meter in hardware.flowmeters.items():
         key = f"flow.{name}"
@@ -374,11 +511,13 @@ def _selected_flow_key(config: GaspermConfig) -> str | None:
     return f"flow.{name}"
 
 
-#: Signals that stand for a *pair*, expanded by :func:`resolve_signals`. A
+#: Signals that stand for a *set*, expanded by :func:`resolve_signals`. A
 #: pulse-decay rig is checked two channels at a time -- the differential is the
-#: measurement -- so naming them one at a time is busywork.
+#: measurement -- so naming them one at a time is busywork. ``pulse`` adds
+#: ``pulse_dp``, since the difference is the quantity the method actually
+#: measures and neither transducer panel shows it.
 GROUPS: dict[str, tuple[str, ...]] = {
-    "pulse": ("pulse_upstream", "pulse_downstream"),
+    "pulse": ("pulse_upstream", "pulse_downstream", "pulse_dp"),
     "pressure": ("inlet_pressure", "outlet_pressure"),
 }
 
@@ -391,9 +530,11 @@ def default_selection(config: GaspermConfig) -> list[str]:
     channel into the DAQ task on a rig that only has one physically connected,
     which fails at open time rather than showing anything.
 
-    The pulse pair is included only when it is **dedicated**. On a rig without
-    one it resolves to the steady-state transducers, and listing it too would
-    draw the same two channels on four panels.
+    The pulse group -- the pair and their difference -- is included only when
+    the pair is **dedicated**. On a rig without one it resolves to the
+    steady-state transducers, and listing it too would draw the same two
+    channels on five panels. ``--signal pulse_dp`` still works there, for a
+    steady-state rig where the differential is worth watching.
     """
     available = available_signals(config)
     dedicated = pulse_transducer_pair(config)[2]
@@ -438,8 +579,9 @@ def resolve_signals(
     Each argument is ``KEY`` or ``KEY:UNIT``. Three conveniences, all resolved
     here so a typo fails before the DAQ is opened:
 
-    * ``pulse`` and ``pressure`` expand to a **pair** -- the two transducers a
-      pulse-decay run would read, and the steady-state pair, respectively.
+    * ``pulse`` and ``pressure`` expand to a **group** -- the two transducers a
+      pulse-decay run would read plus their difference, and the steady-state
+      pair, respectively.
     * ``flow`` is whichever meter ``run.yaml`` selects.
     * a bare ``aiN`` the config does not describe is an uncalibrated,
       volts-only channel.
@@ -500,7 +642,7 @@ def resolve_signals(
         raise PreviewError(
             f"--signal {key!r} is not a signal on this rig. Available: "
             + ", ".join(catalogue)
-            + "; the pairs " + ", ".join(GROUPS) + " and flow. "
+            + "; the groups " + ", ".join(GROUPS) + " and flow. "
             + "Any bare channel name (ai0, ai7, ...) also works, as raw volts."
         )
     return resolved
@@ -510,17 +652,21 @@ def preview_channel_specs(signals: Iterable[PreviewSignal]) -> list[ChannelSpec]
     """The DAQ task for a preview: exactly the selected channels, nothing else.
 
     Two signals may share a channel -- ``flow.low_range`` and a bare ``ai2``,
-    say -- and NI-DAQmx rejects a task that names one input twice, so the first
-    occurrence wins and the second reads the same voltage.
+    say, or ``pulse_dp`` and the two transducers it subtracts -- and NI-DAQmx
+    rejects a task that names one input twice, so the first occurrence wins and
+    the second reads the same voltage.
     """
     specs: list[ChannelSpec] = []
     seen: set[str] = set()
     for signal_ in signals:
-        if signal_.channel is None or signal_.channel in seen:
-            continue
-        seen.add(signal_.channel)
-        low, high = signal_.volts_range or RAW_CHANNEL_RANGE_V
-        specs.append(ChannelSpec(signal_.channel, low, high, role=signal_.key))
+        for source in signal_.sources():
+            if source.channel in seen:
+                continue
+            seen.add(source.channel)
+            low, high = source.volts_range
+            specs.append(
+                ChannelSpec(source.channel, low, high, role=source.role or signal_.key)
+            )
     return specs
 
 
@@ -529,7 +675,7 @@ def describe_signals(signals: Sequence[PreviewSignal], *, volts: bool) -> list[s
     width = max((len(s.key) for s in signals), default=0)
     lines = []
     for signal_ in signals:
-        unit = "V" if volts or signal_.raw_only else signal_.unit
+        unit = signal_.display_unit(volts=volts)
         lines.append(f"  {signal_.key:<{width}}  {unit:>7}   {signal_.detail}")
     return lines
 
@@ -544,8 +690,7 @@ _MIN_COLUMN = 15
 
 
 def _column_heading(signal_: PreviewSignal, *, volts: bool) -> str:
-    unit = "V" if volts or signal_.raw_only else signal_.unit
-    return f"{signal_.label} ({unit})"
+    return f"{signal_.label} ({signal_.display_unit(volts=volts)})"
 
 
 def _column_widths(signals: Sequence[PreviewSignal], *, volts: bool) -> list[int]:
@@ -577,7 +722,7 @@ def format_preview_line(
     """One console line: the elapsed time and one column per signal."""
     parts = [f"{sample.elapsed_s:8.1f}s"]
     for signal_, width in zip(signals, _column_widths(signals, volts=volts)):
-        source = sample.raw if (volts or signal_.raw_only) else sample.values
+        source = sample.raw if signal_.shown_as_volts(volts=volts) else sample.values
         value = source.get(signal_.key)
         text = "--" if value is None else f"{value:.4g}"
         parts.append(f"{text:>{width}}")
@@ -611,6 +756,21 @@ class ConsoleThrottle:
 # --------------------------------------------------------------------------
 # The loop
 # --------------------------------------------------------------------------
+
+
+def _volts_for(
+    signal_: PreviewSignal, channel: str, voltages: Mapping[str, float]
+) -> float:
+    """One channel's voltage out of a DAQ read, or a clear error saying which."""
+    try:
+        return voltages[channel]
+    except KeyError:
+        # The task was built from these same signals, so this means the device
+        # returned a different set than it was configured with.
+        raise KeyError(
+            f"no voltage for {signal_.key} on channel {channel!r}; "
+            f"the DAQ task returned {sorted(voltages)}"
+        ) from None
 
 
 class PreviewLoop:
@@ -701,15 +861,18 @@ class PreviewLoop:
                 raw[signal_.key] = celsius
                 values[signal_.key] = signal_.convert(celsius)
                 continue
-            try:
-                volts = voltages[signal_.channel]
-            except KeyError:
-                # The task was built from these same signals, so this means the
-                # device returned a different set than it was configured with.
-                raise KeyError(
-                    f"no voltage for {signal_.key} on channel {signal_.channel!r}; "
-                    f"the DAQ task returned {sorted(voltages)}"
-                ) from None
+            volts = _volts_for(signal_, signal_.channel, voltages)
+            if signal_.subtracted is not None:
+                other = signal_.subtracted
+                # Both halves are converted to the display unit first and then
+                # subtracted, so a gauge pair's atmospheric term cancels
+                # instead of being counted twice. There is no single raw value
+                # for a difference, so it gets no `raw` entry -- see
+                # PreviewSignal.calibrated_only.
+                values[signal_.key] = signal_.convert(volts) - other.convert(
+                    _volts_for(signal_, other.channel, voltages)
+                )
+                continue
             raw[signal_.key] = volts
             values[signal_.key] = signal_.convert(volts)
 

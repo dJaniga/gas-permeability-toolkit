@@ -1259,9 +1259,10 @@ def preview_command(
         help="Signal to preview, e.g. 'inlet_pressure' or 'inlet_pressure:bar'. "
              "Repeat for more. 'pulse' selects both transducers a pulse-decay "
              "run would read -- the dedicated pair when the rig has one, the "
-             "steady-state pair when it does not. A bare channel name (ai7) "
-             "previews an uncalibrated input as raw volts. Default: every "
-             "signal this rig defines. See --list.",
+             "steady-state pair when it does not -- plus 'pulse_dp', their "
+             "difference, which is what the method measures. A bare channel "
+             "name (ai7) previews an uncalibrated input as raw volts. Default: "
+             "every signal this rig defines. See --list.",
     ),
     list_signals: bool = typer.Option(
         False, "--list",
@@ -1271,7 +1272,9 @@ def preview_command(
     volts: bool = typer.Option(
         False, "--volts",
         help="Show raw voltages instead of calibrated values -- what the wire "
-             "is doing, before any calibration has an opinion about it.",
+             "is doing, before any calibration has an opinion about it. A "
+             "differential like pulse_dp has no wire of its own and stays in "
+             "its pressure unit.",
     ),
     plot: bool = typer.Option(
         False, "--plot", help="Open a live window, one stacked panel per signal."
@@ -1332,7 +1335,7 @@ def preview_command(
         typer.secho(f"Signals available on {config.daq.device_name}:", fg=typer.colors.CYAN)
         for line in describe_signals(catalogue, volts=False):
             typer.echo(line)
-        typer.echo("\nPairs, selectable with one --signal:")
+        typer.echo("\nGroups, selectable with one --signal:")
         for name, members in GROUPS.items():
             typer.echo(f"  {name:<10}  {', '.join(members)}")
         typer.echo("  flow        whichever meter run.yaml selects")

@@ -750,7 +750,36 @@ failure the whole method exists to avoid — they cannot resolve a 100 kPa pulse
 healthy while measuring nothing. `--list` warns about it up front. Unlike
 `collect`, this ignores `run.method`: you check the dedicated pair on a rig whose
 `run.yaml` still says `steady_state`, usually because you are about to change it.
-`pressure` is a pair the same way, and a unit on a pair applies to both halves.
+`pressure` is a pair the same way, and a unit on a group applies to every member.
+
+**`-s pulse` also brings `pulse_dp`**, the difference of the two — which is what
+pulse decay actually measures, and what neither transducer panel shows. A 100 kPa
+pulse riding on 50 bar of pore pressure is a fifth of a percent of either
+absolute trace, invisible on an axis scaled to 5000 kPa; on its own panel it is
+the full height of the plot:
+
+```
+     time      pP1 (kPa)      pP2 (kPa)       dP (kPa)
+     0.0s           5020           5000             20
+     0.2s           5015           5000             15
+```
+
+That panel is where the two things worth knowing before a fourteen-hour run
+show up. The **zero mismatch** between the pair — with both vessels open to the
+same pressure, dP should read zero and generally does not — is exactly what the
+free-offset fit exists to absorb (see [Reading the result](#reading-the-result));
+seeing its size beforehand tells you whether it is a few tenths of a kPa or
+enough to matter. And the **noise floor on the difference** is what the decay
+has to be resolved against, which on a tight plug is the thing that decides
+whether the run is worth starting.
+
+The subtraction is done on the two converted **absolute** pressures, so a gauge
+pair's atmospheric term cancels rather than being counted twice. `pulse_dp` is
+the one signal that keeps its pressure unit under `--volts`: no wire carries a
+difference, and a difference of two voltages is a pressure only if both
+transducers share a span, which the fallback pair need not. Its two members still
+show their own volts. It is selectable on its own (`-s pulse_dp`), including on a
+rig with no dedicated pair, where it is the steady-state differential.
 
 With `--plot`, each signal gets its own stacked panel. **Nothing is drawn on top
 of the traces** — preview runs no detector, so any criterion band would assert

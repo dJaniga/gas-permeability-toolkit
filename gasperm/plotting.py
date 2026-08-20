@@ -772,7 +772,7 @@ class PreviewPlot(_StackedPlot):
         panels = [
             _Panel(
                 key=signal.key,
-                ylabel=f"{signal.label} ({'V' if volts or signal.raw_only else signal.unit})",
+                ylabel=f"{signal.label} ({signal.display_unit(volts=volts)})",
                 traces=(_Trace(signal.key, signal.label, preview_color(index)),),
                 signal=None,
                 to_display=lambda value: value,
@@ -803,7 +803,11 @@ class PreviewPlot(_StackedPlot):
             return
         values = {}
         for signal in self.signals:
-            source = sample.raw if (self.volts or signal.raw_only) else sample.values
+            source = (
+                sample.raw
+                if signal.shown_as_volts(volts=self.volts)
+                else sample.values
+            )
             # NaN rather than a dropped point: a probe that said nothing this
             # sample leaves a visible gap instead of a straight line drawn
             # across the silence.
@@ -812,7 +816,13 @@ class PreviewPlot(_StackedPlot):
 
     def _title(self) -> str:
         span = "whole session" if self.window_s is None else f"last {self.window_s:g} s"
-        mode = "raw volts" if self.volts else "calibrated"
+        mode = "calibrated"
+        if self.volts:
+            # A differential has no raw voltage and keeps its unit, so an
+            # unqualified "raw volts" would misdescribe its panel.
+            mode = "raw volts"
+            if any(getattr(s, "calibrated_only", False) for s in self.signals):
+                mode = "raw volts, except differentials"
         return f"{self._window_title}   {mode}   [{span}]"
 
 

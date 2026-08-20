@@ -184,7 +184,8 @@ plug's length would put a wrong number straight into the Darcy equation.
 ```bash
 gasperm preview                                  # every signal this rig defines
 gasperm preview --list                           # what it can show; touches no hardware
-gasperm preview -s pulse --plot                  # both pulse-decay transducers
+gasperm preview -s pulse --plot                  # both pulse transducers and their dP
+gasperm preview -s pulse_dp:kPa                  # just the differential the method measures
 gasperm preview -s inlet_pressure:bar            # one signal, in a unit you choose
 gasperm preview --volts                          # raw volts, uncalibrated
 gasperm preview -s ai7 -d 30                     # an input the config says nothing about
@@ -192,7 +193,7 @@ gasperm preview -s ai7 -d 30                     # an input the config says noth
 
 | option | |
 |---|---|
-| `-s, --signal NAME[:UNIT]` | repeatable; `pulse` and `pressure` select a pair |
+| `-s, --signal NAME[:UNIT]` | repeatable; `pressure` selects a pair, `pulse` the pair plus `pulse_dp` |
 | `--list` | the signal catalogue, with each channel and range |
 | `--volts` | raw voltage instead of the calibrated value |
 | `--plot`, `--plot-window`, `--plot-from-start` | live stacked panels |
