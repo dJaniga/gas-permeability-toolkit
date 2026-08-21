@@ -63,6 +63,15 @@ DEFAULT_MAX_POINTS = 3600
 #: too-ambitious refresh rate rather than to silently miss sample slots.
 MAX_REDRAW_DUTY = 0.1
 
+#: Size of the corner readout. Large enough to read from across a bench, which
+#: is the point of it -- an operator watching a plateau is rarely sitting at
+#: the keyboard -- and small enough not to crowd a 1.55 in panel.
+_READOUT_FONTSIZE = "large"
+
+#: Vertical step between readout lines, in axes fractions, for a panel with
+#: more than one trace.
+_READOUT_LINE_HEIGHT = 0.26
+
 #: Steady state is only ever declared after ``required_windows`` consecutive
 #: windows, so a steady stretch is minutes long at the shipped criteria. The
 #: from-t0 view can therefore decimate its steady flags by plain sampling
@@ -160,6 +169,10 @@ class _Panel(NamedTuple):
     #: what happens to dP/dP0 on a rig that is not leaking, i.e. the case the
     #: operator most needs to read as "nothing is happening".
     y_range: tuple[float, float] | None = None
+    #: Unit for the corner readout, so the number is self-describing rather
+    #: than needing the ylabel read alongside it. Empty for a dimensionless
+    #: quantity such as ``dP/dP0``.
+    unit: str = ""
 
 
 def _channel_values(reading: Reading, run) -> dict[str, float]:
@@ -229,6 +242,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             traces=(_Trace("inlet_pressure", "P1", "tab:blue"),),
             signal="inlet_pressure",
             to_display=lambda atm: units.from_atm(atm, pressure),
+            unit=pressure,
         ),
         "outlet_pressure": _Panel(
             key="outlet_pressure",
@@ -237,6 +251,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             # The detector watches the inlet, not the outlet.
             signal=None,
             to_display=lambda atm: units.from_atm(atm, pressure),
+            unit=pressure,
         ),
         "delta_pressure": _Panel(
             key="delta_pressure",
@@ -244,6 +259,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             traces=(_Trace("delta_pressure", "dP", "tab:red"),),
             signal=None,
             to_display=lambda atm: units.from_atm(atm, pressure),
+            unit=pressure,
         ),
         "decay_fraction": _Panel(
             key="decay_fraction",
@@ -266,6 +282,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             traces=(_Trace("flow", "Q", "tab:green"),),
             signal="flow",
             to_display=lambda cm3_s: units.flow_from_cm3_s(cm3_s, run.display_flow_unit),
+            unit=run.display_flow_unit,
         ),
         "temperature": _Panel(
             key="temperature",
@@ -273,6 +290,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             traces=(_Trace("temperature", "T", "tab:purple"),),
             signal="temperature",
             to_display=units.kelvin_to_celsius,
+            unit="C",
         ),
         "permeability": _Panel(
             key="permeability",
@@ -292,6 +310,7 @@ def _panels_for(config: GaspermConfig) -> list[_Panel]:
             ),
             signal="permeability",
             to_display=lambda d: units.darcy_to(d, run.display_permeability_unit),
+            unit=run.display_permeability_unit,
         ),
     }
     # Filter by method rather than making the operator curate the list per run:
@@ -435,8 +454,11 @@ class _StackedPlot:
         redraw_interval_s: float,
         window_title: str,
         plot_config: Any = None,
+        show_last_value: bool = True,
     ) -> None:
         self._panels = list(panels)
+        #: Print each panel's newest value in its corner. See `_draw_readout`.
+        self.show_last_value = show_last_value
         #: Supplies the monitor and window mode; ``None`` places nothing.
         self._plot_config = plot_config
         self.window_s = window_s
@@ -685,6 +707,9 @@ class _StackedPlot:
             for start, end in spans:
                 axis.axvspan(start, end, color=_STEADY_COLOR, alpha=0.12, zorder=0)
             self._annotate(panel, axis, data_limits)
+            if self.show_last_value:
+                # Last, so nothing an annotation draws lands on top of it.
+                _draw_readout(panel, axis, channels)
 
         self._axes[-1].set_xlim(*self._xlim(times))
         self._figure.suptitle(self._title(), fontsize="medium")
@@ -763,6 +788,7 @@ class LivePlot(_StackedPlot):
             ),
             window_title=f"gasperm - {config.sample.id} ({config.gas.name})",
             plot_config=plot_config,
+            show_last_value=plot_config.show_last_value,
         )
 
     def open(self) -> LivePlot:
@@ -931,6 +957,11 @@ class PreviewPlot(_StackedPlot):
                 traces=(_Trace(signal.key, signal.label, preview_color(index)),),
                 signal=None,
                 to_display=lambda value: value,
+                # Whatever the panel is actually showing: volts under --volts,
+                # the signal's own unit otherwise. The readout is the number a
+                # wiring check gets written down from, so it must not claim kPa
+                # while the trace is volts.
+                unit=signal.display_unit(volts=volts),
             )
             for index, signal in enumerate(self.signals)
         ]
@@ -941,6 +972,11 @@ class PreviewPlot(_StackedPlot):
             redraw_interval_s=redraw_interval_s,
             window_title=f"gasperm preview{f' - {device_name}' if device_name else ''}",
             plot_config=plot_config,
+            show_last_value=(
+                # Preview has no run.yaml opinion to consult when it is driven
+                # directly; when it does, honour it like every other panel.
+                getattr(plot_config, "show_last_value", True)
+            ),
         )
 
     def open(self) -> PreviewPlot:
@@ -989,6 +1025,54 @@ def _corner_note(axis: Any, text: str, color: str) -> None:
         fontsize="x-small", color=color,
         bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "none", "pad": 1.5},
     )
+
+
+def format_last_value(series: Sequence[float], unit: str = "") -> str:
+    """The newest value in ``series``, as it should read in the corner.
+
+    Four significant figures, matching the console line, so the plot and the
+    text do not disagree about a number the operator is copying down.
+
+    The **literal** last value, never the last finite one. A missing sample is
+    reported as ``--`` exactly as the console reports it: there is no
+    permeability before the first computable sample, and no flow reading while
+    the meter is unplugged. Carrying the previous number forward would put a
+    stale value on screen with nothing to say it was stale, which is the one
+    thing a live readout must never do.
+    """
+    if not len(series):
+        return "--"
+    value = series[-1]
+    if not math.isfinite(value):
+        return "--"
+    return f"{value:.4g} {unit}".strip()
+
+
+def _draw_readout(panel: _Panel, axis: Any, channels: dict[str, list[float]]) -> None:
+    """Print the panel's newest value, or values, in its top-right corner.
+
+    The trace shows the shape and the axis gives the scale, but reading a
+    number off a plot by eye is guesswork -- and it is the number, not the
+    shape, that ends up in the lab book. Top-right because the bottom-right is
+    where the criteria note goes, and because a trace settling into a plateau
+    tends to occupy the middle of the panel.
+
+    A panel with two traces gets one line each, coloured to match, since which
+    of ``k`` instant and averaged you are reading matters. The trace's own
+    ``alpha`` is deliberately *not* applied: the faint instantaneous trace is
+    drawn at 0.35 to keep it behind the mean, and text at 0.35 is unreadable.
+    """
+    for index, trace in enumerate(panel.traces):
+        text = format_last_value(channels.get(trace.channel, []), panel.unit)
+        axis.text(
+            0.995, 0.94 - index * _READOUT_LINE_HEIGHT, text,
+            transform=axis.transAxes, ha="right", va="top",
+            fontsize=_READOUT_FONTSIZE, color=trace.color, fontweight="bold",
+            # Nearly opaque: a settled trace runs along the top of its own
+            # autoscaled panel, which is exactly where this sits, and a number
+            # with a trace showing through it is the one that gets misread.
+            bbox={"facecolor": "white", "alpha": 0.92, "edgecolor": "none", "pad": 2.0},
+        )
 
 
 def _limits_with_band(

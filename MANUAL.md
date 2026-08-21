@@ -74,9 +74,27 @@ plot:
   panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability]
   window_s: null          # null = whole run from t0; a number = trailing window
   show_criteria: true     # the steady-state bands and the fitted drift line
+  show_last_value: true   # each panel's newest value, in its top-right corner
   redraw_interval_s: 0.5  # honoured as set while the plot has its own thread
   max_points: 3600        # per series; the from-t0 view decimates to fit
 ```
+
+**Every panel prints its newest value in its top-right corner**, in the same
+unit as its axis and to the same four significant figures as the console line,
+so the plot and the text never disagree about a number you are copying down.
+The trace shows the shape and the axis gives the scale, but reading a value off
+a plot by eye is guesswork — and it is the number, not the shape, that ends up
+in the lab book.
+
+A panel with two traces reads out both, coloured to match, since which of `k`
+instantaneous and `k` averaged you are reading matters. A sample with no value
+reads `--`, exactly as the console prints it: there is no permeability before
+the first computable sample, and none while the flowmeter is unplugged.
+Carrying the previous number forward would put a stale value on screen with
+nothing to say it was stale, which is the one thing a live readout must never
+do. `preview` shows the same readout, following `--volts` — the number you
+write down from a wiring check must not claim kPa while the trace is volts.
+Set `show_last_value: false` to turn it off.
 
 **The two views answer different questions.** A trailing window fills the axis
 with the last few minutes, so small movements are visible while you wait for a

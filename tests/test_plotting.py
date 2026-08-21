@@ -16,6 +16,7 @@ import pytest
 
 matplotlib.use("Agg")  # noqa: E402 - must precede any pyplot import
 
+from gasperm import units  # noqa: E402
 from gasperm.config import GaspermConfig  # noqa: E402
 from gasperm.models import Reading, SignalStability, SteadyStateStatus  # noqa: E402
 from gasperm.plotting import (  # noqa: E402
@@ -24,6 +25,7 @@ from gasperm.plotting import (  # noqa: E402
     _limits_with_band,
     _panels_for,
     _steady_spans,
+    format_last_value,
 )
 
 
@@ -504,6 +506,174 @@ class TestRendering:
         assert "last 45 s" in title
         assert "steady (3/3)" in title
         plot.close()
+
+
+class TestLastValueReadout:
+    """The newest value, printed in each panel's top-right corner.
+
+    The trace shows the shape and the axis gives the scale, but the number is
+    what gets written down -- and reading one off a plot by eye is guesswork.
+    """
+
+    def _plot(self, config, **kwargs) -> LivePlot:
+        plot = LivePlot(config, **kwargs)
+        plot.open()
+        return plot
+
+    def readouts(self, plot, index=0):
+        return [t.get_text() for t in plot._axes[index].texts]
+
+    def test_it_shows_the_newest_value_with_its_unit(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        config.run.display_pressure_unit = "kPa"
+        plot = self._plot(config)
+        for index, atm in enumerate((5.0, 5.5, 6.0)):
+            plot.add(reading(index, index * 0.1, inlet_atm=atm))
+        plot.maybe_redraw(now=1000.0)
+        expected = f"{units.from_atm(6.0, 'kPa'):.4g} kPa"
+        assert self.readouts(plot) == [expected]
+        plot.close()
+
+    def test_it_tracks_the_display_unit(self):
+        """Not a second opinion about units -- the same one the axis is in."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        config.run.display_pressure_unit = "bar"
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0, inlet_atm=5.0))
+        plot.maybe_redraw(now=1000.0)
+        assert self.readouts(plot) == [f"{units.from_atm(5.0, 'bar'):.4g} bar"]
+        plot.close()
+
+    def test_it_updates_between_frames(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["flow"]
+        config.run.display_flow_unit = "sccm"
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0, flow_cm3_s=3.0))
+        plot.maybe_redraw(now=1000.0)
+        first = self.readouts(plot)
+        plot.add(reading(1, 0.1, flow_cm3_s=4.5))
+        plot.maybe_redraw(now=2000.0)
+        second = self.readouts(plot)
+        assert first == [f"{units.flow_from_cm3_s(3.0, 'sccm'):.4g} sccm"]
+        assert second == [f"{units.flow_from_cm3_s(4.5, 'sccm'):.4g} sccm"]
+        assert first != second
+
+    def test_an_unmonitored_panel_shows_both_its_note_and_its_value(self):
+        """They occupy different corners, so neither displaces the other."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["temperature"]
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0, temperature_c=21.0), status_with())
+        plot.maybe_redraw(now=1000.0)
+        texts = self.readouts(plot)
+        assert "not a steady-state signal" in texts
+        assert "21 C" in texts
+        plot.close()
+
+    def test_a_two_trace_panel_reads_out_both(self):
+        """Which of k instant and k averaged you are reading matters."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["permeability"]
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0, permeability=0.005))
+        plot.maybe_redraw(now=1000.0)
+        readouts = self.readouts(plot)
+        assert len(readouts) == 2
+        assert all(text.endswith("mD") for text in readouts)
+        plot.close()
+
+    def test_the_readout_colours_match_their_traces(self):
+        """A number in the corner that cannot be tied to a trace is a riddle."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0))
+        plot.maybe_redraw(now=1000.0)
+        assert plot._axes[0].texts[0].get_color() == "tab:blue"
+        plot.close()
+
+    def test_a_missing_value_reads_as_a_gap(self):
+        """Same '--' the console prints. A stale number with no mark saying so
+        is the one thing a live readout must never show."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["permeability"]
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0, permeability=0.005))
+        plot.add(reading(1, 0.1, permeability=None))
+        plot.maybe_redraw(now=1000.0)
+        assert self.readouts(plot) == ["--", "--"]
+        plot.close()
+
+    def test_it_does_not_accumulate_across_frames(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        for frame in range(1, 6):
+            plot.add(reading(frame, frame * 0.1))
+            plot.maybe_redraw(now=1000.0 * frame)
+        assert len(self.readouts(plot)) == 1
+        plot.close()
+
+    def test_it_can_be_switched_off(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        config.run.plot.show_last_value = False
+        plot = self._plot(config)
+        plot.add(reading(0, 0.0))
+        plot.maybe_redraw(now=1000.0)
+        assert self.readouts(plot) == []
+        plot.close()
+
+    def test_it_sits_clear_of_the_criteria_note(self):
+        """Both corners are used; they must not be the same corner."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        for index in range(60):
+            plot.add(reading(index, index * 0.1), status_with("inlet_pressure"))
+        plot.maybe_redraw(now=1000.0)
+        placements = {
+            t.get_text(): (t.get_position()[1], t.get_va()) for t in plot._axes[0].texts
+        }
+        assert len(placements) == 2
+        tops = [y for _, (y, va) in placements.items() if va == "top"]
+        bottoms = [y for _, (y, va) in placements.items() if va == "bottom"]
+        assert len(tops) == 1 and len(bottoms) == 1
+        assert tops[0] > bottoms[0]
+        plot.close()
+
+
+class TestFormatLastValue:
+    """Four significant figures, matching the console line."""
+
+    def test_a_plain_value_keeps_four_figures(self):
+        assert format_last_value([1234.5678], "kPa") == "1235 kPa"
+
+    def test_a_small_value_is_not_rounded_away(self):
+        assert format_last_value([0.0051234], "mD") == "0.005123 mD"
+
+    def test_a_huge_value_goes_exponential_rather_than_wide(self):
+        assert format_last_value([12345678.0], "kPa") == "1.235e+07 kPa"
+
+    def test_a_dimensionless_value_gets_no_trailing_space(self):
+        assert format_last_value([0.873]) == "0.873"
+
+    def test_an_empty_series_is_a_gap(self):
+        assert format_last_value([], "kPa") == "--"
+
+    def test_a_nan_is_a_gap_not_the_word_nan(self):
+        assert format_last_value([1.0, float("nan")], "kPa") == "--"
+
+    def test_an_infinity_is_a_gap_too(self):
+        assert format_last_value([float("inf")], "kPa") == "--"
+
+    def test_the_last_value_wins_even_if_earlier_ones_were_finite(self):
+        """Never the last *finite* value: that would be a stale number
+        presented as a current one."""
+        assert format_last_value([5.0, 6.0, float("nan")], "kPa") == "--"
 
 
 class TestRepeatedRedraw:

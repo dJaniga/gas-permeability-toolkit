@@ -710,8 +710,12 @@ class TestPreviewPlot:
         assert plot._history.recent["inlet_pressure"] == [2.5]
         plot.close()
 
-    def test_nothing_is_drawn_on_top_of_the_traces(self):
-        """No detector runs, so bands or shading would assert an untested claim."""
+    def test_no_criteria_are_drawn_on_top_of_the_traces(self):
+        """No detector runs, so bands or shading would assert an untested claim.
+
+        The corner readout is not one of those: it restates the sample that was
+        just plotted, which is the one thing preview is certain of.
+        """
         plot, _ = self.plot_for(["inlet_pressure"])
         for index in range(20):
             plot.add(
@@ -719,9 +723,35 @@ class TestPreviewPlot:
             )
         plot.maybe_redraw(now=1000.0)
         axis = plot._axes[0]
-        assert list(axis.texts) == []
-        assert list(axis.patches) == []
-        assert len(axis.lines) == 1
+        assert list(axis.patches) == []      # no steady shading
+        assert len(axis.lines) == 1          # the trace, and no criterion lines
+        texts = [t.get_text() for t in axis.texts]
+        assert texts == ["500 kPa"]          # the readout, and nothing else
+        plot.close()
+
+    def test_the_readout_shows_the_latest_value(self):
+        plot, _ = self.plot_for(["inlet_pressure"])
+        for index, value in enumerate((500.0, 512.5, 523.75)):
+            plot.add(PreviewSample(index, index * 0.1, {"inlet_pressure": value}, {}))
+        plot.maybe_redraw(now=1000.0)
+        assert [t.get_text() for t in plot._axes[0].texts] == ["523.8 kPa"]
+        plot.close()
+
+    def test_the_readout_follows_volts_mode(self):
+        """It is the number written down from a wiring check; it must not lie."""
+        plot, _ = self.plot_for(["inlet_pressure"], volts=True)
+        plot.add(PreviewSample(0, 0.0, {"inlet_pressure": 500.0}, {"inlet_pressure": 2.5}))
+        plot.maybe_redraw(now=1000.0)
+        assert [t.get_text() for t in plot._axes[0].texts] == ["2.5 V"]
+        plot.close()
+
+    def test_a_signal_with_no_reading_reads_as_a_gap(self):
+        """Same '--' the console shows; never the last value it happened to have."""
+        plot, _ = self.plot_for(["temperature"])
+        plot.add(PreviewSample(0, 0.0, {"temperature": 21.5}, {}))
+        plot.add(PreviewSample(1, 0.1, {}, {}, temperature_ok=False))
+        plot.maybe_redraw(now=1000.0)
+        assert [t.get_text() for t in plot._axes[0].texts] == ["--"]
         plot.close()
 
     def test_a_missing_signal_leaves_a_gap(self):

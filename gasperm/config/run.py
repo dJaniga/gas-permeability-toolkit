@@ -383,6 +383,11 @@ class LivePlotConfig(_Base):
     window_s: float | None = Field(default=None, gt=0.0)
     #: Draw the steady-state criterion bands and the fitted drift line.
     show_criteria: bool = True
+    #: Print each panel's most recent value in its top-right corner. The trace
+    #: shows the shape and the axis gives the scale, but reading a number off a
+    #: plot by eye is guesswork -- and it is the number, not the shape, that
+    #: gets written in the lab book.
+    show_last_value: bool = True
     #: Minimum wall-clock gap between redraws. The acquisition loop only ever
     #: appends to a buffer; this is what keeps matplotlib off its critical path.
     redraw_interval_s: float = Field(default=0.5, gt=0.0)
