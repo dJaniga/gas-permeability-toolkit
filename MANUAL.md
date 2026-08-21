@@ -74,7 +74,7 @@ plot:
   panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability]
   window_s: null          # null = whole run from t0; a number = trailing window
   show_criteria: true     # the steady-state bands and the fitted drift line
-  redraw_interval_s: 0.5
+  redraw_interval_s: 0.5  # a floor; stretched if a frame costs too much (below)
   max_points: 3600        # per series; the from-t0 view decimates to fit
 ```
 
@@ -109,9 +109,34 @@ exponential decay straightens into a line and a leak or thermal ramp does not.
 No criterion annotations appear there — no detector runs in pulse mode, so
 drawing them would assert something never tested.
 
-Plotting never blocks acquisition: samples go into a bounded buffer with an O(1)
-append and the figure redraws on a timer. If the window is closed mid-run, or no
-display is available, the plot disables itself and the run carries on.
+**Drawing costs the run time, and budgets itself accordingly.** Buffering a
+sample is O(1) and free, but the redraw happens on the acquisition thread —
+there is no separate render thread — so every millisecond spent drawing is a
+millisecond the rig is not sampling in. On a five-panel figure a redraw costs
+roughly 0.15 s against a 0.1 s sample slot at 10 Hz, so `redraw_interval_s` is
+treated as a **floor**: the plot measures what a frame actually costs on your
+machine and backend, and stretches the interval until drawing takes no more
+than a tenth of the wall clock. It only ever lengthens, so a fast machine keeps
+the interval you set, and it says so in the log the first time it backs off.
+
+Without that budget the symptom is not a missing sample but a *bunched* one.
+The loop sleeps to an absolute target, so it wins back the time a slow frame
+cost by taking the next samples with no sleep at all — the mean rate survives
+and the cadence does not, which is what a stuttering console and plot are. A
+run that spends too much of itself drawing says so in its summary, separating
+the two cases: `could not hold the configured sample rate` when the rate
+genuinely fell short, and `took it in bursts` when only the spacing went. Both
+leave the result correct — every reading carries its true elapsed time from the
+clock, never its slot index — and both mean fewer or less evenly spaced points
+than were ordered.
+
+Note that `max_points` is a **memory** bound, not a speed one. A redraw costs
+about the same whether it draws 600 points or 3600, because the time goes on
+the axes and their tick labels rather than on the trace; turning it down to
+make the plot faster is the natural first thing to try and does nothing.
+
+If the window is closed mid-run, or no display is available, the plot disables
+itself and the run carries on.
 
 ### Which monitor it opens on
 

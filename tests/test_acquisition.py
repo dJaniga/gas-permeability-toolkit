@@ -528,6 +528,193 @@ def build_loop(config, analog, temperature, **kwargs):
     )
 
 
+class _KeepingUpClock:
+    """A clock that advances only when the loop sleeps -- a rig that keeps up."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _StarvedClock(_KeepingUpClock):
+    """A clock that advances on every read: work outrunning the sample slot.
+
+    What a live plot drawing on the acquisition thread does to a real run --
+    the loop comes to sleep and finds the next slot already gone.
+    """
+
+    def __init__(self, step: float) -> None:
+        super().__init__()
+        self.step = step
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        return value
+
+
+class TestLoopPacing:
+    """What the loop does when a sample slot has already passed.
+
+    Sleeping to an absolute target keeps a slow sample from making the whole
+    run drift late, but it cannot buy back time already spent. Nothing in a
+    reading shows this -- each carries its true elapsed time, so the physics is
+    unaffected and only the sample density drops -- so the loop counts it and
+    the run says so, rather than a rig quietly sampling at 6 Hz looking healthy.
+    """
+
+    def build(self, config, clock, analog, temperature, **kwargs):
+        return AcquisitionLoop(
+            config, make_processor(config), analog, temperature,
+            clock=clock, sleep=clock.sleep, **kwargs,
+        )
+
+    def test_a_slot_with_time_left_sleeps_and_counts_nothing(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        clock = _KeepingUpClock()
+        loop = self.build(
+            quick_steady_config, clock, fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        loop._pace(target_s=0.0, interval_s=0.1)
+        assert clock.now == pytest.approx(0.1)
+        assert loop.late_slots == 0
+
+    def test_a_slot_already_gone_is_counted_not_slept_through(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        clock = _KeepingUpClock()
+        clock.now = 0.35  # the callback overran its 0.1 s slot by 0.25 s
+        loop = self.build(
+            quick_steady_config, clock, fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        loop._pace(target_s=0.0, interval_s=0.1)
+        assert loop.late_slots == 1
+        assert loop.worst_overrun_s == pytest.approx(0.25)
+        # And it does not sleep off a debt it cannot pay.
+        assert clock.now == pytest.approx(0.35)
+
+    def test_the_worst_overrun_is_kept_not_the_last(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        clock = _KeepingUpClock()
+        loop = self.build(
+            quick_steady_config, clock, fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        for overrun in (0.4, 0.05):
+            clock.now = 0.1 + overrun
+            loop._pace(target_s=0.0, interval_s=0.1)
+        assert loop.late_slots == 2
+        assert loop.worst_overrun_s == pytest.approx(0.4)
+
+    def test_a_run_that_holds_its_rate_says_nothing(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        quick_steady_config.hardware.daq.sample_rate_hz = 10.0
+        quick_steady_config.run.max_samples = 40
+        loop = self.build(
+            quick_steady_config, _KeepingUpClock(), fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        loop.run(install_signal_handler=False)
+        assert loop.late_slots == 0
+        assert not any("sample rate" in w for w in loop.warnings)
+
+    def test_a_starved_run_reports_both_rates(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """The number is the point: 'laggy' is a feeling, 4 Hz is a fact."""
+        quick_steady_config.hardware.daq.sample_rate_hz = 10.0
+        quick_steady_config.run.max_samples = 40
+        loop = self.build(
+            quick_steady_config, _StarvedClock(0.25), fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        loop.run(install_signal_handler=False)
+        assert loop.late_slots > 0
+        behind = [w for w in loop.warnings if "could not hold the configured" in w]
+        assert len(behind) == 1
+        assert "configured 10.0 Hz" in behind[0]
+        # And it points at the usual culprit rather than leaving it a mystery.
+        assert "redraw_interval_s" in behind[0]
+
+    def test_bursty_sampling_is_reported_even_though_the_mean_rate_holds(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """The failure a check on the mean rate alone would call healthy.
+
+        Pacing to an absolute target wins back the time a slow callback lost, by
+        taking the next samples with no sleep. So a run that spends a third of
+        its wall clock drawing still lands on its configured rate -- in bursts.
+        That is what a stuttering console is, and it has to be caught.
+        """
+        quick_steady_config.hardware.daq.sample_rate_hz = 10.0
+        quick_steady_config.run.max_samples = 60
+        clock = _KeepingUpClock()
+
+        def slow_redraw(reading) -> None:
+            # A live plot refreshing every 1 s at a cost of 0.25 s: a quarter of
+            # the wall clock, well inside what absolute-target pacing can win
+            # back, and therefore invisible in the mean rate.
+            if reading.index % 10 == 0:
+                clock.now += 0.25
+
+        loop = self.build(
+            quick_steady_config, clock, fake_analog_source(VOLTAGES),
+            fake_temperature_source(), on_reading=slow_redraw,
+        )
+        loop.run(install_signal_handler=False)
+        span = loop.readings[-1].elapsed_s - loop.readings[0].elapsed_s
+        assert (len(loop.readings) - 1) / span == pytest.approx(10.0, rel=0.05)
+        assert loop.late_slots > 0
+        bursty = [w for w in loop.warnings if "in bursts" in w]
+        assert len(bursty) == 1
+        assert "bunched rather than evenly spaced" in bursty[0]
+        # It is the cadence that went, not the rate, and it must say so.
+        assert not any("could not hold the configured" in w for w in loop.warnings)
+
+    def test_an_occasional_slow_slot_is_not_worth_a_warning(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """A desktop OS does desktop things; that says nothing about the rig."""
+        quick_steady_config.hardware.daq.sample_rate_hz = 10.0
+        quick_steady_config.run.max_samples = 60
+        loop = self.build(
+            quick_steady_config, _KeepingUpClock(), fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        loop.late_slots = 2  # under MAX_LATE_SLOT_FRACTION of 60
+        loop.run(install_signal_handler=False)
+        assert not any("in bursts" in w for w in loop.warnings)
+        assert not any("could not hold the configured" in w for w in loop.warnings)
+
+    def test_the_readings_still_carry_true_timestamps_when_starved(
+        self, quick_steady_config, fake_analog_source, fake_temperature_source
+    ):
+        """Why a starved run is thinner rather than wrong: elapsed comes from
+        the clock, never from the slot index."""
+        quick_steady_config.hardware.daq.sample_rate_hz = 10.0
+        quick_steady_config.run.max_samples = 10
+        clock = _StarvedClock(0.25)
+        loop = self.build(
+            quick_steady_config, clock, fake_analog_source(VOLTAGES),
+            fake_temperature_source(),
+        )
+        readings = loop.run(install_signal_handler=False)
+        stamps = [r.elapsed_s for r in readings]
+        assert stamps == sorted(stamps)
+        # Spaced by what actually happened, not by the 0.1 s that was ordered.
+        assert stamps[1] - stamps[0] > 0.1
+
+
 class TestAcquisitionLoop:
     def test_stops_after_max_samples(
         self, quick_steady_config, fake_analog_source, fake_temperature_source

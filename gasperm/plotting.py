@@ -47,7 +47,20 @@ __all__ = [
 
 #: How many points the live window keeps per series. Bounded so a multi-hour
 #: run cannot grow the figure's memory without limit.
+#:
+#: Note this is a *memory* bound and not a speed one: a redraw costs about the
+#: same whether it draws 600 points or 3600, because the cost is in the axes
+#: and its tick labels rather than in the trace. Turning it down to make the
+#: plot faster is a natural thing to try and does nothing.
 DEFAULT_MAX_POINTS = 3600
+
+#: The most of the wall clock the live plot may spend drawing. It draws on the
+#: acquisition thread, so this is time the rig is not sampling in -- a tenth
+#: costs a sample every ten and stays invisible in the result, where the
+#: configured 0.5 s interval against a 0.15 s redraw would cost nearly a third
+#: of them. Used by ``_StackedPlot._effective_interval_s`` to stretch a
+#: too-ambitious refresh rate rather than to silently miss sample slots.
+MAX_REDRAW_DUTY = 0.1
 
 #: Steady state is only ever declared after ``required_windows`` consecutive
 #: windows, so a steady stretch is minutes long at the shipped criteria. The
@@ -416,6 +429,14 @@ class _StackedPlot:
         self._axes: Any = None
         self._plt: Any = None
         self._disabled = False
+        #: One persistent Line2D per ``(panel, trace)``. See :meth:`_create_lines`.
+        self._lines: dict[tuple[str, str], Any] = {}
+        #: Per-axes artist counts taken once the traces exist, so a redraw can
+        #: tell last frame's annotations from the traces it must keep.
+        self._overlay_base: list[tuple[int, ...]] = []
+        #: Smoothed cost of one redraw, or None until one has been drawn.
+        self._redraw_cost_s: float | None = None
+        self._backoff_reported = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -435,6 +456,8 @@ class _StackedPlot:
         for panel, axis in zip(self._panels, axes):
             axis.set_ylabel(panel.ylabel, fontsize="small")
             axis.grid(True, alpha=0.3)
+            if panel.yscale != "linear":
+                axis.set_yscale(panel.yscale)
         axes[-1].set_xlabel("elapsed (s)")
         figure.tight_layout()
         # Reserve the strip the status line is written into. Done once, here,
@@ -446,7 +469,58 @@ class _StackedPlot:
         self._figure = figure
         self._axes = axes
         self._plt = plt
+        self._create_lines()
         return self
+
+    def _create_lines(self) -> None:
+        """Create one Line2D per trace, once, to be fed new data thereafter.
+
+        Rebuilding the artists every frame -- ``axis.clear()`` and a fresh
+        ``plot()`` -- is what made a redraw cost ~310 ms *regardless of how many
+        points were in it*: clearing an axes destroys its ticks, and the next
+        draw reconstructs and re-rasterises every tick and tick label from
+        scratch. That dwarfed the traces themselves. Keeping the artists keeps
+        the ticks, and the per-frame work drops to ``set_data`` plus the
+        annotations that genuinely do change.
+
+        Keyed by ``(panel, channel)`` rather than channel alone: nothing stops
+        two panels drawing the same quantity, and one shared artist cannot be
+        on both.
+        """
+        self._lines = {}
+        self._overlay_base = []
+        for panel, axis in zip(self._panels, self._axes):
+            for trace in panel.traces:
+                (self._lines[(panel.key, trace.channel)],) = axis.plot(
+                    [], [],
+                    color=trace.color,
+                    linewidth=trace.linewidth,
+                    alpha=trace.alpha,
+                    label=trace.label,
+                )
+            if len(panel.traces) > 1:
+                # The labels never change, so this is built once as well.
+                axis.legend(loc="best", fontsize="x-small", framealpha=0.6)
+            self._overlay_base.append(
+                tuple(
+                    len(container)
+                    for container in (axis.lines, axis.patches, axis.texts, axis.collections)
+                )
+            )
+
+    def _strip_overlay(self, axis: Any, base: tuple[int, ...]) -> None:
+        """Remove the previous frame's annotations, keeping the traces.
+
+        The baseline counts were taken when the traces were created, so anything
+        past them is last frame's overlay: the criterion lines and band, the
+        shaded steady span, the corner note. Those genuinely change every frame
+        and are cheap; the traces, the ticks and the legend do not, and are what
+        clearing the axes used to throw away.
+        """
+        containers = (axis.lines, axis.patches, axis.texts, axis.collections)
+        for container, keep in zip(containers, base):
+            while len(container) > keep:
+                container[-1].remove()
 
     def __enter__(self) -> Any:
         try:
@@ -473,24 +547,68 @@ class _StackedPlot:
     # -- data flow --------------------------------------------------------
 
     def maybe_redraw(self, now: float | None = None) -> bool:
-        """Redraw if ``redraw_interval_s`` has elapsed. Returns whether it did.
+        """Redraw if the interval has elapsed. Returns whether it did.
 
-        Called from the loop after the per-sample append; the interval check is
-        what keeps plotting off the critical path.
+        Called from the acquisition loop after the per-sample append, so the
+        time this takes is time the rig is *not* sampling in. The configured
+        interval is therefore a floor, not the whole story: a redraw that turns
+        out to cost more than :data:`MAX_REDRAW_DUTY` of it backs the interval
+        off until it does not. See :meth:`_effective_interval_s`.
         """
         if self._disabled or self._figure is None or not len(self._history):
             return False
         moment = now if now is not None else time.monotonic()
-        if moment - self._last_redraw < self.redraw_interval_s:
+        if moment - self._last_redraw < self._effective_interval_s():
             return False
         self._last_redraw = moment
+        started = time.perf_counter()
         try:
             self._redraw()
         except Exception as exc:  # noqa: BLE001 - the window may have been closed
             logger.warning("Live plot failed and has been disabled: %s", exc)
             self._disabled = True
             return False
+        self._note_redraw_cost(time.perf_counter() - started)
         return True
+
+    def _effective_interval_s(self) -> float:
+        """The configured interval, or longer if drawing is slow on this rig.
+
+        A redraw is not free and does not run on a thread of its own: on a
+        five-panel figure it costs on the order of 0.15 s, against a 0.1 s
+        sample slot at the default 10 Hz. Left alone at ``redraw_interval_s:
+        0.5`` that spends a third of the run drawing instead of sampling, and
+        the symptom -- a plot that stutters and a console that falls behind --
+        looks like the plot being slow rather than the loop being starved.
+
+        So the interval is stretched to hold drawing to a small share of the
+        wall clock. It only ever lengthens: a fast machine keeps the interval
+        it was given.
+        """
+        if self._redraw_cost_s is None:
+            return self.redraw_interval_s
+        return max(self.redraw_interval_s, self._redraw_cost_s / MAX_REDRAW_DUTY)
+
+    def _note_redraw_cost(self, seconds: float) -> None:
+        """Track what a redraw costs, smoothed, and say so the first time it bites."""
+        # A running maximum would latch onto one unlucky frame and never let go;
+        # a plain mean would take too long to react to a window being resized.
+        self._redraw_cost_s = (
+            seconds
+            if self._redraw_cost_s is None
+            else 0.7 * self._redraw_cost_s + 0.3 * seconds
+        )
+        if self._backoff_reported or self._effective_interval_s() <= self.redraw_interval_s:
+            return
+        self._backoff_reported = True
+        logger.info(
+            "A redraw costs %.0f ms here, so the live plot is refreshing every "
+            "%.1f s rather than the configured %.1f s -- it draws on the "
+            "acquisition thread, and the rig is not sampling while it does.",
+            self._redraw_cost_s * 1000.0,
+            self._effective_interval_s(),
+            self.redraw_interval_s,
+        )
 
     # -- drawing ----------------------------------------------------------
 
@@ -500,21 +618,18 @@ class _StackedPlot:
             return
         spans = self._spans(times, flags)
 
-        for panel, axis in zip(self._panels, self._axes):
-            axis.clear()
-            axis.grid(True, alpha=0.3)
-            axis.set_ylabel(panel.ylabel, fontsize="small")
-            if panel.yscale != "linear":
-                axis.set_yscale(panel.yscale)
+        for panel, axis, base in zip(self._panels, self._axes, self._overlay_base):
+            self._strip_overlay(axis, base)
             for trace in panel.traces:
-                axis.plot(
-                    times,
-                    channels[trace.channel],
-                    color=trace.color,
-                    linewidth=trace.linewidth,
-                    alpha=trace.alpha,
-                    label=trace.label,
+                self._lines[(panel.key, trace.channel)].set_data(
+                    times, channels[trace.channel]
                 )
+            # The artists persist now, so autoscale has to be asked for rather
+            # than coming free with a fresh plot() -- and re-enabled each frame,
+            # since a criterion band's set_ylim turns it off.
+            axis.set_autoscaley_on(True)
+            axis.relim()
+            axis.autoscale_view(scalex=False)
             # The trace's own y-range, captured before any annotation gets a
             # vote on the autoscale.
             data_limits = axis.get_ylim()
@@ -527,10 +642,7 @@ class _StackedPlot:
             for start, end in spans:
                 axis.axvspan(start, end, color=_STEADY_COLOR, alpha=0.12, zorder=0)
             self._annotate(panel, axis, data_limits)
-            if len(panel.traces) > 1:
-                axis.legend(loc="best", fontsize="x-small", framealpha=0.6)
 
-        self._axes[-1].set_xlabel("elapsed (s)")
         self._axes[-1].set_xlim(*self._xlim(times))
         self._figure.suptitle(self._title(), fontsize="medium")
         self._figure.canvas.draw_idle()

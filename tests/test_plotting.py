@@ -505,6 +505,172 @@ class TestRendering:
         plot.close()
 
 
+class TestRepeatedRedraw:
+    """A live plot redraws hundreds of times; the first frame proves nothing.
+
+    The traces are created once and thereafter only fed new data -- clearing
+    the axes per frame is what made a redraw cost ~310 ms whatever it drew,
+    because it destroyed the ticks and the next draw rebuilt every one. What
+    that buys has to be paid for here: the annotations *do* change every frame,
+    so they are stripped and redrawn, and nothing may accumulate.
+    """
+
+    def _plot(self, config, **kwargs) -> LivePlot:
+        plot = LivePlot(config, **kwargs)
+        plot.open()
+        return plot
+
+    def feed(self, plot, count, start=0, *, steady=False, status=None):
+        for index in range(start, start + count):
+            plot.add(reading(index, index * 0.1, steady=steady), status)
+
+    def test_a_trace_is_the_same_artist_frame_after_frame(self):
+        """If it is not, the ticks are being rebuilt too and the cost is back."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        self.feed(plot, 20)
+        plot.maybe_redraw(now=1000.0)
+        first = plot._axes[0].lines[0]
+        self.feed(plot, 20, start=20)
+        plot.maybe_redraw(now=2000.0)
+        assert plot._axes[0].lines[0] is first
+        plot.close()
+
+    def test_the_trace_still_follows_the_data(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        self.feed(plot, 20)
+        plot.maybe_redraw(now=1000.0)
+        self.feed(plot, 20, start=20)
+        plot.maybe_redraw(now=2000.0)
+        xdata = plot._axes[0].lines[0].get_xdata()
+        assert len(xdata) == 40
+        assert xdata[-1] == pytest.approx(3.9)
+        plot.close()
+
+    def test_criterion_lines_do_not_accumulate(self):
+        """They are redrawn every frame, so they must be stripped every frame."""
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        self.feed(plot, 60, status=status_with("inlet_pressure"))
+        plot.maybe_redraw(now=1000.0)
+        after_one = len(plot._axes[0].lines)
+        for frame in range(2, 8):
+            self.feed(plot, 10, start=60 * frame, status=status_with("inlet_pressure"))
+            plot.maybe_redraw(now=1000.0 * frame)
+        assert len(plot._axes[0].lines) == after_one == 5
+        plot.close()
+
+    def test_the_shaded_span_does_not_accumulate(self):
+        plot = self._plot(GaspermConfig())
+        self.feed(plot, 60, steady=True)
+        plot.maybe_redraw(now=1000.0)
+        for frame in range(2, 8):
+            self.feed(plot, 10, start=60 * frame, steady=True)
+            plot.maybe_redraw(now=1000.0 * frame)
+        assert len(plot._axes[0].patches) == 1
+        plot.close()
+
+    def test_the_corner_note_does_not_accumulate(self):
+        config = GaspermConfig()
+        config.run.plot.panels = ["outlet_pressure"]
+        plot = self._plot(config)
+        for frame in range(1, 6):
+            self.feed(plot, 20, start=20 * frame, status=status_with())
+            plot.maybe_redraw(now=1000.0 * frame)
+        notes = [t.get_text() for t in plot._axes[0].texts]
+        assert notes.count("not a steady-state signal") == 1
+        plot.close()
+
+    def test_the_y_axis_still_follows_the_data_after_a_criterion_band(self):
+        """A band's set_ylim turns autoscale off; the next frame must re-enable it.
+
+        Without that the panel freezes at the first frame's limits and a signal
+        walking out of range slides off the top of a plot that looks fine --
+        exactly the drift the criterion lines are there to make visible.
+        """
+        config = GaspermConfig()
+        config.run.plot.panels = ["inlet_pressure"]
+        plot = self._plot(config)
+        for index in range(60):
+            plot.add(reading(index, index * 0.1, inlet_atm=5.0), status_with("inlet_pressure"))
+        plot.maybe_redraw(now=1000.0)
+        settled = plot._axes[0].get_ylim()
+
+        # The inlet climbs well clear of the old window.
+        for index in range(60, 120):
+            plot.add(reading(index, index * 0.1, inlet_atm=9.0), status_with("inlet_pressure"))
+        plot.maybe_redraw(now=2000.0)
+        assert plot._axes[0].get_ylim()[1] > settled[1]
+        plot.close()
+
+    def test_a_pinned_range_survives_repeated_frames(self):
+        """The decay panel's floor is not a first-frame-only courtesy."""
+        config = GaspermConfig()
+        config.run.method = "pulse_decay"
+        config.run.plot.panels = ["decay_fraction"]
+        plot = self._plot(config)
+        for frame in range(1, 5):
+            for index in range(20 * frame, 20 * frame + 20):
+                plot.add(reading(index, index * 0.1, decay_fraction=1.0 - 1e-5 * index))
+            plot.maybe_redraw(now=1000.0 * frame)
+        low, high = plot._axes[0].get_ylim()
+        floor = config.run.pulse_decay.stop_below_fraction * 0.8
+        assert low <= floor and high >= 1.05
+        plot.close()
+
+
+class TestRedrawBackoff:
+    """Drawing happens on the acquisition thread, so it has to budget itself."""
+
+    def test_a_fast_redraw_keeps_the_configured_interval(self):
+        plot = LivePlot(GaspermConfig(), redraw_interval_s=0.5)
+        plot._redraw_cost_s = 0.002
+        assert plot._effective_interval_s() == pytest.approx(0.5)
+
+    def test_a_slow_redraw_stretches_it(self):
+        """A 0.15 s redraw every 0.5 s spends a third of the run not sampling."""
+        from gasperm.plotting import MAX_REDRAW_DUTY
+
+        plot = LivePlot(GaspermConfig(), redraw_interval_s=0.5)
+        plot._redraw_cost_s = 0.15
+        assert plot._effective_interval_s() == pytest.approx(0.15 / MAX_REDRAW_DUTY)
+        assert plot._effective_interval_s() > 0.5
+
+    def test_the_interval_is_never_shortened(self):
+        """It is a floor the operator set, not a target to be optimised past."""
+        plot = LivePlot(GaspermConfig(), redraw_interval_s=5.0)
+        plot._redraw_cost_s = 0.001
+        assert plot._effective_interval_s() == pytest.approx(5.0)
+
+    def test_an_unmeasured_plot_uses_the_configured_interval(self):
+        plot = LivePlot(GaspermConfig(), redraw_interval_s=0.5)
+        assert plot._redraw_cost_s is None
+        assert plot._effective_interval_s() == pytest.approx(0.5)
+
+    def test_the_cost_is_measured_from_a_real_redraw(self):
+        plot = LivePlot(GaspermConfig())
+        plot.open()
+        plot.add(reading())
+        plot.maybe_redraw(now=100.0)
+        assert plot._redraw_cost_s is not None and plot._redraw_cost_s > 0.0
+        plot.close()
+
+    def test_backoff_defers_the_next_frame(self):
+        """The measured cost, not the configured interval, gates the next one."""
+        plot = LivePlot(GaspermConfig(), redraw_interval_s=0.5)
+        plot.open()
+        plot.add(reading())
+        assert plot.maybe_redraw(now=100.0) is True
+        plot._redraw_cost_s = 0.15  # a slow backend
+        assert plot.maybe_redraw(now=100.6) is False
+        assert plot.maybe_redraw(now=102.0) is True
+        plot.close()
+
+
 class TestLoopSafety:
     """The plot must never be able to take a run down with it."""
 

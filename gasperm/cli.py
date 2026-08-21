@@ -937,6 +937,7 @@ def collect_command(
     )
     from gasperm.gas_properties import build_provider
     from gasperm.hardware.daq import DaqError, open_analog_input
+    from gasperm.preview import ConsoleThrottle
     from gasperm.storage import RunWriter
 
     _configure_logging(verbose)
@@ -1120,12 +1121,29 @@ def collect_command(
         else SampleProcessor(config, gas_provider)
     )
 
-    def on_reading(reading) -> None:
-        writer.write(reading)
+    # `ConsoleThrottle` is defined next to `preview`'s console loop, which needs
+    # the same thing for the same reason: this callback runs
+    # inside the sample slot, and writing a line to a Windows console is slow
+    # enough that echoing every sample at 10 Hz starves the loop -- while
+    # scrolling far too fast to read. The CSV keeps every sample regardless;
+    # only what reaches the terminal is thinned. A rate slower than the throttle
+    # prints every sample, since `due()` is true whenever the interval has
+    # passed.
+    console = ConsoleThrottle()
+    printed_index: int | None = None
+
+    def show(reading) -> None:
+        nonlocal printed_index
         if pulse_mode:
             typer.echo(format_pulse_reading_line(reading, loop.status, config))
         else:
             typer.echo(format_reading_line(reading, config))
+        printed_index = reading.index
+
+    def on_reading(reading) -> None:
+        writer.write(reading)
+        if console.due(time.monotonic()):
+            show(reading)
         if live_plot is not None:
             # The detector's verdict is what the criterion lines are drawn
             # from; it is already updated for this reading by the time the
@@ -1186,6 +1204,12 @@ def collect_command(
         logger.info("Interrupted.")
     finally:
         writer.close()
+        # The console is throttled, so the last line on screen is whichever
+        # sample happened to land on a tick. Show the final one unconditionally
+        # -- a run that ends between ticks would otherwise close on a stale
+        # reading, and on a pulse run that line is the decay's last word.
+        if loop.readings and loop.readings[-1].index != printed_index:
+            show(loop.readings[-1])
         if live_plot is not None:
             live_plot.close()
 

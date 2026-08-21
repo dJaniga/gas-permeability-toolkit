@@ -83,6 +83,20 @@ DOWNSTREAM_MISMATCH_TOLERANCE = 0.05
 #: the point at which "slower than the sample rate" becomes "not answering".
 MISSED_CONVERSIONS = 3
 
+#: The share of the configured sample rate a run must actually achieve before
+#: it is reported as having fallen behind. A few slow slots are a desktop OS
+#: doing desktop things and say nothing about the rig; a sustained shortfall
+#: means the loop is starved -- almost always by the live plot, which draws on
+#: the acquisition thread. See ``_LoopBase._warn_if_behind``.
+MIN_ACHIEVED_RATE_FRACTION = 0.95
+
+#: The share of slots that may start late before the run is reported as having
+#: sampled in bursts rather than evenly. Separate from the rate check above
+#: because absolute-target pacing wins back the time a slow callback lost --
+#: so a badly bunched run still lands on its configured mean rate, and only
+#: this notices. See ``_LoopBase._warn_if_behind``.
+MAX_LATE_SLOT_FRACTION = 0.1
+
 #: Porosity to fall back on when the sample sheet does not record one, used
 #: only to bound the equilibration time from below -- consolidated rock is
 #: rarely tighter than this, so the true time can only be longer. It decides
@@ -567,6 +581,12 @@ class _LoopBase:
         self._stop_reason = ""
         self.started_at: datetime | None = None
         self.ended_at: datetime | None = None
+        #: Slots the loop was already past by the time it came to sleep. See
+        #: :meth:`_pace` -- a display handler that outruns the sample interval
+        #: shows up here and nowhere else.
+        self.late_slots = 0
+        #: The worst single overrun, in seconds.
+        self.worst_overrun_s = 0.0
 
     # -- control ----------------------------------------------------------
 
@@ -610,6 +630,78 @@ class _LoopBase:
                 f"({temperature.temperature_c:.2f} degC).",
             )
         return voltages, temperature
+
+    # -- timing -----------------------------------------------------------
+
+    def _pace(self, target_s: float, interval_s: float) -> None:
+        """Sleep until the next slot, counting the slots already gone.
+
+        Sleeping to an absolute target rather than for a fixed interval stops a
+        slow sample making the whole run drift late. What it cannot do is buy
+        back time already spent: if the sample and the callback together took
+        longer than the interval, the next slot has passed and the loop starts
+        it late.
+
+        That is otherwise invisible. Each reading carries its *true* elapsed
+        time from the clock, not its slot index, so the decay fit and the
+        steady-state windows stay correct -- the run simply has fewer points
+        than it asked for, and the only symptoms are a console and a plot that
+        feel behind. Counting it here is what lets a run say so at the end
+        instead of leaving a rig quietly sampling at 6 Hz looking healthy.
+        """
+        remaining = (target_s + interval_s) - self._clock()
+        if remaining > 0:
+            self._sleep(remaining)
+            return
+        self.late_slots += 1
+        self.worst_overrun_s = max(self.worst_overrun_s, -remaining)
+
+    def _warn_if_behind(self, interval_s: float) -> None:
+        """Record one warning if the loop could not keep to its slots.
+
+        There are **two** distinct failures here and only one of them shows up
+        in the mean rate. Because :meth:`_pace` sleeps to an absolute target, a
+        loop that loses time to a slow callback wins it back by taking the next
+        samples with no sleep at all -- so a run that spends a third of its
+        wall clock drawing still finishes with very nearly the ordered number
+        of samples, at very nearly the ordered mean rate, in *bursts*. That is
+        what a stuttering console and plot actually are, and a check on the
+        mean rate alone would call it healthy.
+
+        So the cadence is judged separately from the rate, and the warning says
+        which one went. Neither makes a result wrong -- every reading carries
+        its true elapsed time -- but bunched samples are not the even series
+        the run was configured to take.
+        """
+        if not self.late_slots or len(self.readings) < 2:
+            return
+        span_s = self.readings[-1].elapsed_s - self.readings[0].elapsed_s
+        if span_s <= 0.0:
+            return
+        achieved_hz = (len(self.readings) - 1) / span_s
+        configured_hz = 1.0 / interval_s
+        late_fraction = self.late_slots / len(self.readings)
+        remedy = (
+            "The live plot is the usual cause; raise run.plot.redraw_interval_s "
+            "or drop --plot."
+        )
+        if achieved_hz < configured_hz * MIN_ACHIEVED_RATE_FRACTION:
+            self._record_warning(
+                f"The acquisition loop could not hold the configured sample rate: "
+                f"{self.late_slots} slot(s) started late (worst "
+                f"{self.worst_overrun_s * 1000:.0f} ms), giving {achieved_hz:.1f} Hz "
+                f"against the configured {configured_hz:.1f} Hz. Readings carry "
+                "their true timestamps, so the result stands -- on fewer points "
+                f"than intended. {remedy}"
+            )
+        elif late_fraction > MAX_LATE_SLOT_FRACTION:
+            self._record_warning(
+                f"The acquisition loop kept {achieved_hz:.1f} Hz on average but "
+                f"took it in bursts: {self.late_slots} of {len(self.readings)} "
+                f"slot(s) started late (worst {self.worst_overrun_s * 1000:.0f} ms), "
+                "so samples are bunched rather than evenly spaced. Timestamps are "
+                f"true, so the result stands. {remedy}"
+            )
 
     def _emit(self, reading: Reading) -> None:
         if self.on_reading is None:
@@ -763,18 +855,14 @@ class AcquisitionLoop(_LoopBase):
                         )
                         break
                 index += 1
-
-                # Sleep to the next slot rather than a fixed interval, so a
-                # slow sample does not make the whole run drift late.
-                remaining = (target + interval_s) - self._clock()
-                if remaining > 0:
-                    self._sleep(remaining)
+                self._pace(target, interval_s)
         finally:
             self.ended_at = datetime.now(timezone.utc)
             if previous_handler is not None:
                 signal.signal(signal.SIGINT, previous_handler)
             self.close()
 
+        self._warn_if_behind(interval_s)
         if self.steady_state_reached and not self.detector.is_steady:
             self.ended_unsteady = True
             self._record_warning(
@@ -961,15 +1049,14 @@ class PulseDecayLoop(_LoopBase):
 
                 index += 1
                 target = start + index * interval_s
-                remaining = (target + interval_s) - self._clock()
-                if remaining > 0:
-                    self._sleep(remaining)
+                self._pace(target, interval_s)
         finally:
             self.ended_at = datetime.now(timezone.utc)
             if previous_handler is not None:
                 signal.signal(signal.SIGINT, previous_handler)
             self.close()
 
+        self._warn_if_behind(interval_s)
         if leak_test and not self.pulse_seen:
             self._record_warning(
                 "No pulse was detected during the leak test, so nothing was watched "

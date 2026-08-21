@@ -884,6 +884,69 @@ class TestCollectFooter:
             assert banned not in text, f"footer should not coach the operator: {banned!r}"
 
 
+class TestCollectConsole:
+    """What reaches the terminal during a run, and what must not gate it.
+
+    The per-sample callback runs *inside* the sample slot, so everything in it
+    is time the rig is not sampling. Writing a line to a console is slow enough
+    to matter at 10 Hz -- and unreadable at that rate anyway -- so the console
+    is thinned while the CSV keeps every sample. This drives the whole command
+    against the fake DAQ and probe, because the throttle lives in the wiring
+    rather than in any one function.
+    """
+
+    def run_collect(self, tmp_path, samples, *flags):
+        init_config(tmp_path)
+        sample = add_sample(tmp_path / "samples", "core-041")
+        result = runner.invoke(
+            app,
+            ["collect", "-c", str(tmp_path), "--sample", str(sample),
+             "-n", str(samples), *flags],
+        )
+        return result, tmp_path / "runs"
+
+    def reading_lines(self, output):
+        """The per-sample lines, which all start with an elapsed time."""
+        return [
+            line for line in strip_ansi(output).splitlines()
+            if re.match(r"^\s*\d+\.\d+s\s", line)
+        ]
+
+    def csv_rows(self, runs_dir):
+        directory = next(runs_dir.iterdir())
+        text = (directory / "readings.csv").read_text(encoding="utf-8")
+        return [line for line in text.splitlines()[1:] if line.strip()]
+
+    def test_the_console_is_thinner_than_the_run(
+        self, tmp_path, fake_nidaqmx, fake_serial
+    ):
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, _ = self.run_collect(tmp_path, 30)
+        assert result.exit_code in (0, 2), result.output
+        lines = self.reading_lines(result.output)
+        assert 0 < len(lines) < 30
+
+    def test_every_sample_still_reaches_the_csv(
+        self, tmp_path, fake_nidaqmx, fake_serial
+    ):
+        """Only the terminal is thinned. Thinning the record would be a bug."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, runs = self.run_collect(tmp_path, 30)
+        assert len(self.csv_rows(runs)) == 30
+        assert len(self.reading_lines(result.output)) < 30
+
+    def test_the_last_sample_is_always_shown(
+        self, tmp_path, fake_nidaqmx, fake_serial
+    ):
+        """A run ending between ticks would otherwise close on a stale line."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, runs = self.run_collect(tmp_path, 30)
+        last_elapsed = float(self.csv_rows(runs)[-1].split(",")[2])
+        assert self.reading_lines(result.output)[-1].strip().startswith(
+            f"{last_elapsed:.1f}s"
+        )
+
+
 class TestLivePlotFlags:
     """The plot flags are rejected before any hardware is opened.
 
