@@ -74,7 +74,7 @@ plot:
   panels: [inlet_pressure, outlet_pressure, flow, temperature, permeability]
   window_s: null          # null = whole run from t0; a number = trailing window
   show_criteria: true     # the steady-state bands and the fitted drift line
-  redraw_interval_s: 0.5  # a floor; stretched if a frame costs too much (below)
+  redraw_interval_s: 0.5  # honoured as set while the plot has its own thread
   max_points: 3600        # per series; the from-t0 view decimates to fit
 ```
 
@@ -109,22 +109,44 @@ exponential decay straightens into a line and a leak or thermal ramp does not.
 No criterion annotations appear there — no detector runs in pulse mode, so
 drawing them would assert something never tested.
 
-**Drawing costs the run time, and budgets itself accordingly.** Buffering a
-sample is O(1) and free, but the redraw happens on the acquisition thread —
-there is no separate render thread — so every millisecond spent drawing is a
-millisecond the rig is not sampling in. On a five-panel figure a redraw costs
-roughly 0.15 s against a 0.1 s sample slot at 10 Hz, so `redraw_interval_s` is
-treated as a **floor**: the plot measures what a frame actually costs on your
-machine and backend, and stretches the interval until drawing takes no more
-than a tenth of the wall clock. It only ever lengthens, so a fast machine keeps
-the interval you set, and it says so in the log the first time it backs off.
+**With a window open, the run moves to a second thread.** A redraw of a
+five-panel figure costs on the order of 0.15 s, against a 0.1 s sample slot at
+10 Hz, so drawing inside the per-sample callback spends a large part of the run
+not sampling. `collect` and `preview` therefore split the two: the
+**acquisition loop runs on a worker thread and the plot keeps the main
+thread**.
 
-Without that budget the symptom is not a missing sample but a *bunched* one.
-The loop sleeps to an absolute target, so it wins back the time a slow frame
-cost by taking the next samples with no sleep at all — the mean rate survives
-and the cadence does not, which is what a stuttering console and plot are. A
-run that spends too much of itself drawing says so in its summary, separating
-the two cases: `could not hold the configured sample rate` when the rate
+That order surprises people, and it is not a choice. matplotlib's GUI backends
+may only draw on the thread that owns them, which is the main thread — so
+moving the *plot* to a worker, the arrangement most people reach for first, is
+the one that is actually forbidden. Moving the acquisition instead is what is
+left, and it is also what you want: the loop spends nearly all of its slot
+asleep, and both the sleep and the DAQ read release the GIL, so the drawing
+gets the processor exactly when the loop has no use for it.
+
+Measured on a 12 s run at 10 Hz with five panels, drawing inline against
+drawing on its own thread:
+
+| | inline | threaded |
+|---|---|---|
+| slots starting late | 7 % | **0 %** |
+| worst gap between samples | 210 ms | **113 ms** |
+
+With no `--plot` there is nothing to draw and the loop stays where it is; that
+is the only difference between the two paths.
+
+Ctrl+C still stops a run, and still stops it cleanly — the first one asks the
+loop to finish its current sample, so a partial run is written and summarised
+rather than lost. A second interrupt gives up waiting, which matters only if
+the DAQ has wedged. Closing the plot window mid-run is not a fault and does not
+stop anything.
+
+**The run still reports its own cadence**, because that is the instrument that
+tells you whether any of this is working. The loop sleeps to an absolute
+target, so it wins back time a slow frame cost by taking the next samples with
+no sleep at all — meaning a starved run can hold its mean rate and lose only
+its *spacing*, which is what a stuttering console and plot are. The summary
+separates the two: `could not hold the configured sample rate` when the rate
 genuinely fell short, and `took it in bursts` when only the spacing went. Both
 leave the result correct — every reading carries its true elapsed time from the
 clock, never its slot index — and both mean fewer or less evenly spaced points

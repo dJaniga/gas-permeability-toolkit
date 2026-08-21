@@ -937,6 +937,7 @@ def collect_command(
     )
     from gasperm.gas_properties import build_provider
     from gasperm.hardware.daq import DaqError, open_analog_input
+    from gasperm.live import run_with_display
     from gasperm.preview import ConsoleThrottle
     from gasperm.storage import RunWriter
 
@@ -1145,12 +1146,15 @@ def collect_command(
         if console.due(time.monotonic()):
             show(reading)
         if live_plot is not None:
+            # Buffering only -- O(1), and safe to call from the acquisition
+            # thread. The drawing itself belongs to whoever owns the main
+            # thread; see `run_with_display`.
+            #
             # The detector's verdict is what the criterion lines are drawn
             # from; it is already updated for this reading by the time the
             # loop calls back. A pulse run has no steady-state status, so the
             # plot draws no criteria -- which its own panels already reflect.
             live_plot.add(reading, None if pulse_mode else loop.status)
-            live_plot.maybe_redraw()
 
     loop_class = PulseDecayLoop if pulse_mode else AcquisitionLoop
     loop = loop_class(
@@ -1195,7 +1199,16 @@ def collect_command(
 
     exit_code = 0
     try:
-        loop.run()
+        if live_plot is None:
+            loop.run()
+        else:
+            # With a window open the loop moves to a worker and the drawing
+            # keeps the main thread -- the only order matplotlib's GUI backends
+            # allow, and the only one that keeps a 0.15 s frame out of a 0.1 s
+            # sample slot. Without a window there is nothing to draw and the
+            # loop stays where it is, on the simpler path.
+            live_plot.on_own_thread = True
+            run_with_display(loop, live_plot)
     except DaqError as exc:
         logger.error("%s", exc)
         typer.secho(f"\nAcquisition stopped: {exc}", fg=typer.colors.RED, err=True)
@@ -1333,6 +1346,7 @@ def preview_command(
     """
     from gasperm.config import load_bench_config
     from gasperm.hardware.daq import DaqError, NiDaqAnalogInput
+    from gasperm.live import run_with_display
     from gasperm.preview import (
         GROUPS,
         ConsoleThrottle,
@@ -1480,8 +1494,9 @@ def preview_command(
 
     def on_sample(sample) -> None:
         if live_plot is not None:
+            # Buffering only; the drawing belongs to the main thread. See
+            # `run_with_display`.
             live_plot.add(sample)
-            live_plot.maybe_redraw()
         if throttle.due(time.monotonic()):
             show(sample)
 
@@ -1497,7 +1512,11 @@ def preview_command(
 
     exit_code = 0
     try:
-        loop.run()
+        if live_plot is None:
+            loop.run()
+        else:
+            live_plot.on_own_thread = True
+            run_with_display(loop, live_plot)
     except DaqError as exc:
         logger.error("%s", exc)
         typer.secho(f"\nPreview stopped: {exc}", fg=typer.colors.RED, err=True)

@@ -12,9 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import matplotlib
 import pytest
 import yaml
-from typer.testing import CliRunner
+
+matplotlib.use("Agg")  # noqa: E402 - no window may open during a test run
+
+from typer.testing import CliRunner  # noqa: E402
 
 from gasperm import cli, units
 from gasperm.cli import app
@@ -944,6 +948,93 @@ class TestCollectConsole:
         last_elapsed = float(self.csv_rows(runs)[-1].split(",")[2])
         assert self.reading_lines(result.output)[-1].strip().startswith(
             f"{last_elapsed:.1f}s"
+        )
+
+
+class TestCollectWithLivePlot:
+    """A whole run with a window open, on the threaded path.
+
+    With ``--plot`` the acquisition loop moves to a worker and the drawing keeps
+    the main thread -- the only order matplotlib's GUI backends allow. That is a
+    different code path through the command, so it is driven end to end here
+    rather than trusted to the driver's own unit tests.
+    """
+
+    def _collect(self, tmp_path, monkeypatch, *flags, samples=20):
+        from gasperm import live
+
+        seen = {}
+        original = live.run_with_display
+
+        def spy(loop, display, **kwargs):
+            seen["loop"] = loop
+            seen["display"] = display
+            return original(loop, display, **kwargs)
+
+        monkeypatch.setattr(live, "run_with_display", spy)
+        init_config(tmp_path)
+        sample = add_sample(tmp_path / "samples", "core-041")
+        result = runner.invoke(
+            app,
+            ["collect", "-c", str(tmp_path), "--sample", str(sample),
+             "-n", str(samples), *flags],
+        )
+        return result, seen
+
+    def test_a_plotted_run_goes_through_the_driver(
+        self, tmp_path, monkeypatch, fake_nidaqmx, fake_serial
+    ):
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, seen = self._collect(tmp_path, monkeypatch, "--plot")
+        assert result.exit_code in (0, 2), result.output
+        assert "loop" in seen, "collect --plot did not use run_with_display"
+
+    def test_an_unplotted_run_does_not(
+        self, tmp_path, monkeypatch, fake_nidaqmx, fake_serial
+    ):
+        """No window means nothing to draw, so the loop stays on the simple path."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, seen = self._collect(tmp_path, monkeypatch)
+        assert result.exit_code in (0, 2), result.output
+        assert seen == {}
+
+    def test_every_sample_survives_the_thread_handoff(
+        self, tmp_path, monkeypatch, fake_nidaqmx, fake_serial
+    ):
+        """The worker writes the CSV; a dropped or duplicated row would show here."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, _ = self._collect(tmp_path, monkeypatch, "--plot", samples=25)
+        assert result.exit_code in (0, 2), result.output
+        directory = next((tmp_path / "runs").iterdir())
+        rows = [
+            line for line in
+            (directory / "readings.csv").read_text(encoding="utf-8").splitlines()[1:]
+            if line.strip()
+        ]
+        assert len(rows) == 25
+        indices = [int(row.split(",")[0]) for row in rows]
+        assert indices == list(range(25))
+
+    def test_the_run_is_still_written_and_summarised(
+        self, tmp_path, monkeypatch, fake_nidaqmx, fake_serial
+    ):
+        """Everything after the loop must still happen once the worker is joined."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        result, _ = self._collect(tmp_path, monkeypatch, "--plot")
+        directory = next((tmp_path / "runs").iterdir())
+        assert (directory / "readings.csv").exists()
+        assert (directory / "run_metadata.yaml").exists()
+        assert "Run written to" in strip_ansi(result.output)
+
+    def test_the_plot_is_told_it_owns_the_main_thread(
+        self, tmp_path, monkeypatch, fake_nidaqmx, fake_serial
+    ):
+        """Which stands the duty budget down -- it only exists for the other order."""
+        fake_serial.lines = [b"T:22.0\n"] * 4000
+        _, seen = self._collect(tmp_path, monkeypatch, "--plot")
+        assert seen["display"].on_own_thread is True
+        assert seen["display"]._effective_interval_s() == pytest.approx(
+            seen["display"].redraw_interval_s
         )
 
 

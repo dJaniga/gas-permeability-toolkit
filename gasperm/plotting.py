@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from bisect import bisect_left
 from pathlib import Path
@@ -315,11 +316,19 @@ class _History:
         Decimated by a stride that doubles whenever it fills. Backs the from-t0
         view, so a multi-hour run spans the whole x-axis at fixed memory
         instead of either exhausting it or silently starting the axis late.
+
+    **This is the boundary between two threads.** ``append`` is called from the
+    acquisition worker and :meth:`view` from the main thread that draws, so
+    both take the lock -- and ``view`` returns *copies*. Handing out the live
+    lists would let a truncation land in the middle of a draw that takes a
+    tenth of a second to read them. Copying costs a fraction of a millisecond
+    and lets the lock go before the expensive part starts.
     """
 
     def __init__(self, channels: Sequence[str], max_points: int) -> None:
         self._channels = list(channels)
         self.max_points = max_points
+        self._lock = threading.Lock()
         self.recent_times: list[float] = []
         self.recent: dict[str, list[float]] = {name: [] for name in self._channels}
         self.recent_steady: list[bool] = []
@@ -333,27 +342,29 @@ class _History:
         return self._seen
 
     def append(self, elapsed_s: float, values: dict[str, float], steady: bool) -> None:
-        self.recent_times.append(elapsed_s)
-        for name in self._channels:
-            self.recent[name].append(values[name])
-        self.recent_steady.append(steady)
-        if len(self.recent_times) > self.max_points:
-            # Drop the oldest in one slice rather than per-append: amortised
-            # O(1) and it keeps the lists contiguous for matplotlib.
-            keep = self.max_points // 2
-            self.recent_times = self.recent_times[-keep:]
+        """Buffer one sample. O(1) amortised, and called from the worker thread."""
+        with self._lock:
+            self.recent_times.append(elapsed_s)
             for name in self._channels:
-                self.recent[name] = self.recent[name][-keep:]
-            self.recent_steady = self.recent_steady[-keep:]
+                self.recent[name].append(values[name])
+            self.recent_steady.append(steady)
+            if len(self.recent_times) > self.max_points:
+                # Drop the oldest in one slice rather than per-append: amortised
+                # O(1) and it keeps the lists contiguous for matplotlib.
+                keep = self.max_points // 2
+                self.recent_times = self.recent_times[-keep:]
+                for name in self._channels:
+                    self.recent[name] = self.recent[name][-keep:]
+                self.recent_steady = self.recent_steady[-keep:]
 
-        if self._seen % self._stride == 0:
-            self.archive_times.append(elapsed_s)
-            for name in self._channels:
-                self.archive[name].append(values[name])
-            self.archive_steady.append(steady)
-            if len(self.archive_times) > self.max_points:
-                self._decimate()
-        self._seen += 1
+            if self._seen % self._stride == 0:
+                self.archive_times.append(elapsed_s)
+                for name in self._channels:
+                    self.archive[name].append(values[name])
+                self.archive_steady.append(steady)
+                if len(self.archive_times) > self.max_points:
+                    self._decimate()
+            self._seen += 1
 
     def _decimate(self) -> None:
         """Halve the archive and double the stride, covering the same span."""
@@ -364,33 +375,42 @@ class _History:
         self._stride *= 2
 
     def view(self, window_s: float | None) -> tuple[list[float], dict[str, list[float]], list[bool]]:
-        """The series to draw for the requested display mode.
+        """A **copy** of the series to draw for the requested display mode.
 
         A trailing window is served from ``recent`` when that still reaches
         back far enough, and from the archive otherwise -- asking for a window
         longer than the buffer holds degrades to coarser data rather than to a
         silently truncated axis.
-        """
-        if window_s is None:
-            return self.archive_times, self.archive, self.archive_steady
 
-        covers = bool(self.recent_times) and (
-            self.recent_times[0] <= self.recent_times[-1] - window_s
-            or len(self.recent_times) == self._seen
-        )
-        times, channels, steady = (
-            (self.recent_times, self.recent, self.recent_steady)
-            if covers
-            else (self.archive_times, self.archive, self.archive_steady)
-        )
-        if not times:
-            return times, channels, steady
-        start = bisect_left(times, times[-1] - window_s)
-        return (
-            times[start:],
-            {name: series[start:] for name, series in channels.items()},
-            steady[start:],
-        )
+        Always a copy, never the live lists: the caller is the drawing thread
+        and will spend a tenth of a second reading what it gets back, while the
+        acquisition worker goes on appending to and truncating the originals.
+        """
+        with self._lock:
+            if window_s is None:
+                return (
+                    list(self.archive_times),
+                    {name: list(series) for name, series in self.archive.items()},
+                    list(self.archive_steady),
+                )
+
+            covers = bool(self.recent_times) and (
+                self.recent_times[0] <= self.recent_times[-1] - window_s
+                or len(self.recent_times) == self._seen
+            )
+            times, channels, steady = (
+                (self.recent_times, self.recent, self.recent_steady)
+                if covers
+                else (self.archive_times, self.archive, self.archive_steady)
+            )
+            if not times:
+                return list(times), {n: list(s) for n, s in channels.items()}, list(steady)
+            start = bisect_left(times, times[-1] - window_s)
+            return (
+                times[start:],
+                {name: series[start:] for name, series in channels.items()},
+                steady[start:],
+            )
 
 
 class _StackedPlot:
@@ -437,6 +457,10 @@ class _StackedPlot:
         #: Smoothed cost of one redraw, or None until one has been drawn.
         self._redraw_cost_s: float | None = None
         self._backoff_reported = False
+        #: Set by :func:`gasperm.live.run_with_display` when this plot has the
+        #: main thread to itself and the loop is elsewhere. Drawing then costs
+        #: the run nothing directly, so the duty budget stands down.
+        self.on_own_thread = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -546,19 +570,17 @@ class _StackedPlot:
 
     # -- data flow --------------------------------------------------------
 
-    def maybe_redraw(self, now: float | None = None) -> bool:
+    def maybe_redraw(self, now: float | None = None, *, force: bool = False) -> bool:
         """Redraw if the interval has elapsed. Returns whether it did.
 
-        Called from the acquisition loop after the per-sample append, so the
-        time this takes is time the rig is *not* sampling in. The configured
-        interval is therefore a floor, not the whole story: a redraw that turns
-        out to cost more than :data:`MAX_REDRAW_DUTY` of it backs the interval
-        off until it does not. See :meth:`_effective_interval_s`.
+        ``force`` draws regardless of the interval, for the last frame of a run:
+        it ended somewhere between two ticks, and the operator should be looking
+        at where it finished.
         """
         if self._disabled or self._figure is None or not len(self._history):
             return False
         moment = now if now is not None else time.monotonic()
-        if moment - self._last_redraw < self._effective_interval_s():
+        if not force and moment - self._last_redraw < self._effective_interval_s():
             return False
         self._last_redraw = moment
         started = time.perf_counter()
@@ -572,22 +594,39 @@ class _StackedPlot:
         return True
 
     def _effective_interval_s(self) -> float:
-        """The configured interval, or longer if drawing is slow on this rig.
+        """The configured interval, or longer if drawing would starve the loop.
 
-        A redraw is not free and does not run on a thread of its own: on a
-        five-panel figure it costs on the order of 0.15 s, against a 0.1 s
-        sample slot at the default 10 Hz. Left alone at ``redraw_interval_s:
-        0.5`` that spends a third of the run drawing instead of sampling, and
-        the symptom -- a plot that stutters and a console that falls behind --
-        looks like the plot being slow rather than the loop being starved.
+        This budget exists for **one** arrangement: the redraw running inside
+        the acquisition loop's per-sample callback, where the 0.15 s a
+        five-panel figure costs comes straight out of a 0.1 s sample slot.
+        There, stretching the interval is the only thing standing between the
+        operator and a run that spends a third of itself drawing.
 
-        So the interval is stretched to hold drawing to a small share of the
-        wall clock. It only ever lengthens: a fast machine keeps the interval
-        it was given.
+        Once :func:`gasperm.live.run_with_display` moves the loop to a worker
+        thread, that stops being true -- drawing no longer takes the loop's
+        time -- and the budget would only throttle the window for nothing. So
+        the driver sets :attr:`on_own_thread` and the configured interval is
+        honoured as given.
         """
-        if self._redraw_cost_s is None:
+        if self.on_own_thread or self._redraw_cost_s is None:
             return self.redraw_interval_s
         return max(self.redraw_interval_s, self._redraw_cost_s / MAX_REDRAW_DUTY)
+
+    def pump(self) -> None:
+        """Service the GUI's event queue without redrawing.
+
+        Called far more often than :meth:`maybe_redraw` while the worker
+        samples. A window whose events are only serviced once a redraw is due
+        cannot be dragged, resized or closed in between, and the window manager
+        eventually paints it as "not responding".
+        """
+        if self._disabled or self._figure is None:
+            return
+        try:
+            self._figure.canvas.flush_events()
+        except Exception as exc:  # noqa: BLE001 - the window may have been closed
+            logger.warning("Live plot event pump failed and has been disabled: %s", exc)
+            self._disabled = True
 
     def _note_redraw_cost(self, seconds: float) -> None:
         """Track what a redraw costs, smoothed, and say so the first time it bites."""
@@ -598,7 +637,11 @@ class _StackedPlot:
             if self._redraw_cost_s is None
             else 0.7 * self._redraw_cost_s + 0.3 * seconds
         )
-        if self._backoff_reported or self._effective_interval_s() <= self.redraw_interval_s:
+        if (
+            self.on_own_thread
+            or self._backoff_reported
+            or self._effective_interval_s() <= self.redraw_interval_s
+        ):
             return
         self._backoff_reported = True
         logger.info(

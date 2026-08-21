@@ -9,6 +9,7 @@ testable logic, not something only visible by eye on a running rig.
 from __future__ import annotations
 
 import math
+import threading
 
 import matplotlib
 import pytest
@@ -621,6 +622,70 @@ class TestRepeatedRedraw:
         floor = config.run.pulse_decay.stop_below_fraction * 0.8
         assert low <= floor and high >= 1.05
         plot.close()
+
+
+class TestHistoryUnderTwoThreads:
+    """The buffer is the boundary between the worker and the drawing thread.
+
+    ``append`` comes from the acquisition worker and ``view`` from the main
+    thread, which then spends a tenth of a second reading what it got. Handing
+    back the live lists would let the worker's truncation land in the middle of
+    that read.
+    """
+
+    def test_a_view_is_a_copy_not_the_live_buffer(self):
+        history = _History(["a"], max_points=100)
+        for index in range(10):
+            history.append(index * 0.1, {"a": float(index)}, False)
+        times, channels, flags = history.view(None)
+        history.append(99.0, {"a": 99.0}, True)
+        # What the drawing thread is holding did not change under it.
+        assert times[-1] == pytest.approx(0.9)
+        assert channels["a"][-1] == pytest.approx(9.0)
+        assert len(flags) == 10
+
+    def test_a_windowed_view_is_a_copy_too(self):
+        history = _History(["a"], max_points=100)
+        for index in range(50):
+            history.append(index * 0.1, {"a": float(index)}, False)
+        times, channels, _ = history.view(1.0)
+        taken = len(times)
+        for index in range(50, 100):
+            history.append(index * 0.1, {"a": float(index)}, False)
+        assert len(times) == taken
+        assert len(channels["a"]) == taken
+
+    def test_appending_while_viewing_does_not_corrupt_either(self):
+        """Reader and writer at full tilt, including the truncation path."""
+        history = _History(["a", "b"], max_points=64)
+        stop = threading.Event()
+        failures: list[BaseException] = []
+
+        def writer():
+            index = 0
+            while not stop.is_set():
+                history.append(index * 0.01, {"a": float(index), "b": -float(index)}, False)
+                index += 1
+
+        def reader():
+            try:
+                for _ in range(2000):
+                    times, channels, flags = history.view(None)
+                    # Every series must agree with the timebase it came with.
+                    assert len(times) == len(flags)
+                    for series in channels.values():
+                        assert len(series) == len(times)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+
+        hand = threading.Thread(target=writer, daemon=True)
+        hand.start()
+        try:
+            reader()
+        finally:
+            stop.set()
+            hand.join(timeout=5.0)
+        assert not failures, failures[0]
 
 
 class TestRedrawBackoff:
