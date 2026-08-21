@@ -909,11 +909,18 @@ def write_sample_summary(report, path: str | Path) -> Path:
             "method": line.method,
             "purpose": line.purpose,
             "confirmed": line.confirmed,
+            # Means over the measured window. A file is parsed rather than
+            # read, so both these and the pulse-decay setup condition below are
+            # written under their own names -- the table picks one per method,
+            # but nothing downstream should have to know which it picked.
             "inlet_pressure_atm": line.inlet_pressure_atm,
             "downstream_pressure_atm": line.downstream_pressure_atm,
             "mean_pressure_atm": line.mean_pressure_atm,
-            # dP0, the pulse a decay started from. Absent for steady state.
+            # dP0 and the pressures at the pulse: what a pulse-decay run has to
+            # be set up to in order to repeat it. Absent for steady state.
             "pulse_amplitude_atm": line.pulse_amplitude_atm,
+            "initial_inlet_pressure_atm": line.initial_inlet_pressure_atm,
+            "initial_downstream_pressure_atm": line.initial_downstream_pressure_atm,
             "permeability_D": line.permeability_darcy,
             "permeability_mD": (
                 units.darcy_to(line.permeability_darcy, "mD")

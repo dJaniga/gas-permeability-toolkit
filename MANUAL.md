@@ -868,11 +868,11 @@ core-041
   5.000 x 3.810 cm   porosity 0.101
   8 confirmed run(s), 1 not   2026-01-10 to 2026-06-14
 
-  Runs   pressures in kPa, permeability in mD
+  Runs   pressures in kPa, permeability in mD;  pulse rows: P at the pulse
     run                      date        method            P_in     P_out    P_mean       dP0         k      U(k)  meter
     core-041_20260110T090000 2026-01-10  steady_state    759.94    253.31    506.62                 0.9   0.03776  low_range
     ...
-    core-041_20260114T090000 2026-01-14  pulse_decay     3039.8    1013.2    2026.5    50.663    0.0144 0.0006041  low_range
+    core-041_20260114T090000 2026-01-14  pulse_decay     3090.4    3039.8    3039.8    50.663    0.0144 0.0006041  low_range
     core-041_20260111T000000 2026-01-11  steady_state    1823.9    608.00    1215.9                 0.9   0.03776  low_range   never confirmed
 
   Klinkenberg correction
@@ -899,6 +899,28 @@ because there is no pulse, which is not the same as a pulse whose amplitude
 went missing. A run recorded before the summary carried its pressure pair shows
 `--` for `P_in` and `P_out`: they cannot be recovered from a mean, so they are
 reported as unknown rather than split evenly and guessed at.
+
+**On a pulse-decay row, `P_in` and `P_out` are the pressures at the pulse** —
+the *setup condition*, which is what re-measuring a plug under matching
+conditions actually needs. The upstream vessel decays toward the downstream for
+the whole run, so its **mean** collapses onto the pore pressure: it is nearly
+equal to `P_mean`, nearly equal to the outlet's mean, and is not a number
+anyone can set a regulator to. The caption says `pulse rows: P at the pulse`
+whenever the table contains one.
+
+So a pulse row reads as one moment: `P_out` is the pore pressure both vessels
+were charged to, `P_in` is that plus the pulse, and `dP0` is their difference.
+Note that reading `dP0` *by subtracting the two columns* loses precision — at
+3000 kPa, five significant figures leaves ±0.05 on each, so a 50 kPa pulse
+comes out uncertain in its second digit. That is why `dP0` has its own column
+rather than being left as an exercise. The full-precision values are in the
+run's own sidecar as `pulse_decay.initial_upstream_pressure_atm` and
+`initial_downstream_pressure_atm`, and in `--output` as
+`initial_inlet_pressure_atm` / `initial_downstream_pressure_atm` alongside the
+window means.
+
+A steady-state row is unaffected: it keeps the means over its measured window,
+which for a run held at a fixed differential is the same thing throughout.
 
 **The findings are the point; the table is the evidence.** A summary that only
 restated what is on disk would leave you to notice that a run never confirmed,

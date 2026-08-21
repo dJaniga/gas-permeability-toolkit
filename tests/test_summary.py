@@ -379,6 +379,95 @@ class TestRunTableColumns:
         assert "dP0" in self.header(rig)
         assert f"{units.from_atm(0.5, 'kPa'):.5g}" in self.table(rig)[0]
 
+    def test_a_pulse_row_reports_the_pressures_at_the_pulse(self, tmp_path):
+        """The setup condition, which is what re-measuring the plug needs.
+
+        The upstream vessel decays toward the downstream for the whole run, so
+        its *mean* is very nearly the pore pressure and is not a number anyone
+        could set a regulator to.
+        """
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        row = self.table(rig)[0].split()
+        p_in, p_out = float(row[3]), float(row[4])
+        # Charged to the pore pressure plus the pulse, not to the window mean.
+        assert p_in == pytest.approx(units.from_atm(30.5, "kPa"), rel=1e-4)
+        assert p_out == pytest.approx(units.from_atm(30.0, "kPa"), rel=1e-4)
+        # The helper's mean pair is 1.5x/0.5x the mean; neither is shown.
+        assert p_in != pytest.approx(units.from_atm(45.0, "kPa"), rel=1e-4)
+
+    def test_dp0_is_the_difference_of_the_pair_shown_beside_it(self, tmp_path):
+        """Both are taken at one instant, so the subtraction holds.
+
+        Only to within the printed precision, and that is the whole argument
+        for dP0 having its own column: at 3000 kPa, five significant figures
+        leaves +/-0.05 on each pressure, so a 50 kPa pulse read by subtracting
+        them is uncertain in its second digit. The column carries dP0 at full
+        precision instead.
+        """
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        row = self.table(rig)[0].split()
+        p_in, p_out, dp0 = float(row[3]), float(row[4]), float(row[6])
+        assert p_in - p_out == pytest.approx(dp0, abs=0.15)
+
+    def test_the_caption_says_pulse_rows_are_different(self, tmp_path):
+        """P_in means one thing on a steady row and another on a pulse row."""
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        assert "pulse rows" not in self.caption(rig)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 11, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        assert "pulse rows: P at the pulse" in self.caption(rig)
+
+    def test_a_pulse_run_without_a_setup_condition_falls_back_to_its_means(
+        self, tmp_path
+    ):
+        """The only pressures such a run has. Better than an empty cell."""
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+            initial_upstream_pressure_atm=False,
+        )
+        row = self.table(rig)[0].split()
+        assert float(row[3]) == pytest.approx(units.from_atm(45.0, "kPa"), rel=1e-4)
+
+    def test_a_steady_row_still_shows_its_means(self, tmp_path):
+        """The per-method choice must not leak into steady-state rows."""
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 11, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        steady = next(r for r in self.table(rig) if "steady_state" in r).split()
+        assert float(steady[3]) == pytest.approx(units.from_atm(15.0, "kPa"), rel=1e-4)
+
     def test_a_steady_row_leaves_the_dp0_cell_blank(self, tmp_path):
         """Blank, not '--': there is no pulse, which is not a missing pulse."""
         from gasperm import units

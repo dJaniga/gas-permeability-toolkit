@@ -2069,10 +2069,12 @@ def _print_sample_summary(
         # The units, once, rather than repeated in seven column headings: three
         # pressures share one unit, and a heading wide enough to carry it would
         # push the table past the width of a terminal.
-        typer.secho(
-            f"   pressures in {pressure_unit}, permeability in mD",
-            fg=typer.colors.BRIGHT_BLACK,
-        )
+        caption = f"   pressures in {pressure_unit}, permeability in mD"
+        if with_pulse:
+            # P_in and P_out mean something different on a pulse row, and an
+            # operator setting the rig up again is reading exactly those cells.
+            caption += ";  pulse rows: P at the pulse"
+        typer.secho(caption, fg=typer.colors.BRIGHT_BLACK)
         header = (
             f"    {'run':<24} {'date':<11} {'method':<12} "
             f"{'P_in':>9} {'P_out':>9} {'P_mean':>9} "
@@ -2142,8 +2144,10 @@ def _print_run_line(line, pressure_unit: str, with_pulse: bool) -> None:
         f"    {line.name[:24]:<24} "
         f"{(line.started_at.date().isoformat() if line.started_at else '--'):<11} "
         f"{line.method[:12]:<12} "
-        f"{_pressure_cell(line.inlet_pressure_atm, pressure_unit):>9} "
-        f"{_pressure_cell(line.downstream_pressure_atm, pressure_unit):>9} "
+        # Per method: the measured means for steady state, the pressures at the
+        # pulse for pulse decay. See RunLine.reported_inlet_pressure_atm.
+        f"{_pressure_cell(line.reported_inlet_pressure_atm, pressure_unit):>9} "
+        f"{_pressure_cell(line.reported_downstream_pressure_atm, pressure_unit):>9} "
         f"{_pressure_cell(line.mean_pressure_atm, pressure_unit):>9} "
     )
     if with_pulse:

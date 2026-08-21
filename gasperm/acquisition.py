@@ -204,6 +204,27 @@ def _mean_stddev(values: Sequence[float]) -> tuple[float, float]:
     return mean, (statistics.stdev(values) if len(values) > 1 else 0.0)
 
 
+def _pressures_at(
+    readings: Sequence[Reading], elapsed_s: float
+) -> tuple[float | None, float | None]:
+    """``(inlet, downstream)`` at the first reading from ``elapsed_s`` onward.
+
+    Used to capture the pulse-decay **setup condition**: the pressures the two
+    vessels were at when the pulse went in. The first sample at or after the
+    detected pulse rather than the one before it, because the pulse is what
+    charges the upstream vessel -- the sample before is the pre-pulse
+    equilibrium, which is a different number and not the one to reproduce.
+
+    ``(None, None)`` when nothing was recorded that late, so a run whose pulse
+    was detected on its very last sample reports the condition as unknown
+    rather than reaching for whatever is nearest.
+    """
+    reading = next((r for r in readings if r.elapsed_s >= elapsed_s), None)
+    if reading is None:
+        return None, None
+    return reading.inlet_pressure_atm, reading.downstream_pressure_atm
+
+
 def _mean_pressure_pair(readings: Sequence[Reading]) -> tuple[float | None, float | None]:
     """Mean inlet and mean **downstream-as-used** pressure over ``readings``.
 
@@ -1811,12 +1832,17 @@ def summarize_pulse_decay_run(
         )
         theta = first_storage_root(storage_ratio_up, storage_ratio_down)
 
+    pulse_at = processor.monitor.status.pulse_at_elapsed_s or 0.0
+    initial_upstream, initial_downstream = _pressures_at(readings, pulse_at)
+
     result = PulseDecayResult(
         decay_rate_per_s=decay_rate,
         decay_rate_standard_uncertainty_per_s=fit.decay_rate_standard_uncertainty_per_s,
         degrees_of_freedom=fit.degrees_of_freedom,
         pulse_amplitude_atm=processor.monitor.pulse_amplitude_atm or fit.amplitude_atm,
-        pulse_at_elapsed_s=processor.monitor.status.pulse_at_elapsed_s or 0.0,
+        pulse_at_elapsed_s=pulse_at,
+        initial_upstream_pressure_atm=initial_upstream,
+        initial_downstream_pressure_atm=initial_downstream,
         fitted_offset_atm=fit.offset_atm,
         r_squared=fit.r_squared,
         fit_start_elapsed_s=fit.start_elapsed_s,

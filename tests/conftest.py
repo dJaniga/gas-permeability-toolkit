@@ -300,6 +300,9 @@ def write_measured_run(
     diameter_cm: float = 3.81,
     budget=None,
     pulse_amplitude_atm: float | None = None,
+    #: Pass ``False`` for a pulse run recorded before the setup condition was
+    #: kept, i.e. one whose sidecar has dP0 but no pressures at the pulse.
+    initial_upstream_pressure_atm: bool = True,
 ) -> Path:
     """A run directory carrying a **complete** :class:`RunSummary`.
 
@@ -364,6 +367,16 @@ def write_measured_run(
                 decay_rate_per_s=0.02,
                 pulse_amplitude_atm=pulse_amplitude_atm,
                 pulse_at_elapsed_s=1.0,
+                # The setup condition: both vessels at the pore pressure, the
+                # upstream one dP0 above it. dP0 is exactly their difference.
+                initial_upstream_pressure_atm=(
+                    None
+                    if initial_upstream_pressure_atm is False
+                    else mean_pressure_atm + pulse_amplitude_atm
+                ),
+                initial_downstream_pressure_atm=(
+                    None if initial_upstream_pressure_atm is False else mean_pressure_atm
+                ),
                 r_squared=0.999,
                 fit_start_elapsed_s=1.0,
                 fit_end_elapsed_s=100.0,

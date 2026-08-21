@@ -486,6 +486,15 @@ class PulseDecayResult(BaseModel):
     degrees_of_freedom: float = float("inf")
     pulse_amplitude_atm: float
     pulse_at_elapsed_s: float
+    #: The two vessel pressures at the instant the pulse was applied -- the
+    #: **setup condition**, and the thing to reproduce when the plug is
+    #: re-measured. Distinct from the run's mean inlet and outlet: the upstream
+    #: vessel decays toward the downstream throughout, so averaging it over the
+    #: fit window returns very nearly the pore pressure and describes nothing
+    #: anyone could set a regulator to. Optional because sidecars written
+    #: before they existed do not carry them.
+    initial_upstream_pressure_atm: float | None = None
+    initial_downstream_pressure_atm: float | None = None
     fitted_offset_atm: float | None = None
     r_squared: float
     fit_start_elapsed_s: float

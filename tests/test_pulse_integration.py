@@ -159,6 +159,60 @@ class TestRunEndToEnd:
         assert summary.pulse_decay.fitted_offset_atm == pytest.approx(0.002, rel=0.05)
         assert summary.permeability_darcy == pytest.approx(k_true, rel=0.02)
 
+    def test_the_setup_condition_is_captured_at_the_pulse(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """What the rig has to be charged to in order to repeat this run.
+
+        The synthesised decay holds the vessels at ``P +/- dP/2``, so at the
+        pulse they are 10.25 and 9.75 atm. Recording those is the whole point:
+        an operator re-measuring the plug sets a regulator, and no *mean* over
+        the run is a number a regulator can be set to.
+        """
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        result = loop.summarize().pulse_decay
+        assert result.initial_upstream_pressure_atm == pytest.approx(10.25, rel=1e-3)
+        assert result.initial_downstream_pressure_atm == pytest.approx(9.75, rel=1e-3)
+
+    def test_the_setup_condition_is_not_the_run_mean(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """The distinction that makes this worth storing separately.
+
+        The upstream vessel decays toward the downstream all run, so its mean
+        collapses onto the pore pressure -- close enough to it to be useless
+        for setting the rig up, and indistinguishable from the outlet's mean.
+        """
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        summary = loop.summarize()
+        initial = summary.pulse_decay.initial_upstream_pressure_atm
+        assert summary.mean_inlet_pressure_atm == pytest.approx(10.0, abs=0.2)
+        assert initial > summary.mean_inlet_pressure_atm
+
+    def test_the_pulse_is_the_difference_of_the_captured_pair(
+        self, pulse_config, fake_analog_source, fake_temperature_source
+    ):
+        """Both taken at one instant, so dP0 really is their difference."""
+        rate = true_decay_rate(pulse_config, 5.0e-4, 10.0)
+        loop = run_decay(
+            pulse_config, fake_analog_source, fake_temperature_source,
+            rate=rate, duration_s=40.0,
+        )
+        result = loop.summarize().pulse_decay
+        span = (
+            result.initial_upstream_pressure_atm
+            - result.initial_downstream_pressure_atm
+        )
+        assert span == pytest.approx(result.pulse_amplitude_atm, rel=0.02)
+
     def test_the_storage_correction_is_applied_and_recorded(
         self, pulse_config, fake_analog_source, fake_temperature_source
     ):

@@ -83,6 +83,11 @@ class RunLine:
     #: ``dP0``, the pulse a decay started from. ``None`` for steady state,
     #: where there is no pulse, and for a pulse run that never fitted one.
     pulse_amplitude_atm: float | None = None
+    #: The vessel pressures **at the pulse**: a pulse-decay run's setup
+    #: condition. ``None`` for steady state, and for pulse runs recorded before
+    #: these were kept.
+    initial_inlet_pressure_atm: float | None = None
+    initial_downstream_pressure_atm: float | None = None
     #: Why this run is not a usable measurement, when it is not.
     excluded_reason: str = ""
 
@@ -91,6 +96,40 @@ class RunLine:
         if not self.permeability_darcy or self.expanded_uncertainty_darcy is None:
             return None
         return self.expanded_uncertainty_darcy / abs(self.permeability_darcy)
+
+    @property
+    def reported_inlet_pressure_atm(self) -> float | None:
+        """The inlet pressure that characterises this run.
+
+        For steady state, the mean over the measured window -- the pressure the
+        equation used. For pulse decay, the pressure **at the pulse**: the
+        upstream vessel decays toward the downstream for the whole run, so its
+        mean is very nearly the pore pressure and describes nothing that could
+        be set up again. What an operator re-measuring the plug needs is the
+        charge pressure, and that is what this returns.
+
+        Falls back to the mean for a pulse run recorded before the setup
+        condition was kept, which is the only number that run has.
+        """
+        if self.method == "pulse_decay" and self.initial_inlet_pressure_atm is not None:
+            return self.initial_inlet_pressure_atm
+        return self.inlet_pressure_atm
+
+    @property
+    def reported_downstream_pressure_atm(self) -> float | None:
+        """The outlet pressure, chosen to match :attr:`reported_inlet_pressure_atm`.
+
+        Taken at the same instant as the inlet, so on a pulse-decay row the two
+        columns and ``dP0`` describe one moment and ``dP0`` is their difference.
+        Mixing an initial inlet with a mean outlet would make that subtraction
+        wrong by whatever the decay had already done.
+        """
+        if (
+            self.method == "pulse_decay"
+            and self.initial_downstream_pressure_atm is not None
+        ):
+            return self.initial_downstream_pressure_atm
+        return self.downstream_pressure_atm
 
 
 @dataclass(frozen=True)
@@ -199,6 +238,16 @@ def _line_from(record, summary: RunSummary | None) -> RunLine:
         ),
         pulse_amplitude_atm=(
             summary.pulse_decay.pulse_amplitude_atm
+            if summary is not None and summary.pulse_decay is not None
+            else None
+        ),
+        initial_inlet_pressure_atm=(
+            summary.pulse_decay.initial_upstream_pressure_atm
+            if summary is not None and summary.pulse_decay is not None
+            else None
+        ),
+        initial_downstream_pressure_atm=(
+            summary.pulse_decay.initial_downstream_pressure_atm
             if summary is not None and summary.pulse_decay is not None
             else None
         ),
