@@ -2210,6 +2210,13 @@ def reprocess_command(
         help="Re-derive every run for this plug -- the usual case, since a "
              "corrected uncertainty applies to a whole campaign, not one run.",
     ),
+    all_runs: bool = typer.Option(
+        False, "--all",
+        help="Re-derive every run in the runs directory, for every plug. For a "
+             "rig-level correction -- a transducer recalibrated, a vessel "
+             "re-measured -- which applies to everything the bench recorded. "
+             "Runs already superseded by a re-derivation are skipped.",
+    ),
     set_values: Optional[list[str]] = typer.Option(
         None, "--set", metavar="KEY=VALUE",
         help="Override a config field, e.g. --set sample.porosity_uncertainty=0.005. "
@@ -2263,12 +2270,28 @@ def reprocess_command(
     )
     from gasperm.storage import (
         _record_from_directory,
+        drop_superseded,
         find_runs,
         runs_for_sample,
         summary_from_run,
     )
 
     _configure_logging(verbose)
+
+    if all_runs and (targets or sample is not None):
+        _fail(
+            "--all already means every run in the runs directory. Drop it, or "
+            "drop the run directories and --sample."
+        )
+        return
+    if all_runs and sample_file is not None:
+        # It replaces the whole sample section, so across plugs it would stamp
+        # one plug's id and geometry onto every core in the directory.
+        _fail(
+            "--sample-file describes one plug, and --all spans every plug in the "
+            "runs directory. Reprocess that plug with --sample instead."
+        )
+        return
 
     records = []
     if targets:
@@ -2284,10 +2307,42 @@ def reprocess_command(
         if not found:
             _fail(f"No runs found for {sample_id!r} under {resolved_runs}.")
         records.extend(found)
+    if all_runs:
+        resolved_runs = _resolve_runs_dir(runs_dir, config_dir)
+        found = find_runs(resolved_runs)
+        if not found:
+            _fail(f"No runs found under {resolved_runs}.")
+            return
+        # The runs a reduction would actually use. Re-deriving a run that a
+        # previous reprocess already superseded would leave its parent with two
+        # children, and `drop_superseded` keeps every childless run -- so the
+        # same experiment would enter a regression twice, which is the exact
+        # thing supersession exists to prevent.
+        records, superseded = drop_superseded(found)
+        for record, reason in superseded:
+            typer.secho(f"  skipping {record.name}: {reason}", fg=typer.colors.BRIGHT_BLACK)
+        plugs = sorted({record.sample_id for record in records if record.sample_id})
+        typer.secho(
+            f"{len(records)} run(s) across {len(plugs)} plug(s) under {resolved_runs}",
+            fg=typer.colors.CYAN,
+        )
+        if set_values:
+            # A rig-level correction is what --all is for; a plug-level one
+            # applied to every plug is almost always a mistake, and a silent
+            # one, since each re-derived run looks internally consistent.
+            per_plug = [v for v in set_values if _describes_one_plug(v)]
+            if per_plug:
+                typer.secho(
+                    "warning: " + ", ".join(per_plug) + f" will be applied to all "
+                    f"{len(plugs)} plug(s). Fields that describe one core -- id, "
+                    "length, diameter, porosity -- should be set per plug with "
+                    "--sample.",
+                    fg=typer.colors.YELLOW,
+                )
     if not records:
         _fail(
-            "Nothing to reprocess. Give one or more run directories, or --sample "
-            "to take every run for a plug."
+            "Nothing to reprocess. Give one or more run directories, --sample to "
+            "take every run for a plug, or --all for the whole runs directory."
         )
         return
 
@@ -2443,11 +2498,54 @@ def _write_reprocessed(result, config: GaspermConfig) -> Path:
     return target
 
 
+#: Sample fields that describe **one core**, so setting them across a whole
+#: runs directory is almost certainly a mistake.
+#:
+#: Deliberately not "anything under sample.": ``porosity_uncertainty`` is a
+#: property of how porosity was measured and legitimately applies to a batch
+#: measured the same way -- which is a thing ``--all`` exists to do. A warning
+#: that fires on the common correct case is one people learn to click past.
+_PER_PLUG_SAMPLE_FIELDS = frozenset(
+    {"id", "length", "diameter", "porosity", "description", "depth"}
+)
+
+
+def _describes_one_plug(assignment: str) -> bool:
+    """Whether a ``--set KEY=VALUE`` names a field belonging to a single core."""
+    key = assignment.partition("=")[0].strip()
+    section, _, rest = key.partition(".")
+    if section != "sample" or not rest:
+        return False
+    return rest.partition(".")[0] in _PER_PLUG_SAMPLE_FIELDS
+
+
+def _combined_changes(results) -> tuple[tuple, dict[str, int]]:
+    """Every field that changed anywhere in the batch, and how many runs saw it.
+
+    Each run is re-derived from **its own** stored snapshot, so what a single
+    ``--set`` actually changes differs from run to run: a value already correct
+    in one run's snapshot is not a change there. Reporting the first run's list
+    as though it described the batch would misreport precisely the case the
+    batch options exist for -- a rig-wide correction across runs recorded under
+    several configs.
+
+    Keyed on the field name rather than the whole change, because ``before``
+    legitimately differs between runs and is not always hashable.
+    """
+    seen: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    for result in results:
+        for change in result.changes:
+            seen.setdefault(change.key, change)
+            counts[change.key] = counts.get(change.key, 0) + 1
+    return tuple(seen.values()), counts
+
+
 def _print_reprocess(results, *, wrote: bool) -> None:
     """What changed, grouped by whether it moved the answer or only its cost."""
     from gasperm.reprocess import summarise_changes
 
-    changes = results[0].changes
+    changes, counts = _combined_changes(results)
     typer.secho(f"\nReprocessing {len(results)} run(s) from raw voltages", bold=True)
     if not changes:
         typer.secho(
@@ -2468,7 +2566,11 @@ def _print_reprocess(results, *, wrote: bool) -> None:
         text, color = labels[kind]
         typer.secho(f"  {kind}: {text}", fg=color)
         for change in entries:
-            typer.echo(f"    {change.describe()}")
+            hit = counts.get(change.key, 0)
+            # Said only when it is not the whole batch, so the common case
+            # stays uncluttered and the partial one cannot be missed.
+            scope = "" if hit == len(results) else f"   ({hit} of {len(results)} runs)"
+            typer.echo(f"    {change.describe()}{scope}")
 
     typer.echo("")
     typer.echo(

@@ -94,6 +94,59 @@ def record_steady_run(tmp_path) -> tuple[Path, Path, object]:
     return rig, writer.directory, summary
 
 
+def add_plug(rig: Path, sample_id: str, *overrides: str) -> Path:
+    """A second (or third) core plug in an existing rig folder."""
+    args = ["new-sample", sample_id, "--dir", str(rig / "samples"), "-n", "--force"]
+    for override in overrides:
+        args += ["--set", override]
+    assert runner.invoke(app, args).exit_code == 0, sample_id
+    return rig / "samples" / f"{sample_id}.yaml"
+
+
+def record_run_for(rig: Path, sample_path: Path, *, started_at=None) -> Path:
+    """One steady-state run for one plug, into the rig's own runs directory."""
+    from datetime import datetime, timezone
+
+    config = load_config(rig, sample=sample_path)
+    config.run.steady_state.window_s = 1.0
+    config.run.steady_state.required_windows = 2
+    config.run.steady_state.min_samples = 3
+    config.hardware.daq.sample_rate_hz = 200.0
+    config.run.max_samples = 700
+    config.sample.porosity = 0.10
+
+    provider = build_provider(config.run.gas)
+    loop = AcquisitionLoop(
+        config, SampleProcessor(config, provider),
+        FakeAnalogSource({"ai0": 0.30, "ai1": 0.05, "ai2": 2.0}),
+        FakeTemperatureSource(22.0),
+    )
+    loop.run(install_signal_handler=False)
+    writer = RunWriter(
+        config, started_at=started_at or datetime.now(timezone.utc)
+    )
+    writer.open()
+    for reading in loop.readings:
+        writer.write(reading)
+    writer.close()
+    writer.write_metadata(loop.summarize(csv_path=str(writer.readings_path)))
+    return writer.directory
+
+
+def record_two_plugs(tmp_path, second_length: float = 50.0) -> Path:
+    """A rig whose runs directory holds one run each for two different plugs."""
+    from datetime import datetime, timedelta, timezone
+
+    rig = make_rig(tmp_path)
+    base = datetime(2026, 5, 1, 9, tzinfo=timezone.utc)
+    record_run_for(rig, rig / "samples" / "core-041.yaml", started_at=base)
+    # `new-sample --set` keys are relative to the sample file, which *is* the
+    # sample section -- unlike `reprocess --set`, which addresses a whole config.
+    second = add_plug(rig, "core-042", f"length={second_length}")
+    record_run_for(rig, second, started_at=base + timedelta(hours=1))
+    return rig
+
+
 def record_pulse_run(tmp_path) -> tuple[Path, Path, object]:
     """A well-conditioned pulse decay, sampled at the rate its times imply."""
     rig = make_rig(tmp_path, "run.method=pulse_decay")
@@ -433,5 +486,144 @@ class TestReprocessCommand:
     def test_the_flags_are_documented_in_help(self):
         result = runner.invoke(app, ["reprocess", "--help"], env={"COLUMNS": "200"})
         output = strip_ansi(result.output)
-        for flag in ("--set", "--write", "--sample", "--from-config"):
+        for flag in ("--set", "--write", "--sample", "--from-config", "--all"):
             assert flag in output
+
+
+class TestReprocessAll:
+    """``--all``: the whole runs directory, for a rig-level correction.
+
+    A recalibrated transducer or a re-measured vessel applies to everything the
+    bench recorded, not to one plug -- and reprocessing plug by plug is both
+    tedious and easy to leave half-done.
+    """
+
+    def run(self, rig, *args):
+        return runner.invoke(app, ["reprocess", "--all", "-c", str(rig), *args])
+
+    def derived(self, rig):
+        return sorted(
+            p.name for p in (rig / "runs").iterdir() if "_reprocessed" in p.name
+        )
+
+    def test_it_takes_every_plug(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        result = self.run(rig)
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "2 run(s) across 2 plug(s)" in output
+        assert "Reprocessing 2 run(s)" in output
+
+    def test_each_run_keeps_its_own_plug(self, tmp_path):
+        """The reason --all is safe: every run re-derives from its own snapshot.
+
+        A batch that applied one plug's geometry to the rest would silently
+        corrupt every core but the first, and each result would still look
+        internally consistent.
+        """
+        import yaml
+
+        rig = record_two_plugs(tmp_path, second_length=51.0)
+        assert self.run(rig, "--write").exit_code == 0
+        lengths = {}
+        for name in self.derived(rig):
+            payload = yaml.safe_load(
+                (rig / "runs" / name / "run_metadata.yaml").read_text(encoding="utf-8")
+            )
+            lengths[payload["config"]["sample"]["id"]] = payload["config"]["sample"]["length"]
+        assert lengths == {"core-041": 50.0, "core-042": 51.0}
+
+    def test_write_derives_one_run_per_original(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        assert self.run(rig, "--set", "sample.porosity_uncertainty=0.01", "--write").exit_code == 0
+        assert len(self.derived(rig)) == 2
+
+    def test_a_second_pass_skips_what_it_already_superseded(self, tmp_path):
+        """Otherwise one parent gets two children, and `drop_superseded` keeps
+        both -- putting one experiment into a regression twice, which is the
+        exact thing supersession exists to prevent."""
+        rig = record_two_plugs(tmp_path)
+        assert self.run(rig, "--set", "sample.porosity_uncertainty=0.01", "--write").exit_code == 0
+        first = self.derived(rig)
+
+        result = self.run(rig, "--set", "sample.porosity_uncertainty=0.02", "--write")
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "superseded by" in output
+        # Two more derived runs, each a child of a child -- not of the originals.
+        assert len(self.derived(rig)) == 4
+        assert all(name in self.derived(rig) for name in first)
+        assert "Reprocessing 2 run(s)" in output
+
+    def test_every_experiment_still_reduces_once_afterwards(self, tmp_path):
+        """The property the skipping protects, asserted where it is observable."""
+        from gasperm.storage import drop_superseded, find_runs
+
+        rig = record_two_plugs(tmp_path)
+        for value in ("0.01", "0.02"):
+            assert self.run(
+                rig, "--set", f"sample.porosity_uncertainty={value}", "--write"
+            ).exit_code == 0
+        kept, _ = drop_superseded(find_runs(rig / "runs"))
+        assert len(kept) == 2
+        assert {record.sample_id for record in kept} == {"core-041", "core-042"}
+
+    def test_a_change_that_hit_only_some_runs_says_so(self, tmp_path):
+        """Each run diffs against its own snapshot, so a batch's changes vary."""
+        rig = record_two_plugs(tmp_path, second_length=51.0)
+        result = self.run(rig, "--set", "sample.length=51.0")
+        assert result.exit_code == 0, result.output
+        assert "(1 of 2 runs)" in strip_ansi(result.output)
+
+    def test_a_change_that_hit_every_run_is_not_annotated(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        result = self.run(rig, "--set", "sample.length=52.0")
+        output = strip_ansi(result.output)
+        assert "sample.length" in output
+        assert "of 2 runs" not in output
+
+    def test_per_plug_overrides_are_warned_about(self, tmp_path):
+        """A rig-level correction is the point; a plug-level one is a mistake."""
+        rig = record_two_plugs(tmp_path)
+        output = strip_ansi(self.run(rig, "--set", "sample.length=52.0").output)
+        assert "will be applied to all 2 plug(s)" in output
+
+    def test_a_rig_level_override_is_not_warned_about(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        output = strip_ansi(
+            self.run(rig, "--set", "run.uncertainty.coverage_factor=2.5").output
+        )
+        assert "will be applied to all" not in output
+
+    def test_a_batch_wide_sample_field_is_not_warned_about(self, tmp_path):
+        """`porosity_uncertainty` describes the *method*, not the core, and
+        applying it across a batch measured the same way is what --all is for.
+        A warning that fires on the correct case is one people click past."""
+        rig = record_two_plugs(tmp_path)
+        output = strip_ansi(
+            self.run(rig, "--set", "sample.porosity_uncertainty=0.01").output
+        )
+        assert "will be applied to all" not in output
+
+    def test_it_refuses_a_sample_file(self, tmp_path):
+        """It replaces the whole sample section -- one plug's id onto every core."""
+        rig = record_two_plugs(tmp_path)
+        result = self.run(rig, "--sample-file", str(rig / "samples" / "core-041.yaml"))
+        assert result.exit_code == 1
+        assert "describes one plug" in strip_ansi(result.output)
+
+    def test_it_refuses_a_competing_scope(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        for extra in (["--sample", "core-041"], [str(rig / "runs")]):
+            result = runner.invoke(
+                app, ["reprocess", "--all", "-c", str(rig), *extra]
+            )
+            assert result.exit_code == 1
+            assert "already means every run" in strip_ansi(result.output)
+
+    def test_an_empty_runs_directory_says_so(self, tmp_path):
+        rig = make_rig(tmp_path)
+        (rig / "runs").mkdir(exist_ok=True)
+        result = self.run(rig)
+        assert result.exit_code == 1
+        assert "No runs found" in strip_ansi(result.output)

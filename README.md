@@ -300,6 +300,7 @@ gasperm reprocess runs/core-041_2026...                        # check it re-der
 gasperm reprocess --sample core-041 --set sample.porosity_uncertainty=0.005
 gasperm reprocess --sample core-041 --set sample.length=50.4 --write
 gasperm reprocess --sample core-041 --from-config              # after fixing hardware.yaml
+gasperm reprocess --all --from-config --write                  # every plug on the bench
 ```
 
 Re-derives stored runs from their **raw voltages**, so a calibration correction
@@ -307,6 +308,12 @@ or a newly measured uncertainty does not mean repeating a fourteen-hour run. It
 says which class of change you made — one that moves `k` (a correction), one
 that moves only `U(k)` (a re-costing), or neither — and checks that prediction
 against the arithmetic.
+
+`--sample` takes one plug's whole campaign; **`--all`** takes every run in the
+runs directory, for a rig-level correction — a transducer recalibrated, a
+vessel re-measured — that applies to everything the bench recorded. Each run
+still re-derives from its **own** stored snapshot, so every plug keeps its own
+geometry.
 
 Reports only, unless `--write`, which writes a **new** `<original>_reprocessed`
 directory and never touches the original. Details:

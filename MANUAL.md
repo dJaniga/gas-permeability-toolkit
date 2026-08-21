@@ -1087,6 +1087,42 @@ whatever the config files say today, or the "before" half would be a result
 nobody ever produced. `--from-config` opts into the current files, for when the
 rig file itself is what was corrected.
 
+### Reprocessing the whole bench
+
+`--sample <plug>` re-derives one plug's whole campaign, which is the usual case:
+a corrected uncertainty applies to a campaign, not to a single run. **`--all`**
+re-derives every run in the runs directory, across every plug — for a *rig*-level
+correction, where a recalibrated transducer or a re-measured vessel applies to
+everything the bench ever recorded.
+
+```bash
+gasperm reprocess --all --from-config           # what would it change?
+gasperm reprocess --all --from-config --write   # commit it
+```
+
+Each run still re-derives from **its own** snapshot, so every plug keeps its own
+geometry and porosity; nothing is broadcast between cores. Because of that, a
+`--set` that names a field describing one core (`id`, `length`, `diameter`,
+`porosity`) is warned about — applied across a directory it would corrupt every
+plug but the one you had in mind, and each result would still look internally
+consistent. `--sample-file` is refused outright for the same reason: it replaces
+the whole sample section. Fields that describe the *method* rather than the core,
+`porosity_uncertainty` among them, pass without comment.
+
+**Runs already superseded by an earlier re-derivation are skipped**, and the
+command says which. Re-deriving one would leave its parent with two children,
+and since supersession keeps every childless run, that single experiment would
+then enter a regression twice — the exact thing the mechanism exists to prevent.
+Running `--all --write` twice therefore builds a *chain* per experiment
+(`..._reprocessed_reprocessed`), and each reduction still sees one run per
+experiment.
+
+One more thing changes with a batch: the per-run changes need not be the same.
+Each run diffs against its own snapshot, so a value already correct in one run's
+config is not a change there. A change that applied to only part of the batch is
+reported as `(2 of 5 runs)` rather than being presented as though it described
+all of them.
+
 ---
 
 ## Reference
