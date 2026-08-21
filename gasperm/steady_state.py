@@ -432,6 +432,7 @@ def detect_steady_window(
     detector = SteadyStateDetector(config)
     rows = list(samples)
     steady_since: float | None = None
+    steady_until: float | None = None
 
     for row in rows:
         elapsed = row.get(time_key)
@@ -439,15 +440,28 @@ def detect_steady_window(
             continue
         signals = {name: row.get(name) for name in config.signals}
         detector.update(float(elapsed), signals)
-        steady_since = detector.steady_since_elapsed_s
+        # The plateau, captured while the detector is *in* it. Reading
+        # `steady_since_elapsed_s` after the final row instead loses the whole
+        # window for a run that was still drifting when it stopped -- the
+        # detector has left steady state by then and reports nothing. That run
+        # has a perfectly good plateau, it is what the live loop reports, and
+        # summarising the drifting tail in its place moves k.
+        if detector.is_steady:
+            steady_since = detector.steady_since_elapsed_s
+            steady_until = float(elapsed)
 
-    if steady_since is None:
+    if steady_since is None or steady_until is None:
         return None
 
     indices = [
         index
         for index, row in enumerate(rows)
-        if row.get(time_key) is not None and float(row[time_key]) >= steady_since
+        if row.get(time_key) is not None
+        and steady_since <= float(row[time_key]) <= steady_until
+        # Samples that yielded no permeability are trimmed from the ends the
+        # same way the live loop trims them, so a replay reduces over exactly
+        # the samples the original run reduced over.
+        and row.get("permeability", 0.0) is not None
     ]
     if not indices:
         return None

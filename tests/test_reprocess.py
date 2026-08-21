@@ -490,6 +490,127 @@ class TestReprocessCommand:
             assert flag in output
 
 
+class TestNoChangeReproduces:
+    """A re-derivation with nothing changed must reproduce the original.
+
+    This is the baseline every other use of reprocess rests on: if a no-op
+    replay moves the answer, no reported change can be attributed to the field
+    that was actually edited. Both methods reconstruct *derived* state -- the
+    steady window, the pulse -- and both used to rebuild it from an object that
+    had never seen the run.
+    """
+
+    def replay(self, directory, live):
+        from gasperm.cli import _stored_config
+        from gasperm.storage import _record_from_directory
+
+        return reprocess_run(
+            directory, _stored_config(_record_from_directory(directory)),
+            started_at=live.started_at, ended_at=live.ended_at,
+        )
+
+    def drifting_run(self, tmp_path):
+        """A run that is still moving when it stops -- warned about, not rare."""
+        rig = make_rig(tmp_path)
+        config = load_config(rig, sample=rig / "samples" / "core-041.yaml")
+        config.run.steady_state.window_s = 1.0
+        config.run.steady_state.required_windows = 2
+        config.run.steady_state.min_samples = 3
+        config.hardware.daq.sample_rate_hz = 20.0
+        frames = [{"ai0": 0.30, "ai1": 0.05, "ai2": 2.0} for _ in range(400)]
+        frames += [
+            {"ai0": 0.30, "ai1": 0.05, "ai2": 2.0 * (1 + 0.002 * (i + 1))}
+            for i in range(200)
+        ]
+        config.run.max_samples = len(frames)
+        loop = AcquisitionLoop(
+            config, SampleProcessor(config, build_provider(config.run.gas)),
+            FakeAnalogSource(frames), FakeTemperatureSource(22.0),
+        )
+        loop.run(install_signal_handler=False)
+        writer = RunWriter(config)
+        writer.open()
+        for reading in loop.readings:
+            writer.write(reading)
+        writer.close()
+        live = loop.summarize(csv_path=str(writer.readings_path))
+        writer.write_metadata(live)
+        return loop, writer.directory, live
+
+    def test_a_run_that_ended_while_drifting_keeps_its_plateau(self, tmp_path):
+        """The replay must not summarise the drifting tail in the plateau's place.
+
+        Reading the detector's state *after* the last row loses the window
+        entirely for such a run -- it has left steady state by then -- and the
+        fallback averages the trailing seconds, which are exactly the samples
+        the live run excluded.
+        """
+        loop, directory, live = self.drifting_run(tmp_path)
+        assert loop.ended_unsteady, "the fixture must actually leave steady state"
+        again = self.replay(directory, live)
+        assert again.steady_state_window is not None
+        assert (
+            again.steady_state_window.start_index,
+            again.steady_state_window.end_index,
+        ) == (
+            live.steady_state_window.start_index,
+            live.steady_state_window.end_index,
+        )
+        assert again.permeability_darcy == pytest.approx(
+            live.permeability_darcy, rel=1e-9
+        )
+
+    def test_such_a_run_does_not_lose_its_confirmation(self, tmp_path):
+        """The more damaging half: an unconfirmed re-derivation supersedes its
+        parent and is then excluded from klinkenberg and counted as a failure."""
+        _, directory, live = self.drifting_run(tmp_path)
+        assert live.measurement_confirmed
+        assert self.replay(directory, live).measurement_confirmed
+
+    def test_a_pulse_run_keeps_its_pulse(self, tmp_path):
+        """dP0 and the pulse instant come from the recorded differential now.
+
+        They used to come from the live monitor, which on a replay has seen no
+        samples -- so they fell back to the fit's extrapolated amplitude and to
+        t = 0.
+        """
+        _, directory, live = record_pulse_run(tmp_path)
+        again = self.replay(directory, live)
+        before, after = live.pulse_decay, again.pulse_decay
+        assert after.pulse_amplitude_atm == pytest.approx(
+            before.pulse_amplitude_atm, rel=1e-6
+        )
+        assert after.pulse_at_elapsed_s == pytest.approx(before.pulse_at_elapsed_s)
+
+    def test_a_pulse_run_keeps_its_setup_condition(self, tmp_path):
+        """With t = 0 this read the *pre-pulse* equilibrium -- both vessels at
+        one pressure and no pulse -- which is what an operator would have tried
+        to set the rig back to."""
+        _, directory, live = record_pulse_run(tmp_path)
+        after = self.replay(directory, live).pulse_decay
+        before = live.pulse_decay
+        assert after.initial_upstream_pressure_atm == pytest.approx(
+            before.initial_upstream_pressure_atm, rel=1e-6
+        )
+        assert after.initial_downstream_pressure_atm == pytest.approx(
+            before.initial_downstream_pressure_atm, rel=1e-6
+        )
+        # And they still bracket the pulse, rather than collapsing together.
+        span = (
+            after.initial_upstream_pressure_atm - after.initial_downstream_pressure_atm
+        )
+        assert span == pytest.approx(after.pulse_amplitude_atm, rel=0.02)
+
+    def test_the_command_reports_no_movement(self, tmp_path):
+        """What the operator actually sees for a no-change reprocess."""
+        _, directory, _ = self.drifting_run(tmp_path)
+        result = runner.invoke(app, ["reprocess", str(directory)])
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "No configuration change" in output
+        assert "k moved" not in output
+
+
 class TestReprocessAll:
     """``--all``: the whole runs directory, for a rig-level correction.
 

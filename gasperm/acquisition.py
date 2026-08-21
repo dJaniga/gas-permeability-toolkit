@@ -204,6 +204,41 @@ def _mean_stddev(values: Sequence[float]) -> tuple[float, float]:
     return mean, (statistics.stdev(values) if len(values) > 1 else 0.0)
 
 
+def _pulse_from(
+    readings: Sequence[Reading], processor: PulseProcessor, fit
+) -> tuple[float, float]:
+    """``(dP0, when)`` for the pulse, taken from the **recorded differential**.
+
+    From the readings rather than from the live monitor's state, because a
+    reprocess hands this function a processor whose monitor never saw the run:
+    it would report no pulse, and the old fallbacks then substituted the fit's
+    extrapolated amplitude and ``t = 0``. Both are wrong and neither is
+    obviously wrong -- ``t = 0`` in particular made the setup condition read as
+    the *pre-pulse* equilibrium, i.e. both vessels at the same pressure and no
+    pulse at all, which is exactly the number an operator would try to
+    reproduce.
+
+    ``find_pulse`` over the stored differential is the same quantity the
+    monitor reports live, agreeing with it to the CSV's float precision, so
+    live and replayed runs now derive it identically by construction. The
+    monitor is kept only as a fallback for a differential that ``find_pulse``
+    cannot read at all.
+    """
+    from gasperm.pulse_decay import PulseDecayInputError, find_pulse
+
+    try:
+        index, peak = find_pulse(
+            [r.elapsed_s for r in readings], [r.delta_pressure_atm for r in readings]
+        )
+    except (PulseDecayInputError, ValueError, IndexError):
+        monitor = processor.monitor
+        return (
+            monitor.pulse_amplitude_atm or fit.amplitude_atm,
+            monitor.status.pulse_at_elapsed_s or 0.0,
+        )
+    return peak, readings[index].elapsed_s
+
+
 def _pressures_at(
     readings: Sequence[Reading], elapsed_s: float
 ) -> tuple[float | None, float | None]:
@@ -1832,14 +1867,14 @@ def summarize_pulse_decay_run(
         )
         theta = first_storage_root(storage_ratio_up, storage_ratio_down)
 
-    pulse_at = processor.monitor.status.pulse_at_elapsed_s or 0.0
+    pulse_amplitude, pulse_at = _pulse_from(readings, processor, fit)
     initial_upstream, initial_downstream = _pressures_at(readings, pulse_at)
 
     result = PulseDecayResult(
         decay_rate_per_s=decay_rate,
         decay_rate_standard_uncertainty_per_s=fit.decay_rate_standard_uncertainty_per_s,
         degrees_of_freedom=fit.degrees_of_freedom,
-        pulse_amplitude_atm=processor.monitor.pulse_amplitude_atm or fit.amplitude_atm,
+        pulse_amplitude_atm=pulse_amplitude,
         pulse_at_elapsed_s=pulse_at,
         initial_upstream_pressure_atm=initial_upstream,
         initial_downstream_pressure_atm=initial_downstream,
