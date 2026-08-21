@@ -593,6 +593,18 @@ class RunSummary(BaseModel):
 
     #: Steady-state means. Only meaningful when the measurement was confirmed.
     mean_pressure_atm: float
+    #: The two pressures behind :attr:`mean_pressure_atm`, averaged over the
+    #: same window, so ``P_mean`` is exactly their midpoint and a summary table
+    #: showing all three reads consistently. ``mean_downstream_pressure_atm``
+    #: is the P2 the equation *used* -- the transducer, or the declared number
+    #: when ``downstream_pressure`` is supplied -- which is why it is named for
+    #: the convention rather than for the outlet port.
+    #:
+    #: Optional because sidecars written before these existed do not carry
+    #: them, and they cannot be recovered from a mean: such a run reports them
+    #: as unknown rather than inventing a split.
+    mean_inlet_pressure_atm: float | None = None
+    mean_downstream_pressure_atm: float | None = None
     permeability_darcy: float
     permeability_stddev_darcy: float
     mean_temperature_c: float

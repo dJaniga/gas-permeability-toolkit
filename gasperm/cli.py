@@ -1978,7 +1978,9 @@ def summarize_command(
                 logger.debug("No Klinkenberg fit for %s: %s", sample_id, exc)
 
     report = build_report(sample_id, records, summaries, klinkenberg=fit)
-    _print_sample_summary(report, resolved_runs_dir, superseded)
+    _print_sample_summary(
+        report, resolved_runs_dir, superseded, _summary_pressure_unit(config_dir)
+    )
 
     if output is not None:
         saved = write_sample_summary(report, output)
@@ -2018,7 +2020,9 @@ def _print_plug_roster(records, runs_dir: Path) -> None:
     )
 
 
-def _print_sample_summary(report, runs_dir: Path, superseded) -> None:
+def _print_sample_summary(
+    report, runs_dir: Path, superseded, pressure_unit: str = "atm"
+) -> None:
     """The report. Identity, then the runs, then the result, then the gaps."""
     typer.secho(f"\n{report.sample_id}", bold=True)
 
@@ -2055,14 +2059,30 @@ def _print_sample_summary(report, runs_dir: Path, superseded) -> None:
         fg=typer.colors.CYAN,
     )
 
-    if report.measurements or report.excluded:
-        typer.secho("\n  Runs", bold=True)
-        typer.echo(
-            f"    {'run':<30} {'date':<11} {'method':<13} {'P_mean':>9} "
-            f"{'k':>11} {'U(k)':>10}  {'meter':<11}"
+    rows = (*report.measurements, *report.excluded, *report.leak_tests)
+    if rows:
+        # dP0 belongs to pulse decay alone, so a plug measured only in steady
+        # state gets no permanently empty column -- the same rule the live plot
+        # follows when it drops the flow panel from a pulse run.
+        with_pulse = any(line.method == "pulse_decay" for line in rows)
+        typer.secho("\n  Runs", bold=True, nl=False)
+        # The units, once, rather than repeated in seven column headings: three
+        # pressures share one unit, and a heading wide enough to carry it would
+        # push the table past the width of a terminal.
+        typer.secho(
+            f"   pressures in {pressure_unit}, permeability in mD",
+            fg=typer.colors.BRIGHT_BLACK,
         )
-        for line in (*report.measurements, *report.excluded, *report.leak_tests):
-            _print_run_line(line)
+        header = (
+            f"    {'run':<24} {'date':<11} {'method':<12} "
+            f"{'P_in':>9} {'P_out':>9} {'P_mean':>9} "
+        )
+        if with_pulse:
+            header += f"{'dP0':>9} "
+        header += f"{'k':>9} {'U(k)':>9}  {'meter':<11}"
+        typer.echo(header)
+        for line in rows:
+            _print_run_line(line, pressure_unit, with_pulse)
 
     if report.klinkenberg is not None:
         fit = report.klinkenberg
@@ -2094,10 +2114,14 @@ def _print_sample_summary(report, runs_dir: Path, superseded) -> None:
             typer.secho(f"    - {finding}", fg=typer.colors.YELLOW)
 
 
-def _print_run_line(line) -> None:
-    pressure = (
-        f"{line.mean_pressure_atm:.4g}" if line.mean_pressure_atm is not None else "--"
-    )
+def _pressure_cell(value_atm: float | None, unit: str) -> str:
+    """One pressure, in the operator's unit rather than the internal atm."""
+    if value_atm is None:
+        return "--"
+    return f"{units.from_atm(value_atm, unit):.5g}"
+
+
+def _print_run_line(line, pressure_unit: str, with_pulse: bool) -> None:
     permeability = (
         f"{units.darcy_to(line.permeability_darcy, 'mD'):.5g}"
         if line.permeability_darcy is not None
@@ -2114,13 +2138,25 @@ def _print_run_line(line) -> None:
         colour, tail = typer.colors.YELLOW, f"  {line.excluded_reason}"
     else:
         colour, tail = None, ""
-    typer.secho(
-        f"    {line.name[:30]:<30} "
+    text = (
+        f"    {line.name[:24]:<24} "
         f"{(line.started_at.date().isoformat() if line.started_at else '--'):<11} "
-        f"{line.method:<13} {pressure:>9} {permeability:>11} {expanded:>10}  "
-        f"{(line.flowmeter or '--')[:11]:<11}{tail}",
-        fg=colour,
+        f"{line.method[:12]:<12} "
+        f"{_pressure_cell(line.inlet_pressure_atm, pressure_unit):>9} "
+        f"{_pressure_cell(line.downstream_pressure_atm, pressure_unit):>9} "
+        f"{_pressure_cell(line.mean_pressure_atm, pressure_unit):>9} "
     )
+    if with_pulse:
+        # Blank rather than "--" on a steady-state row: there is no pulse to
+        # report, which is different from a pulse whose amplitude went missing.
+        cell = (
+            _pressure_cell(line.pulse_amplitude_atm, pressure_unit)
+            if line.method == "pulse_decay"
+            else ""
+        )
+        text += f"{cell:>9} "
+    text += f"{permeability:>9} {expanded:>9}  {(line.flowmeter or '--')[:11]:<11}{tail}"
+    typer.secho(text, fg=colour)
 
 
 # --------------------------------------------------------------------------
@@ -2964,6 +3000,28 @@ def _resolve_runs_dir(runs_dir: Path | None, config_dir: Path) -> Path:
         raise  # unreachable
     output = Path(run_config.output_dir)
     return output if output.is_absolute() else config_dir / output
+
+
+def _summary_pressure_unit(config_dir: Path) -> str:
+    """The unit ``summarize`` reports pressures in.
+
+    ``run.yaml``'s display unit, so a summary agrees with what ``collect``
+    printed on the console and what the live plot showed for the same rig.
+    Pressures are stored in atm because that is what the physics runs in, and
+    a table that reported the internal unit would be asking the operator to
+    convert numbers that the rest of the package already converts for them.
+
+    Falls back to ``atm`` when there is no ``run.yaml`` to read -- a
+    ``--runs-dir`` pointed at a folder of runs with no rig beside it. That is
+    the stored unit itself, and the header names it, which beats picking a
+    display unit nobody configured.
+    """
+    from gasperm.config import RUN_FILENAME, load_run_config
+
+    try:
+        return load_run_config(config_dir / RUN_FILENAME).display_pressure_unit
+    except (ConfigError, OSError):
+        return "atm"
 
 
 def _discover_points(records, *, window, allow_unsteady):

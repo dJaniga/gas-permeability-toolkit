@@ -75,6 +75,14 @@ class RunLine:
     temperature_c: float | None = None
     duration_s: float | None = None
     derived_from: str | None = None
+    #: The pair behind ``mean_pressure_atm``. ``None`` for a run recorded
+    #: before the summary carried them -- they cannot be recovered from a mean,
+    #: so they read as unknown rather than being split evenly and guessed at.
+    inlet_pressure_atm: float | None = None
+    downstream_pressure_atm: float | None = None
+    #: ``dP0``, the pulse a decay started from. ``None`` for steady state,
+    #: where there is no pulse, and for a pulse run that never fitted one.
+    pulse_amplitude_atm: float | None = None
     #: Why this run is not a usable measurement, when it is not.
     excluded_reason: str = ""
 
@@ -185,6 +193,15 @@ def _line_from(record, summary: RunSummary | None) -> RunLine:
         temperature_c=summary.mean_temperature_c if summary else None,
         duration_s=summary.duration_s if summary else None,
         derived_from=record.derived_from,
+        inlet_pressure_atm=summary.mean_inlet_pressure_atm if summary else None,
+        downstream_pressure_atm=(
+            summary.mean_downstream_pressure_atm if summary else None
+        ),
+        pulse_amplitude_atm=(
+            summary.pulse_decay.pulse_amplitude_atm
+            if summary is not None and summary.pulse_decay is not None
+            else None
+        ),
         excluded_reason=(
             ""
             if confirmed

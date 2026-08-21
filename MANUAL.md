@@ -868,11 +868,12 @@ core-041
   5.000 x 3.810 cm   porosity 0.101
   8 confirmed run(s), 1 not   2026-01-10 to 2026-06-14
 
-  Runs
-    run                        date        method         P_mean       k     U(k)   meter
-    core-041_20260110T090000Z  2026-01-10  steady_state        5     0.9  0.03776   low_range
+  Runs   pressures in kPa, permeability in mD
+    run                      date        method            P_in     P_out    P_mean       dP0         k      U(k)  meter
+    core-041_20260110T090000 2026-01-10  steady_state    759.94    253.31    506.62                 0.9   0.03776  low_range
     ...
-    core-041_20260111T000000Z  2026-01-11  steady_state       12     0.9  0.03776   low_range   never confirmed
+    core-041_20260114T090000 2026-01-14  pulse_decay     3039.8    1013.2    2026.5    50.663    0.0144 0.0006041  low_range
+    core-041_20260111T000000 2026-01-11  steady_state    1823.9    608.00    1215.9                 0.9   0.03776  low_range   never confirmed
 
   Klinkenberg correction
     k_L = 0.520566 mD +/- 0.02125 (k = 2.45)
@@ -882,6 +883,22 @@ core-041
     - These runs fall into two groups either side of 2026-06-14. ...
     - core-041_20260111T000000Z is not a measurement: never confirmed a measurement.
 ```
+
+**Pressures are shown in `run.display_pressure_unit`**, the same unit `collect`
+printed on the console and the live plot labelled its axes with — not the atm
+the physics runs in and the files store. The unit is named once above the table
+rather than repeated in three headings, which would push it past the width of a
+terminal. `P_mean` is exactly the midpoint of the `P_in` and `P_out` beside it,
+so the three read as a set; `P_out` is the P2 the equation *used*, which on a
+rig with a declared downstream pressure is the declared number rather than the
+transducer.
+
+`dP0` is the pulse a decay started from, and the column appears only when the
+plug has at least one pulse-decay run — a steady-state row leaves it blank,
+because there is no pulse, which is not the same as a pulse whose amplitude
+went missing. A run recorded before the summary carried its pressure pair shows
+`--` for `P_in` and `P_out`: they cannot be recovered from a mean, so they are
+reported as unknown rather than split evenly and guessed at.
 
 **The findings are the point; the table is the evidence.** A summary that only
 restated what is on disk would leave you to notice that a run never confirmed,

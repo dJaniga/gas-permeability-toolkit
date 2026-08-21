@@ -204,6 +204,25 @@ def _mean_stddev(values: Sequence[float]) -> tuple[float, float]:
     return mean, (statistics.stdev(values) if len(values) > 1 else 0.0)
 
 
+def _mean_pressure_pair(readings: Sequence[Reading]) -> tuple[float | None, float | None]:
+    """Mean inlet and mean **downstream-as-used** pressure over ``readings``.
+
+    Downstream rather than the outlet transducer, because that is the P2 the
+    equation took and therefore the one whose midpoint with the inlet is the
+    reported ``mean_pressure_atm``. On a rig with a declared P2 the transducer
+    may read something else entirely; the run's ``downstream_convention`` is
+    what records that, and the summary flags a disagreement separately.
+
+    ``(None, None)`` for an empty window, so an unknown pair stays unknown
+    rather than becoming a confident zero.
+    """
+    if not readings:
+        return None, None
+    inlet, _ = _mean_stddev([r.inlet_pressure_atm for r in readings])
+    downstream, _ = _mean_stddev([r.downstream_pressure_atm for r in readings])
+    return inlet, downstream
+
+
 # --------------------------------------------------------------------------
 # Pure per-sample computation
 # --------------------------------------------------------------------------
@@ -1435,6 +1454,11 @@ def summarize_run(
         steady_state_reached=steady_window is not None,
         steady_state_window=steady_window,
         mean_pressure_atm=mean_p,
+        # The same means the budget was built from, so the summary table's
+        # P_in and P_out are the numbers that produced its k, not a second
+        # opinion computed over a different window.
+        mean_inlet_pressure_atm=mean_inlet,
+        mean_downstream_pressure_atm=mean_downstream,
         permeability_darcy=mean_k,
         permeability_stddev_darcy=stddev_k,
         mean_temperature_c=mean_t,
@@ -1706,6 +1730,7 @@ def summarize_pulse_decay_run(
         window = list(readings)
         mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window])
         mean_t, _ = _mean_stddev([r.temperature_c for r in window])
+        mean_inlet, mean_downstream = _mean_pressure_pair(window)
         return RunSummary(
             sample_id=config.sample.id,
             gas_name=config.run.gas.name,
@@ -1719,6 +1744,8 @@ def summarize_pulse_decay_run(
             # A leak test that found nothing has done its job.
             measurement_confirmed=leak_test_no_decay,
             mean_pressure_atm=mean_p,
+            mean_inlet_pressure_atm=mean_inlet,
+            mean_downstream_pressure_atm=mean_downstream,
             permeability_darcy=0.0,
             permeability_stddev_darcy=0.0,
             mean_temperature_c=mean_t,
@@ -1734,6 +1761,10 @@ def summarize_pulse_decay_run(
     mean_p, _ = _mean_stddev([r.mean_pressure_atm for r in window])
     mean_t, _ = _mean_stddev([r.temperature_c for r in window])
     mean_mu, _ = _mean_stddev([r.viscosity_cp for r in window])
+    # Over the fit window, so the pair brackets the P_mean the rate was
+    # converted at. In pulse decay they are both very nearly the pore pressure;
+    # what separates them is the decaying pulse, reported as its own amplitude.
+    mean_inlet, mean_downstream = _mean_pressure_pair(window)
 
     gas_state = processor.gas_provider.state_at_cgs(mean_t, max(mean_p, 1e-9))
     compressibility = gas_state.isothermal_compressibility_per_atm or (
@@ -1935,6 +1966,8 @@ def summarize_pulse_decay_run(
         steady_state_reached=False,
         measurement_confirmed=confirmed,
         mean_pressure_atm=mean_p,
+        mean_inlet_pressure_atm=mean_inlet,
+        mean_downstream_pressure_atm=mean_downstream,
         permeability_darcy=permeability,
         permeability_stddev_darcy=0.0,
         mean_temperature_c=mean_t,

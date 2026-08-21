@@ -909,7 +909,11 @@ def write_sample_summary(report, path: str | Path) -> Path:
             "method": line.method,
             "purpose": line.purpose,
             "confirmed": line.confirmed,
+            "inlet_pressure_atm": line.inlet_pressure_atm,
+            "downstream_pressure_atm": line.downstream_pressure_atm,
             "mean_pressure_atm": line.mean_pressure_atm,
+            # dP0, the pulse a decay started from. Absent for steady state.
+            "pulse_amplitude_atm": line.pulse_amplitude_atm,
             "permeability_D": line.permeability_darcy,
             "permeability_mD": (
                 units.darcy_to(line.permeability_darcy, "mD")

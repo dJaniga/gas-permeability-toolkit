@@ -299,6 +299,7 @@ def write_measured_run(
     length_cm: float = 5.0,
     diameter_cm: float = 3.81,
     budget=None,
+    pulse_amplitude_atm: float | None = None,
 ) -> Path:
     """A run directory carrying a **complete** :class:`RunSummary`.
 
@@ -309,7 +310,7 @@ def write_measured_run(
     """
     import yaml
 
-    from gasperm.models import ExperimentMetadata, RunSummary
+    from gasperm.models import ExperimentMetadata, PulseDecayResult, RunSummary
     from gasperm.storage import (
         METADATA_FILENAME,
         READING_COLUMNS,
@@ -347,11 +348,31 @@ def write_measured_run(
         steady_state_reached=method == "steady_state",
         measurement_confirmed=True,
         mean_pressure_atm=mean_pressure_atm,
+        # The same pair the CSV rows above carry, so their midpoint really is
+        # mean_pressure_atm and a summary table showing all three is consistent.
+        mean_inlet_pressure_atm=mean_pressure_atm * 1.5,
+        mean_downstream_pressure_atm=mean_pressure_atm * 0.5,
         permeability_darcy=permeability_darcy,
         permeability_stddev_darcy=permeability_darcy * 0.005,
         mean_temperature_c=22.0,
         mean_flow_cm3_s=1.5,
         averaged_samples=50,
+        pulse_decay=(
+            None
+            if pulse_amplitude_atm is None
+            else PulseDecayResult(
+                decay_rate_per_s=0.02,
+                pulse_amplitude_atm=pulse_amplitude_atm,
+                pulse_at_elapsed_s=1.0,
+                r_squared=0.999,
+                fit_start_elapsed_s=1.0,
+                fit_end_elapsed_s=100.0,
+                fit_sample_count=990,
+                upstream_volume_cm3=8.0,
+                downstream_volume_cm3=8.0,
+                gas_compressibility_per_atm=1.0 / mean_pressure_atm,
+            )
+        ),
         uncertainty=budget if budget is not None else build_budget(
             permeability_darcy, geometry={"L": length_cm, "d": diameter_cm}
         ),

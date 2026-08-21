@@ -240,6 +240,163 @@ class TestSampleReport:
         assert "core-041" in strip_ansi(result.output)
 
 
+class TestRunTableColumns:
+    """What the runs table reports, and in whose units.
+
+    Pressures are *stored* in atm, because that is what the physics runs in.
+    A table that printed the internal unit -- and printed it unlabelled --
+    would be asking the operator to convert numbers the rest of the package
+    already converts for them, and to guess what they were converting from.
+    """
+
+    def table(self, rig, sample_id="core-041"):
+        """The run rows, without the header or the surrounding report.
+
+        Matched on the run *directory* name (``<plug>_<timestamp>``) so the
+        report's own title line, which is the bare plug id, is not mistaken
+        for a row.
+        """
+        lines = strip_ansi(summarize(rig, sample_id).output).splitlines()
+        return [line for line in lines if line.strip().startswith(f"{sample_id}_")]
+
+    def header(self, rig, sample_id="core-041"):
+        lines = strip_ansi(summarize(rig, sample_id).output).splitlines()
+        return next(line for line in lines if "P_mean" in line)
+
+    def caption(self, rig, sample_id="core-041"):
+        """The units line above the table."""
+        lines = strip_ansi(summarize(rig, sample_id).output).splitlines()
+        return next(line for line in lines if line.strip().startswith("Runs"))
+
+    def test_the_units_are_stated_once_above_the_table(self, tmp_path):
+        """Three pressures share a unit, and a heading wide enough to repeat it
+        on each would push the table past the width of a terminal."""
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        caption = self.caption(rig)
+        assert "pressures in kPa" in caption
+        assert "permeability in mD" in caption
+
+    def test_every_column_is_headed(self, tmp_path):
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        header = self.header(rig)
+        for column in ("P_in", "P_out", "P_mean", "k", "U(k)"):
+            assert column in header
+
+    def widest(self, rig):
+        return max(len(row) for row in (self.header(rig), *self.table(rig)))
+
+    def test_a_steady_state_table_fits_a_normal_terminal(self, tmp_path):
+        """A wrapped table is unreadable, and this one grew by two columns."""
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        assert self.widest(rig) <= 120, self.widest(rig)
+
+    def test_the_pulse_column_does_not_blow_it_open(self, tmp_path):
+        """dP0 costs ten more columns, and only on plugs that ran pulse decay."""
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 11, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        assert self.widest(rig) <= 130, self.widest(rig)
+
+    def test_pressures_are_shown_in_the_rigs_display_unit(self, tmp_path):
+        """Not atm: the summary must agree with what collect printed."""
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        row = self.table(rig)[0]
+        # write_measured_run puts the pair at 1.5x and 0.5x the mean.
+        assert f"{units.from_atm(15.0, 'kPa'):.5g}" in row
+        assert f"{units.from_atm(5.0, 'kPa'):.5g}" in row
+        assert f"{units.from_atm(10.0, 'kPa'):.5g}" in row
+        assert " 10 " not in row  # ...and not the raw atm value
+
+    def test_another_display_unit_is_followed(self, tmp_path):
+        from gasperm import units
+        from gasperm.config import RUN_FILENAME
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        path = rig / RUN_FILENAME
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace('display_pressure_unit: "kPa"', 'display_pressure_unit: "bar"')
+            .replace("display_pressure_unit: kPa", "display_pressure_unit: bar"),
+            encoding="utf-8",
+        )
+        assert "pressures in bar" in self.caption(rig)
+        assert f"{units.from_atm(10.0, 'bar'):.5g}" in self.table(rig)[0]
+
+    def test_p_mean_is_the_midpoint_of_the_pair_it_is_shown_with(self, tmp_path):
+        """The property that makes the three columns checkable at a glance."""
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        row = self.table(rig)[0].split()
+        p_in, p_out, p_mean = (float(row[3]), float(row[4]), float(row[5]))
+        assert (p_in + p_out) / 2 == pytest.approx(p_mean, rel=1e-4)
+
+    def test_a_run_recorded_before_the_pair_existed_reads_as_unknown(self, tmp_path):
+        """It cannot be recovered from a mean, so it is not guessed at."""
+        rig = make_rig(tmp_path)
+        directory = write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=10.0, permeability_darcy=9e-4,
+        )
+        path = directory / "run_metadata.yaml"
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        del payload["summary"]["mean_inlet_pressure_atm"]
+        del payload["summary"]["mean_downstream_pressure_atm"]
+        path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+        row = self.table(rig)[0]
+        assert "--" in row
+        # The mean it does have is still reported.
+        assert f"{1013.25:.5g}" in row
+
+    def test_no_dp0_column_on_a_plug_measured_only_in_steady_state(self, tmp_path):
+        """An always-empty column is the same waste as an always-empty panel."""
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        assert "dP0" not in self.header(rig)
+
+    def test_a_pulse_run_reports_the_pulse_it_started_from(self, tmp_path):
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        assert "dP0" in self.header(rig)
+        assert f"{units.from_atm(0.5, 'kPa'):.5g}" in self.table(rig)[0]
+
+    def test_a_steady_row_leaves_the_dp0_cell_blank(self, tmp_path):
+        """Blank, not '--': there is no pulse, which is not a missing pulse."""
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 11, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+            flowmeter="low_range",
+        )
+        rows = {row.split()[2]: row for row in self.table(rig)}
+        assert "--" not in rows["steady_state"].split()[6:7]
+        assert rows["pulse_decay"].split()[6] == f"{units.from_atm(0.5, 'kPa'):.5g}"
+
+
 class TestSupersession:
     """A re-derived run replaces its parent; one measurement, counted once."""
 
@@ -307,6 +464,35 @@ class TestSummaryFile:
         assert len(payload["runs"]) == 3
         # The findings are the part a script can act on.
         assert isinstance(payload["findings"], list)
+
+    def test_the_written_runs_carry_the_pressure_pair(self, tmp_path):
+        """The file is what a script reads; it must not be thinner than the table.
+
+        Written in atm, not the display unit: a file is parsed rather than read,
+        and the stored unit is the one every other number in it is already in.
+        """
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        target = tmp_path / "core-041.yaml"
+        assert summarize(rig, "core-041", "--output", str(target)).exit_code == 0
+        run = yaml.safe_load(target.read_text(encoding="utf-8"))["runs"][0]
+        assert run["inlet_pressure_atm"] == pytest.approx(15.0)
+        assert run["downstream_pressure_atm"] == pytest.approx(5.0)
+        assert run["mean_pressure_atm"] == pytest.approx(10.0)
+        assert run["pulse_amplitude_atm"] is None
+
+    def test_a_written_pulse_run_carries_its_dp0(self, tmp_path):
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        target = tmp_path / "core-041.yaml"
+        assert summarize(rig, "core-041", "--output", str(target)).exit_code == 0
+        run = yaml.safe_load(target.read_text(encoding="utf-8"))["runs"][0]
+        assert run["pulse_amplitude_atm"] == pytest.approx(0.5)
 
     def test_an_excluded_run_is_written_with_its_reason(self, tmp_path):
         rig = make_rig(tmp_path)
