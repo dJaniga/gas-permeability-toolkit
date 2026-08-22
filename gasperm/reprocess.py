@@ -575,8 +575,13 @@ class VerifyReport:
         the reduction still moves, because the two paths disagreed about where
         the measurement was.
     ``summary``
-        What came out. Moves if either of the above did, and on its own means
-        the reduction arithmetic differs.
+        What came out -- ``k`` and ``U(k)``. Moves if either of the above did,
+        and on its own means the reduction arithmetic differs.
+
+    Every numeric verdict is relative to :attr:`tolerance`, which is carried on
+    the report rather than read from a module constant: a pass or a fail is
+    meaningless without the threshold it was judged at, and anything reporting
+    one has to be able to state the other.
     """
 
     directory: Path
@@ -591,6 +596,10 @@ class VerifyReport:
     replayed_permeability_darcy: float
     stored_expanded_darcy: float | None
     replayed_expanded_darcy: float | None
+    #: Relative difference treated as reproduction. Not applied to the window,
+    #: which is compared in **seconds** against the CSV's stored precision --
+    #: a different question, and not one an operator should be tuning.
+    tolerance: float = _MOVED_TOLERANCE
 
     @property
     def permeability_ratio(self) -> float | None:
@@ -599,8 +608,28 @@ class VerifyReport:
         return self.replayed_permeability_darcy / self.stored_permeability_darcy
 
     @property
+    def uncertainty_ratio(self) -> float | None:
+        if not self.stored_expanded_darcy or self.replayed_expanded_darcy is None:
+            return None
+        return self.replayed_expanded_darcy / self.stored_expanded_darcy
+
+    @property
     def samples_agree(self) -> bool:
-        return self.sample_drift is None or self.sample_drift <= _MOVED_TOLERANCE
+        return self.sample_drift is None or self.sample_drift <= self.tolerance
+
+    @property
+    def uncertainty_agrees(self) -> bool:
+        """Whether ``U(k)`` reproduced.
+
+        Checked separately from ``k`` because the two move independently: a
+        re-costing bug leaves ``k`` exactly where it was and moves only the
+        budget, which a check on ``k`` alone would pass.
+        """
+        if self.stored_expanded_darcy is None or self.replayed_expanded_darcy is None:
+            return self.stored_expanded_darcy == self.replayed_expanded_darcy
+        return _close(
+            self.stored_expanded_darcy, self.replayed_expanded_darcy, self.tolerance
+        )
 
     @property
     def windows_agree(self) -> bool:
@@ -626,7 +655,8 @@ class VerifyReport:
         return (
             self.samples_agree
             and self.windows_agree
-            and (ratio is None or abs(ratio - 1.0) <= _MOVED_TOLERANCE)
+            and self.uncertainty_agrees
+            and (ratio is None or abs(ratio - 1.0) <= self.tolerance)
         )
 
     def diagnosis(self) -> str:
@@ -644,20 +674,51 @@ class VerifyReport:
                 "the per-sample values are exact but the averaged window is not "
                 "the stored one, so the reduction covers different samples"
             )
+        ratio = self.permeability_ratio
+        if ratio is not None and abs(ratio - 1.0) > self.tolerance:
+            return (
+                "samples and window both match, so the reduction arithmetic itself "
+                "differs -- or the stored summary was written by different code"
+            )
         return (
-            "samples and window both match, so the reduction arithmetic itself "
-            "differs -- or the stored summary was written by different code"
+            "k reproduces but U(k) does not, so the budget is being rebuilt from "
+            "something the raw record does not pin down"
         )
 
 
-def verify_run(directory: str | Path, config: GaspermConfig) -> VerifyReport:
+def verify_run(
+    directory: str | Path,
+    config: GaspermConfig,
+    *,
+    tolerance: float = _MOVED_TOLERANCE,
+) -> VerifyReport:
     """Replay one run with **no change** and compare it against what is stored.
 
     This is the invariant every other use of ``reprocess`` rests on: if a no-op
     replay moves the answer, no reported change can be attributed to the field
     that was actually edited. It is separated from :func:`reprocess_run` so the
     check can be run over a whole directory without writing anything.
+
+    Args:
+        directory: The run directory, or its ``readings.csv``.
+        config: The run's **own** stored snapshot -- verifying against anything
+            else is a different question, and not this one.
+        tolerance: Relative difference treated as reproduction. The default is
+            tight enough to catch a real defect and loose enough to absorb a
+            pulse-decay refit, which lands within about 1e-7. Loosen it to hunt
+            outliers on a rig whose replay is known to differ slightly; the
+            report carries the value so a verdict is never quoted without it.
+
+    Raises:
+        ValueError: ``tolerance`` is not positive. A zero tolerance would fail
+            every run on the last bit of a float and report nothing useful.
     """
+    if tolerance <= 0.0:
+        raise ValueError(
+            f"tolerance must be positive, got {tolerance!r}. Floating-point "
+            "arithmetic does not reproduce exactly across a CSV round trip, so "
+            "a zero tolerance fails every run and localises nothing."
+        )
     import csv as csv_module
 
     from gasperm.gas_properties import build_provider
@@ -705,4 +766,5 @@ def verify_run(directory: str | Path, config: GaspermConfig) -> VerifyReport:
         replayed_permeability_darcy=replayed.permeability_darcy,
         stored_expanded_darcy=_expanded(stored),
         replayed_expanded_darcy=_expanded(replayed),
+        tolerance=tolerance,
     )

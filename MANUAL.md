@@ -1090,8 +1090,9 @@ rig file itself is what was corrected.
 ### Checking that a replay reproduces its original
 
 ```bash
-gasperm reprocess --verify --all        # every run in the directory
+gasperm reprocess --verify --all                    # every run in the directory
 gasperm reprocess --verify runs/C14_2026...
+gasperm reprocess --verify --all --tolerance 1e-5   # only the real outliers
 ```
 
 A no-change reprocess **must** reproduce the stored result. If it does not, no
@@ -1121,6 +1122,27 @@ at, because the three stages fail for unrelated reasons:
 Small differences are expected and ignored: a replayed window bound comes back
 through four decimals of `elapsed_s`, and a pulse-decay run re-*fits* its
 exponential, which reproduces to about a part in 1e7 rather than exactly.
+
+**`--tolerance` sets what counts as reproduction**, as a relative difference.
+The default is `1e-6` — loose enough to absorb that refit, tight enough to catch
+a real defect. Raise it (`--tolerance 1e-5`) on a rig whose replay is known to
+differ slightly and you want only the outliers; it cannot be zero, because a CSV
+round trip does not reproduce a float exactly and every run would fail. The
+threshold is printed with the verdict:
+
+```
+Verifying 8 run(s) re-derive to their stored results   (tolerance 1e-05)
+```
+
+A pass says nothing without the threshold it was judged at, and an operator
+reading the output months later cannot ask what it was. It applies to the
+per-sample drift and to `k` and `U(k)`; the **window** is compared in seconds
+against the CSV's stored precision instead, which is a different question and
+not one worth tuning.
+
+`k` and `U(k)` are checked separately, because they move independently: a
+re-costing bug leaves `k` exactly where it was and moves only the budget, which
+a check on `k` alone would wave through.
 
 ### Reprocessing the whole bench
 

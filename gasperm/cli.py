@@ -2239,6 +2239,14 @@ def reprocess_command(
              "derivation, the averaged window, or the reduction -- for any run "
              "that does not reproduce. Writes nothing.",
     ),
+    tolerance: Optional[float] = typer.Option(
+        None, "--tolerance", metavar="RELATIVE",
+        help="Relative difference --verify accepts as reproduction, e.g. 1e-5. "
+             "Default 1e-6, which absorbs a pulse-decay refit (about 1e-7) and "
+             "still catches a real defect. Raise it to hunt outliers on a rig "
+             "whose replay is known to differ slightly. Reported alongside the "
+             "verdict, since a pass means nothing without its threshold.",
+    ),
     write: bool = typer.Option(
         False, "--write",
         help="Write each re-derived run to a NEW run directory beside the "
@@ -2353,8 +2361,18 @@ def reprocess_command(
         )
         return
 
+    if tolerance is not None and not verify:
+        _fail("--tolerance only applies to --verify. Add --verify, or drop it.")
+        return
     if verify:
-        _verify_runs(records)
+        if tolerance is not None and tolerance <= 0.0:
+            _fail(
+                f"--tolerance must be positive, got {tolerance:g}. A CSV round trip "
+                "does not reproduce a float exactly, so a zero tolerance fails "
+                "every run and localises nothing."
+            )
+            return
+        _verify_runs(records, tolerance)
         return
 
     overrides = list(set_values or [])
@@ -2509,19 +2527,22 @@ def _write_reprocessed(result, config: GaspermConfig) -> Path:
     return target
 
 
-def _verify_runs(records) -> None:
+def _verify_runs(records, tolerance: float | None = None) -> None:
     """Check that each run re-derives to its stored result, and localise any drift.
 
     The useful output for a run that does not reproduce is not the size of the
     difference but the **stage** it appeared at, because the three stages fail
     for unrelated reasons and only one of them is about the physics.
     """
-    from gasperm.reprocess import ReprocessError, verify_run
+    from gasperm.reprocess import _MOVED_TOLERANCE, ReprocessError, verify_run
 
+    resolved = _MOVED_TOLERANCE if tolerance is None else tolerance
     reports, failures = [], []
     for record in records:
         try:
-            reports.append(verify_run(record.directory, _stored_config(record)))
+            reports.append(
+                verify_run(record.directory, _stored_config(record), tolerance=resolved)
+            )
         except (ReprocessError, ConfigError, ValueError, KeyError) as exc:
             failures.append((record.name, str(exc)))
 
@@ -2531,8 +2552,11 @@ def _verify_runs(records) -> None:
         _fail("Nothing could be verified.")
         return
 
+    # The threshold is part of the verdict, not a footnote: "reproduces" says
+    # nothing on its own, and an operator reading this months later cannot ask.
     typer.secho(
-        f"\nVerifying {len(reports)} run(s) re-derive to their stored results",
+        f"\nVerifying {len(reports)} run(s) re-derive to their stored results"
+        f"   (tolerance {resolved:g})",
         bold=True,
     )
     drifted = [report for report in reports if not report.reproduces]
@@ -2561,6 +2585,11 @@ def _verify_runs(records) -> None:
                 f"{units.darcy_to(report.stored_permeability_darcy, 'mD'):.6g}"
                 f" -> {units.darcy_to(report.replayed_permeability_darcy, 'mD'):.6g} mD"
             )
+        if not report.uncertainty_agrees:
+            typer.echo(
+                f"      summary U(k)   {_expanded_mD(report.stored_expanded_darcy)}"
+                f" -> {_expanded_mD(report.replayed_expanded_darcy)} mD"
+            )
 
     if drifted:
         typer.secho(
@@ -2575,6 +2604,10 @@ def _verify_runs(records) -> None:
 
 def _window_text(bounds) -> str:
     return "none" if bounds is None else f"{bounds[0]:.2f}-{bounds[1]:.2f} s"
+
+
+def _expanded_mD(value_darcy) -> str:
+    return "--" if value_darcy is None else f"{units.darcy_to(value_darcy, 'mD'):.6g}"
 
 
 #: Sample fields that describe **one core**, so setting them across a whole

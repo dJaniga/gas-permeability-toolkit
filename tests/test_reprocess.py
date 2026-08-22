@@ -704,6 +704,77 @@ class TestVerify:
         runner.invoke(app, ["reprocess", "--verify", str(directory)])
         assert sorted(p.name for p in (rig / "runs").iterdir()) == before
 
+    def drifted_by(self, directory, relative):
+        """A config that moves every sample's k by ``relative``, via geometry."""
+        config = self.stored_config(directory)
+        config.sample.length = config.sample.length * (1 + relative)
+        return config
+
+    def test_the_threshold_decides_the_verdict(self, tmp_path):
+        """The point of making it settable: the same drift, judged two ways."""
+        _, directory, _ = record_steady_run(tmp_path)
+        config = self.drifted_by(directory, 3e-6)
+        assert not verify_run(directory, config, tolerance=1e-6).reproduces
+        assert verify_run(directory, config, tolerance=1e-5).reproduces
+
+    def test_the_report_carries_the_threshold_it_was_judged_at(self, tmp_path):
+        """A pass means nothing without it, so nothing has to look it up."""
+        _, directory, _ = record_steady_run(tmp_path)
+        assert verify_run(directory, self.stored_config(directory),
+                          tolerance=1e-5).tolerance == 1e-5
+
+    def test_the_default_is_unchanged(self, tmp_path):
+        from gasperm.reprocess import _MOVED_TOLERANCE
+
+        _, directory, _ = record_steady_run(tmp_path)
+        report = verify_run(directory, self.stored_config(directory))
+        assert report.tolerance == _MOVED_TOLERANCE
+
+    def test_a_non_positive_threshold_is_refused(self, tmp_path):
+        """It would fail every run on the last bit of a float and localise nothing."""
+        _, directory, _ = record_steady_run(tmp_path)
+        for bad in (0.0, -1e-6):
+            with pytest.raises(ValueError, match="must be positive"):
+                verify_run(directory, self.stored_config(directory), tolerance=bad)
+
+    def test_the_command_states_the_threshold(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(
+            app, ["reprocess", "--verify", str(directory), "--tolerance", "1e-5"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "tolerance 1e-05" in strip_ansi(result.output)
+
+    def test_the_command_refuses_a_non_positive_threshold(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(
+            app, ["reprocess", "--verify", str(directory), "--tolerance", "0"]
+        )
+        assert result.exit_code == 1
+        assert "must be positive" in strip_ansi(result.output)
+
+    def test_the_threshold_without_verify_is_refused(self, tmp_path):
+        """Rather than silently doing nothing, which is how a check gets trusted
+        that was never applied."""
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(
+            app, ["reprocess", str(directory), "--tolerance", "1e-5"]
+        )
+        assert result.exit_code == 1
+        assert "only applies to --verify" in strip_ansi(result.output)
+
+    def test_a_moved_uncertainty_is_caught_and_named(self, tmp_path):
+        """k and U(k) move independently: a re-costing bug leaves k exactly
+        where it was, and a check on k alone would pass it."""
+        _, directory, _ = record_pulse_run(tmp_path)
+        config = self.stored_config(directory)
+        config.sample.porosity_uncertainty = (config.sample.porosity_uncertainty or 0.01) * 4
+        report = verify_run(directory, config)
+        assert not report.reproduces
+        assert report.samples_agree
+        assert not report.uncertainty_agrees
+        assert "U(k) does not" in report.diagnosis()
+
     def test_it_verifies_a_whole_directory(self, tmp_path):
         rig = record_two_plugs(tmp_path)
         result = runner.invoke(
