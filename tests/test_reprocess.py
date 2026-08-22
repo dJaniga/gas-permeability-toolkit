@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from typer.testing import CliRunner
@@ -32,6 +33,7 @@ from gasperm.reprocess import (
     read_raw_samples,
     rebuild_readings,
     reprocess_run,
+    verify_run,
 )
 from gasperm.storage import RunWriter
 
@@ -609,6 +611,106 @@ class TestNoChangeReproduces:
         output = strip_ansi(result.output)
         assert "No configuration change" in output
         assert "k moved" not in output
+
+
+class TestVerify:
+    """``--verify``: does a run re-derive to what is stored, and if not, where?
+
+    Three bugs in this area reached a rig before being noticed, each one a
+    no-change replay quietly moving ``k``. The size of the difference was never
+    the useful part -- the *stage* it appeared at was, because the stages fail
+    for unrelated reasons and only one of them is about the physics.
+    """
+
+    def stored_config(self, directory):
+        from gasperm.cli import _stored_config
+        from gasperm.storage import _record_from_directory
+
+        return _stored_config(_record_from_directory(directory))
+
+    def test_a_healthy_steady_run_reproduces(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        report = verify_run(directory, self.stored_config(directory))
+        assert report.reproduces, report.diagnosis()
+
+    def test_a_healthy_pulse_run_reproduces(self, tmp_path):
+        _, directory, _ = record_pulse_run(tmp_path)
+        report = verify_run(directory, self.stored_config(directory))
+        assert report.reproduces, report.diagnosis()
+
+    def test_a_run_that_ended_drifting_reproduces(self, tmp_path):
+        """The case that did not, before the window fix."""
+        _, directory, _ = TestNoChangeReproduces().drifting_run(tmp_path)
+        report = verify_run(directory, self.stored_config(directory))
+        assert report.reproduces, report.diagnosis()
+
+    def test_csv_rounding_is_not_reported_as_drift(self, tmp_path):
+        """A stored bound is a full-precision float; a replayed one comes back
+        through four decimals of elapsed_s. Comparing those relatively -- near
+        t = 0 especially -- reports every healthy run as broken."""
+        _, directory, _ = record_steady_run(tmp_path)
+        report = verify_run(directory, self.stored_config(directory))
+        assert report.stored_window != report.replayed_window   # they do differ
+        assert report.windows_agree                             # ...but not meaningfully
+
+    def test_a_lost_window_is_named_as_the_window(self, tmp_path):
+        """Localisation is the feature: exact samples, wrong reduction."""
+        _, directory, _ = TestNoChangeReproduces().drifting_run(tmp_path)
+
+        def lost(samples, config, *, time_key="elapsed_s"):
+            return None
+
+        with mock.patch("gasperm.steady_state.detect_steady_window", lost):
+            report = verify_run(directory, self.stored_config(directory))
+        assert not report.reproduces
+        assert report.samples_agree
+        assert not report.windows_agree
+        assert "averaged window is not the stored one" in report.diagnosis()
+
+    def test_a_per_sample_difference_is_named_as_the_samples(self, tmp_path):
+        """The other stage, so a real calibration drift is not blamed on the
+        window -- they need entirely different fixes."""
+        _, directory, _ = record_steady_run(tmp_path)
+        config = self.stored_config(directory)
+        config.sample.length = config.sample.length * 1.05  # moves every sample's k
+        report = verify_run(directory, config)
+        assert not report.reproduces
+        assert not report.samples_agree
+        assert "per-sample derivation differs" in report.diagnosis()
+
+    def test_the_command_exits_two_when_a_run_does_not_reproduce(self, tmp_path):
+        """A distinct code, so a scripted check over a directory can gate on it."""
+        _, directory, _ = TestNoChangeReproduces().drifting_run(tmp_path)
+
+        with mock.patch(
+            "gasperm.steady_state.detect_steady_window",
+            lambda *a, **k: None,
+        ):
+            result = runner.invoke(app, ["reprocess", "--verify", str(directory)])
+        assert result.exit_code == 2
+        output = strip_ansi(result.output)
+        assert "DOES NOT REPRODUCE" in output
+        assert "averaged window" in output
+
+    def test_the_command_is_quiet_and_clean_when_all_reproduce(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(app, ["reprocess", "--verify", str(directory)])
+        assert result.exit_code == 0, result.output
+        assert "All runs reproduce" in strip_ansi(result.output)
+
+    def test_it_writes_nothing(self, tmp_path):
+        rig, directory, _ = record_steady_run(tmp_path)
+        before = sorted(p.name for p in (rig / "runs").iterdir())
+        runner.invoke(app, ["reprocess", "--verify", str(directory)])
+        assert sorted(p.name for p in (rig / "runs").iterdir()) == before
+
+    def test_it_verifies_a_whole_directory(self, tmp_path):
+        rig = record_two_plugs(tmp_path)
+        result = runner.invoke(
+            app, ["reprocess", "--verify", "--all", "-c", str(rig)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Verifying 2 run(s)" in strip_ansi(result.output)
 
 
 class TestReprocessAll:

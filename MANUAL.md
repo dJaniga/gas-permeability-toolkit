@@ -1087,6 +1087,41 @@ whatever the config files say today, or the "before" half would be a result
 nobody ever produced. `--from-config` opts into the current files, for when the
 rig file itself is what was corrected.
 
+### Checking that a replay reproduces its original
+
+```bash
+gasperm reprocess --verify --all        # every run in the directory
+gasperm reprocess --verify runs/C14_2026...
+```
+
+A no-change reprocess **must** reproduce the stored result. If it does not, no
+reported change can be attributed to the field that was actually edited — the
+baseline has moved underneath it. `--verify` re-derives with nothing changed and
+compares against what is stored, writing nothing and exiting `2` if any run
+fails, so it can gate a script.
+
+The useful output is not the size of the difference but the **stage** it appears
+at, because the three stages fail for unrelated reasons:
+
+```
+  C14_20260821T075735Z    k    -0.0540%   DOES NOT REPRODUCE
+      the per-sample values are exact but the averaged window is not the stored
+      one, so the reduction covers different samples
+      per-sample k   worst relative drift 3.019e-08
+      window         stored 0.05-20.95 s   replayed none
+      summary k      0.208702 -> 0.208591 mD
+```
+
+- **per-sample** drift means the same voltages are producing different values —
+  a calibration or property-lookup problem.
+- **window** means the derivation is exact but the two paths disagree about
+  *where* the measurement was.
+- neither, yet `k` still moved, means the reduction arithmetic itself differs.
+
+Small differences are expected and ignored: a replayed window bound comes back
+through four decimals of `elapsed_s`, and a pulse-decay run re-*fits* its
+exponential, which reproduces to about a part in 1e7 rather than exactly.
+
 ### Reprocessing the whole bench
 
 `--sample <plug>` re-derives one plug's whole campaign, which is the usual case:

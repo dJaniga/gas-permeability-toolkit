@@ -2232,6 +2232,13 @@ def reprocess_command(
         help="Replace the stored sample section with this file, e.g. after "
              "re-measuring a plug's porosity.",
     ),
+    verify: bool = typer.Option(
+        False, "--verify",
+        help="Check that each run re-derives to what is stored, changing "
+             "nothing. Reports which stage disagrees -- the per-sample "
+             "derivation, the averaged window, or the reduction -- for any run "
+             "that does not reproduce. Writes nothing.",
+    ),
     write: bool = typer.Option(
         False, "--write",
         help="Write each re-derived run to a NEW run directory beside the "
@@ -2344,6 +2351,10 @@ def reprocess_command(
             "Nothing to reprocess. Give one or more run directories, --sample to "
             "take every run for a plug, or --all for the whole runs directory."
         )
+        return
+
+    if verify:
+        _verify_runs(records)
         return
 
     overrides = list(set_values or [])
@@ -2496,6 +2507,74 @@ def _write_reprocessed(result, config: GaspermConfig) -> Path:
         yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8"
     )
     return target
+
+
+def _verify_runs(records) -> None:
+    """Check that each run re-derives to its stored result, and localise any drift.
+
+    The useful output for a run that does not reproduce is not the size of the
+    difference but the **stage** it appeared at, because the three stages fail
+    for unrelated reasons and only one of them is about the physics.
+    """
+    from gasperm.reprocess import ReprocessError, verify_run
+
+    reports, failures = [], []
+    for record in records:
+        try:
+            reports.append(verify_run(record.directory, _stored_config(record)))
+        except (ReprocessError, ConfigError, ValueError, KeyError) as exc:
+            failures.append((record.name, str(exc)))
+
+    for name, reason in failures:
+        typer.secho(f"skipped {name}: {reason}", fg=typer.colors.YELLOW, err=True)
+    if not reports:
+        _fail("Nothing could be verified.")
+        return
+
+    typer.secho(
+        f"\nVerifying {len(reports)} run(s) re-derive to their stored results",
+        bold=True,
+    )
+    drifted = [report for report in reports if not report.reproduces]
+    for report in reports:
+        ratio = report.permeability_ratio
+        moved = "--" if ratio is None else f"{(ratio - 1.0) * 100:+.4f}%"
+        ok = report.reproduces
+        typer.secho(
+            f"  {report.directory.name[:34]:<34} k {moved:>12}   "
+            f"{'reproduces' if ok else 'DOES NOT REPRODUCE'}",
+            fg=None if ok else typer.colors.RED,
+        )
+        if ok:
+            continue
+        typer.secho(f"      {report.diagnosis()}", fg=typer.colors.YELLOW)
+        if report.sample_drift is not None:
+            typer.echo(f"      per-sample k   worst relative drift {report.sample_drift:.3e}")
+        if not report.windows_agree:
+            typer.echo(
+                f"      window         stored {_window_text(report.stored_window)}"
+                f"   replayed {_window_text(report.replayed_window)}"
+            )
+        if report.stored_permeability_darcy:
+            typer.echo(
+                f"      summary k      "
+                f"{units.darcy_to(report.stored_permeability_darcy, 'mD'):.6g}"
+                f" -> {units.darcy_to(report.replayed_permeability_darcy, 'mD'):.6g} mD"
+            )
+
+    if drifted:
+        typer.secho(
+            f"\n{len(drifted)} of {len(reports)} run(s) do not re-derive to what is "
+            "stored. Their stored results are the ones `collect` produced; treat a "
+            "reprocessed value from them as unreliable until this is fixed.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=2)
+    typer.secho("\nAll runs reproduce their stored results.", fg=typer.colors.GREEN)
+
+
+def _window_text(bounds) -> str:
+    return "none" if bounds is None else f"{bounds[0]:.2f}-{bounds[1]:.2f} s"
 
 
 #: Sample fields that describe **one core**, so setting them across a whole

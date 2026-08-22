@@ -58,11 +58,13 @@ __all__ = [
     "RawSample",
     "ReprocessError",
     "ReprocessResult",
+    "VerifyReport",
     "classify_change",
     "diff_configs",
     "read_raw_samples",
     "rebuild_readings",
     "reprocess_run",
+    "verify_run",
 ]
 
 ChangeClass = Literal["raw", "result", "uncertainty", "metadata"]
@@ -527,6 +529,13 @@ def _expanded(summary: RunSummary | None) -> float | None:
 #: :attr:`ReprocessResult.permeability_moved` for why it is not zero.
 _MOVED_TOLERANCE = 1e-6
 
+#: How far two window bounds may sit apart and still be the same window, in
+#: seconds. The CSV stores ``elapsed_s`` to four decimals, so a replayed bound
+#: is up to 5e-5 s from the full-precision one the live run held; anything
+#: larger than that means a different sample, not a different rounding. Kept
+#: well under one sample interval at any rate this rig runs.
+_WINDOW_TOLERANCE_S = 2e-4
+
 
 def _close(left: float, right: float, tolerance: float = _MOVED_TOLERANCE) -> bool:
     scale = max(abs(left), abs(right))
@@ -541,3 +550,159 @@ def summarise_changes(changes: Iterable[ConfigChange]) -> dict[ChangeClass, list
     for change in changes:
         grouped.setdefault(change.predicted, []).append(change)
     return grouped
+
+
+# --------------------------------------------------------------------------
+# Verifying that a replay reproduces its original
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    """Where a no-change replay of one run agrees with its stored summary, and
+    where it does not.
+
+    A no-change reprocess **must** reproduce the original. When it does not,
+    the useful question is not "by how much" but "at which stage", because the
+    three stages fail for entirely different reasons:
+
+    ``sample_drift``
+        The per-sample derivation. Non-zero means the replay is computing
+        different pressures, flows or viscosities from the same raw voltages --
+        a calibration or property-lookup problem.
+    ``window``
+        Which samples get averaged. The per-sample values can be exact while
+        the reduction still moves, because the two paths disagreed about where
+        the measurement was.
+    ``summary``
+        What came out. Moves if either of the above did, and on its own means
+        the reduction arithmetic differs.
+    """
+
+    directory: Path
+    #: Largest relative difference between the stored per-sample permeability
+    #: and the rebuilt one. ``None`` when the CSV stored none to compare.
+    sample_drift: float | None
+    #: ``(stored, replayed)`` steady-window bounds in seconds, or ``None``
+    #: where a run has no window (pulse decay, or one that never settled).
+    stored_window: tuple[float, float] | None
+    replayed_window: tuple[float, float] | None
+    stored_permeability_darcy: float | None
+    replayed_permeability_darcy: float
+    stored_expanded_darcy: float | None
+    replayed_expanded_darcy: float | None
+
+    @property
+    def permeability_ratio(self) -> float | None:
+        if not self.stored_permeability_darcy:
+            return None
+        return self.replayed_permeability_darcy / self.stored_permeability_darcy
+
+    @property
+    def samples_agree(self) -> bool:
+        return self.sample_drift is None or self.sample_drift <= _MOVED_TOLERANCE
+
+    @property
+    def windows_agree(self) -> bool:
+        """Whether the two windows cover the same span.
+
+        Compared with an **absolute** tolerance in seconds, not a relative one:
+        a stored bound is a full-precision in-memory float while the replayed
+        one comes back through the CSV's four-decimal ``elapsed_s``, so they
+        differ by up to 5e-5 s for reasons that have nothing to do with the
+        measurement -- and near ``t = 0`` a relative tolerance turns that into
+        a false alarm.
+        """
+        if self.stored_window is None or self.replayed_window is None:
+            return self.stored_window == self.replayed_window
+        return all(
+            abs(a - b) <= _WINDOW_TOLERANCE_S
+            for a, b in zip(self.stored_window, self.replayed_window)
+        )
+
+    @property
+    def reproduces(self) -> bool:
+        ratio = self.permeability_ratio
+        return (
+            self.samples_agree
+            and self.windows_agree
+            and (ratio is None or abs(ratio - 1.0) <= _MOVED_TOLERANCE)
+        )
+
+    def diagnosis(self) -> str:
+        """One line naming the stage that broke, for a run that did not reproduce."""
+        if self.reproduces:
+            return "reproduces its stored result"
+        if not self.samples_agree:
+            return (
+                "the per-sample derivation differs -- the same voltages are "
+                "producing different values, so the calibration or a property "
+                "lookup is not being reproduced"
+            )
+        if not self.windows_agree:
+            return (
+                "the per-sample values are exact but the averaged window is not "
+                "the stored one, so the reduction covers different samples"
+            )
+        return (
+            "samples and window both match, so the reduction arithmetic itself "
+            "differs -- or the stored summary was written by different code"
+        )
+
+
+def verify_run(directory: str | Path, config: GaspermConfig) -> VerifyReport:
+    """Replay one run with **no change** and compare it against what is stored.
+
+    This is the invariant every other use of ``reprocess`` rests on: if a no-op
+    replay moves the answer, no reported change can be attributed to the field
+    that was actually edited. It is separated from :func:`reprocess_run` so the
+    check can be run over a whole directory without writing anything.
+    """
+    import csv as csv_module
+
+    from gasperm.gas_properties import build_provider
+    from gasperm.storage import resolve_run_paths, summary_from_run
+
+    readings_path, _ = resolve_run_paths(directory)
+    stored = summary_from_run(directory)
+    samples = read_raw_samples(readings_path)
+    provider = build_provider(config.run.gas)
+    readings = rebuild_readings(samples, config, provider)
+
+    # Per-sample: the stored derived column against the rebuilt one, keyed by
+    # index so a skipped row cannot silently shift the comparison by one.
+    rebuilt = {r.index: r.permeability_darcy for r in readings}
+    drift: float | None = None
+    with Path(readings_path).open("r", encoding="utf-8", newline="") as handle:
+        for row in csv_module.DictReader(handle):
+            was = _optional_float(row.get("permeability_D"))
+            index = _optional_float(row.get("index"))
+            if was is None or index is None or not was:
+                continue
+            now = rebuilt.get(int(index))
+            if now is None:
+                continue
+            drift = max(drift or 0.0, abs(now / was - 1.0))
+
+    replayed = reprocess_run(
+        directory, config,
+        started_at=stored.started_at if stored else None,
+        ended_at=stored.ended_at if stored else None,
+    )
+
+    def bounds(summary):
+        window = getattr(summary, "steady_state_window", None) if summary else None
+        if window is None:
+            return None
+        return (window.start_elapsed_s, window.end_elapsed_s)
+
+    return VerifyReport(
+        directory=Path(readings_path).parent,
+        sample_drift=drift,
+        stored_window=bounds(stored),
+        replayed_window=bounds(replayed),
+        stored_permeability_darcy=stored.permeability_darcy if stored else None,
+        replayed_permeability_darcy=replayed.permeability_darcy,
+        stored_expanded_darcy=_expanded(stored),
+        replayed_expanded_darcy=_expanded(replayed),
+    )
