@@ -271,7 +271,9 @@ gasperm summarize core-041              # one plug, in full
 gasperm summarize core-041 -o core-041.yaml
 ```
 
-Identity, every run with its result and uncertainty, the fit across them, the
+Identity — geometry, and the porosity and bulk density exactly as the sample
+file states them, unrounded and in the unit they were entered in — then every
+run with its result and uncertainty, the fit across them, the
 leak tests behind them — and **the gaps**: a run that never confirmed, a series
 one pressure short of a fit, two meters where there should be one, a
 pulse-decay campaign with no leak test. It also notices when a plug's history is

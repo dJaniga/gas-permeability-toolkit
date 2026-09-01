@@ -2020,6 +2020,18 @@ def _print_plug_roster(records, runs_dir: Path) -> None:
     )
 
 
+def _as_entered(value: float) -> str:
+    """A petrophysical constant at the resolution its sample file states it.
+
+    Twelve significant figures rather than ``repr``: it keeps every digit anyone
+    types into a sample file, while suppressing the binary tail a unit
+    conversion leaves behind -- a porosity of 10.4 % converted to a fraction is
+    0.10400000000000001, and printing that would read as spurious precision
+    rather than as fidelity.
+    """
+    return f"{value:.12g}"
+
+
 def _print_sample_summary(
     report, runs_dir: Path, superseded, pressure_unit: str = "atm"
 ) -> None:
@@ -2029,9 +2041,22 @@ def _print_sample_summary(
     identity = []
     if report.length_cm and report.diameter_cm:
         identity.append(f"{report.length_cm:.3f} x {report.diameter_cm:.3f} cm")
-    if report.porosity_fraction is not None:
-        method = f" ({report.porosity_method})" if report.porosity_method else ""
-        identity.append(f"porosity {report.porosity_fraction:.4g}{method}")
+    if report.porosity is not None:
+        # Unrounded, and in the unit the sample file used: this line is read
+        # against that file, and a porosity quoted to four figures cannot be
+        # compared with the five the pycnometer reported.
+        entry = f"porosity {_as_entered(report.porosity)}"
+        if report.porosity_uncertainty is not None:
+            entry += f" +/- {_as_entered(report.porosity_uncertainty)}"
+        if report.porosity_unit != "fraction":
+            entry += f" {report.porosity_unit}"
+        if report.porosity_method:
+            entry += f" ({report.porosity_method})"
+        identity.append(entry)
+    if report.bulk_density_g_cm3 is not None:
+        identity.append(
+            f"bulk density {_as_entered(report.bulk_density_g_cm3)} g/cm3"
+        )
     for label, value in (
         ("lithology", report.lithology), ("formation", report.formation),
         ("well", report.well),

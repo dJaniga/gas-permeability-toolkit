@@ -158,7 +158,20 @@ class SampleReport:
     length_cm: float | None = None
     diameter_cm: float | None = None
     porosity_fraction: float | None = None
+    #: Porosity and its uncertainty **as the sample file states them**, in
+    #: :attr:`porosity_unit`, beside the converted fraction above. A summary is
+    #: read by whoever measured the plug, and 10.4 % is what they wrote down;
+    #: rounding it, or silently restating it as a fraction, makes the page
+    #: disagree with the file it came from.
+    porosity: float | None = None
+    porosity_unit: str = "fraction"
+    porosity_uncertainty: float | None = None
     porosity_method: str = ""
+    #: Bulk density, g/cm3, as the sample file states it. Descriptive like the
+    #: rest of this block -- it enters no calculation -- but it is what a
+    #: porosity is cross-checked against, so a report carrying one without the
+    #: other cannot be checked at all.
+    bulk_density_g_cm3: float | None = None
 
     measurements: tuple[RunLine, ...] = ()
     leak_tests: tuple[RunLine, ...] = ()
@@ -387,6 +400,24 @@ def _findings(report: SampleReport) -> list[str]:
     return findings
 
 
+def _porosity_as_written(metadata) -> tuple[float | None, str, float | None]:
+    """Porosity, its unit and its uncertainty as the sample file states them.
+
+    The entered value and unit where the run kept them; the stored fraction,
+    with no unit and no uncertainty, where it did not. A run recorded before the
+    entered form was carried has only ever had the fraction -- that *is* its
+    full resolution, and inventing a percent sign for it would be a guess.
+    """
+    entered = getattr(metadata, "porosity", None)
+    if entered is None:
+        return getattr(metadata, "porosity_fraction", None), "fraction", None
+    return (
+        entered,
+        getattr(metadata, "porosity_unit", "fraction") or "fraction",
+        getattr(metadata, "porosity_uncertainty", None),
+    )
+
+
 def build_report(
     sample_id: str,
     records: Sequence,
@@ -421,6 +452,11 @@ def build_report(
         )
     ]
     latest = descriptive[-1] if descriptive else None
+    (
+        written_porosity,
+        written_porosity_unit,
+        written_porosity_uncertainty,
+    ) = _porosity_as_written(latest)
 
     report = SampleReport(
         sample_id=sample_id,
@@ -433,7 +469,13 @@ def build_report(
         length_cm=getattr(latest, "length_cm", None),
         diameter_cm=getattr(latest, "diameter_cm", None),
         porosity_fraction=getattr(latest, "porosity_fraction", None),
+        # Beside the fraction: the same number in the words the sample file
+        # used. See _porosity_as_written.
+        porosity=written_porosity,
+        porosity_unit=written_porosity_unit,
+        porosity_uncertainty=written_porosity_uncertainty,
         porosity_method=getattr(latest, "porosity_method", "") or "",
+        bulk_density_g_cm3=getattr(latest, "bulk_density_g_cm3", None),
         measurements=measurements,
         leak_tests=leak_tests,
         excluded=excluded,

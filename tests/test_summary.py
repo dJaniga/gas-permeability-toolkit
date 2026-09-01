@@ -154,6 +154,51 @@ class TestSampleReport:
         assert "5.000 x 3.810 cm" in output
         assert "porosity 0.123" in output
 
+    def test_porosity_and_bulk_density_read_as_the_sample_file_wrote_them(
+        self, tmp_path
+    ):
+        """Unrounded, and in the unit they were entered in.
+
+        A pycnometer reports percentage points to five or six figures, and this
+        page is read against the sample file it came from. Restating 10.4321 %
+        as a four-figure fraction makes the two disagree, which is the one thing
+        an identity line must not do.
+        """
+        rig = make_rig(tmp_path)
+        add_series(
+            rig,
+            porosity_fraction=0.104321,
+            porosity=10.4321,
+            porosity_unit="%",
+            porosity_uncertainty=0.25,
+            bulk_density_g_cm3=2.36145,
+        )
+        output = strip_ansi(summarize(rig, "core-041").output)
+        assert "porosity 10.4321 +/- 0.25 %" in output
+        assert "bulk density 2.36145 g/cm3" in output
+
+    def test_a_run_that_kept_only_a_fraction_still_reads_in_full(self, tmp_path):
+        """The fraction is that run's full resolution -- print all of it.
+
+        Nothing recorded before the entered value was kept can recover the unit,
+        so it reads as the fraction it stored, with no digits dropped and no
+        percent sign invented.
+        """
+        rig = make_rig(tmp_path)
+        add_series(rig, porosity_fraction=0.1043215)
+        output = strip_ansi(summarize(rig, "core-041").output)
+        assert "porosity 0.1043215" in output
+
+    def test_a_converted_porosity_does_not_read_as_spurious_precision(
+        self, tmp_path
+    ):
+        """10.4 % as a fraction is 0.10400000000000001 in binary. Not that."""
+        rig = make_rig(tmp_path)
+        add_series(rig, porosity_fraction=10.4 / 100.0)
+        output = strip_ansi(summarize(rig, "core-041").output)
+        assert "porosity 0.104" in output
+        assert "0.10400000" not in output
+
     def test_an_unconfirmed_run_is_excluded_and_named(self, tmp_path):
         rig = make_rig(tmp_path)
         add_series(rig)
@@ -553,6 +598,26 @@ class TestSummaryFile:
         assert len(payload["runs"]) == 3
         # The findings are the part a script can act on.
         assert isinstance(payload["findings"], list)
+
+    def test_it_writes_porosity_as_entered_beside_the_fraction(self, tmp_path):
+        """A parsed summary must not have to redo the unit conversion by hand."""
+        rig = make_rig(tmp_path)
+        add_series(
+            rig,
+            porosity_fraction=0.104321,
+            porosity=10.4321,
+            porosity_unit="%",
+            porosity_uncertainty=0.25,
+            bulk_density_g_cm3=2.36145,
+        )
+        target = tmp_path / "core-041.yaml"
+        assert summarize(rig, "core-041", "--output", str(target)).exit_code == 0
+        sample = yaml.safe_load(target.read_text(encoding="utf-8"))["sample"]
+        assert sample["porosity"] == pytest.approx(10.4321)
+        assert sample["porosity_unit"] == "%"
+        assert sample["porosity_uncertainty"] == pytest.approx(0.25)
+        assert sample["porosity_fraction"] == pytest.approx(0.104321)
+        assert sample["bulk_density_g_cm3"] == pytest.approx(2.36145)
 
     def test_the_written_runs_carry_the_pressure_pair(self, tmp_path):
         """The file is what a script reads; it must not be thinner than the table.

@@ -951,7 +951,15 @@ def write_sample_summary(report, path: str | Path) -> Path:
             "length_cm": report.length_cm,
             "diameter_cm": report.diameter_cm,
             "porosity_fraction": report.porosity_fraction,
+            # The fraction above is what anything computes with; these are the
+            # sample file's own words for the same number, unrounded and in the
+            # unit it was entered in, so a parsed summary can be checked against
+            # the file without redoing the conversion by hand.
+            "porosity": report.porosity,
+            "porosity_unit": report.porosity_unit or None,
+            "porosity_uncertainty": report.porosity_uncertainty,
             "porosity_method": report.porosity_method or None,
+            "bulk_density_g_cm3": report.bulk_density_g_cm3,
         },
         "history": {
             "confirmed_runs": report.run_count,

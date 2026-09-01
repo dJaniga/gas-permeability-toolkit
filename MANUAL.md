@@ -865,7 +865,7 @@ to *read* it.
 
 ```
 core-041
-  5.000 x 3.810 cm   porosity 0.101
+  5.000 x 3.810 cm   porosity 10.1432 +/- 0.25 % (helium pycnometry)   bulk density 2.36145 g/cm3
   8 confirmed run(s), 1 not   2026-01-10 to 2026-06-14
 
   Runs   pressures in kPa, permeability in mD;  pulse rows: P at the pulse
@@ -883,6 +883,26 @@ core-041
     - These runs fall into two groups either side of 2026-06-14. ...
     - core-041_20260111T000000Z is not a measurement: never confirmed a measurement.
 ```
+
+**The petrophysics on the identity line is quoted as the sample file states
+it** — unrounded, and in the unit it was entered in. A helium pycnometer
+reports percentage points to five or six figures, and this line is read against
+the file it came from; restating 10.1432 % as a four-figure fraction makes the
+two disagree, which is exactly what an identity line exists to prevent. So the
+porosity carries its `porosity_unit` and, where one is recorded, its
+`porosity_uncertainty` in that same unit, and `bulk_density_g_cm3` is shown
+beside it — porosity is cross-checked against the densities (`1 - rho_b/rho_g`),
+and a page carrying one without the other cannot be checked at all.
+
+The digits stop at twelve significant figures rather than at `repr`, which
+suppresses the binary tail a unit conversion leaves behind: a porosity of 10.4 %
+is 0.10400000000000001 as a fraction, and printing that would read as spurious
+precision rather than as fidelity. A run recorded before the entered value was
+kept has only its converted fraction, which *is* its full resolution — it is
+printed unrounded, with no unit and no percent sign invented for it. `--output`
+writes both spellings under separate keys (`porosity` with `porosity_unit` and
+`porosity_uncertainty`, beside `porosity_fraction` and `bulk_density_g_cm3`), so
+a parsed summary never has to redo the conversion to check it against the file.
 
 **Pressures are shown in `run.display_pressure_unit`**, the same unit `collect`
 printed on the console and the live plot labelled its axes with — not the atm
