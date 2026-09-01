@@ -450,6 +450,17 @@ class ExperimentMetadata(BaseModel):
     depth: float | None = None
     depth_unit: str = "m"
     porosity_fraction: float | None = None
+    #: Porosity **as it was entered**, in :attr:`porosity_unit`, alongside the
+    #: converted fraction above. A helium pycnometer reports percentage points
+    #: and the equations want the fraction, so the two spellings of one number
+    #: are both kept: the fraction is what anything downstream computes with,
+    #: and this is what the operator wrote and expects to read back. ``None``
+    #: on a run recorded before it was kept -- its fraction is then the only
+    #: form it has.
+    porosity: float | None = None
+    porosity_unit: str = "fraction"
+    #: ``u(phi)`` as entered, in the same :attr:`porosity_unit`.
+    porosity_uncertainty: float | None = None
     porosity_method: str = ""
     grain_density_g_cm3: float | None = None
     bulk_density_g_cm3: float | None = None

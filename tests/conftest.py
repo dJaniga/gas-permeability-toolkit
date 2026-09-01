@@ -296,6 +296,11 @@ def write_measured_run(
     downstream_pressure: float | str = "measured",
     porosity_fraction: float | None = None,
     porosity_uncertainty: float | None = None,
+    #: Porosity as a sample file states it, with its unit -- the pair a summary
+    #: reads back. Leave ``None`` for a run that kept only the fraction.
+    porosity: float | None = None,
+    porosity_unit: str = "fraction",
+    bulk_density_g_cm3: float | None = None,
     length_cm: float = 5.0,
     diameter_cm: float = 3.81,
     budget=None,
@@ -396,6 +401,10 @@ def write_measured_run(
             length_cm=length_cm,
             diameter_cm=diameter_cm,
             porosity_fraction=porosity_fraction,
+            porosity=porosity,
+            porosity_unit=porosity_unit,
+            porosity_uncertainty=porosity_uncertainty if porosity is not None else None,
+            bulk_density_g_cm3=bulk_density_g_cm3,
         ),
     )
 
@@ -411,6 +420,7 @@ def write_measured_run(
                 "id": sample_id,
                 "porosity_fraction": porosity_fraction,
                 "porosity_uncertainty": porosity_uncertainty,
+                "bulk_density_g_cm3": bulk_density_g_cm3,
             },
             "run": {
                 "method": method,

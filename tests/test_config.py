@@ -451,6 +451,24 @@ class TestSampleMetadata:
         assert metadata.gas_name == "Nitrogen"
         assert metadata.sample_id == base_config.sample.id
 
+    def test_metadata_keeps_porosity_in_both_spellings(self, base_config):
+        """The fraction for the physics, and the entered value for the reader.
+
+        A run is traceable through its own sidecar, so what the sample file said
+        has to survive in it -- ``summarize`` reads the porosity back against
+        that file, and 10.4 % is what was written down.
+        """
+        base_config.sample.porosity_unit = "%"
+        base_config.sample.porosity = 10.4321
+        base_config.sample.porosity_uncertainty = 0.25
+        base_config.sample.bulk_density_g_cm3 = 2.36145
+        metadata = experiment_metadata(base_config)
+        assert metadata.porosity == pytest.approx(10.4321)
+        assert metadata.porosity_unit == "%"
+        assert metadata.porosity_uncertainty == pytest.approx(0.25)
+        assert metadata.porosity_fraction == pytest.approx(0.104321)
+        assert metadata.bulk_density_g_cm3 == pytest.approx(2.36145)
+
 
 class TestIndependentUnits:
     def test_inlet_and_outlet_units_are_independent(self, base_config):

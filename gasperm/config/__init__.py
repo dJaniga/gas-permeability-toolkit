@@ -500,6 +500,12 @@ def experiment_metadata(config: GaspermConfig) -> ExperimentMetadata:
         depth=sample.depth,
         depth_unit=sample.depth_unit,
         porosity_fraction=sample.porosity_fraction,
+        # Both spellings: the fraction for the physics, and the value as the
+        # operator entered it so a summary can read it back unrounded and in
+        # the unit it was written in.
+        porosity=sample.porosity,
+        porosity_unit=sample.porosity_unit,
+        porosity_uncertainty=sample.porosity_uncertainty,
         porosity_method=sample.porosity_method,
         grain_density_g_cm3=sample.grain_density_g_cm3,
         bulk_density_g_cm3=sample.bulk_density_g_cm3,
