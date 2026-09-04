@@ -2255,7 +2255,16 @@ def reprocess_command(
     sample_file: Optional[Path] = typer.Option(
         None, "--sample-file",
         help="Replace the stored sample section with this file, e.g. after "
-             "re-measuring a plug's porosity.",
+             "re-measuring a plug's porosity. One file describes one plug, so "
+             "use --samples-dir to do a whole bench.",
+    ),
+    samples_dir: Optional[Path] = typer.Option(
+        None, "--samples-dir", metavar="DIR",
+        help="Take each run's sample section from DIR/<plug id>.yaml -- a whole "
+             "bench re-derived against re-measured plugs in one command. Unlike "
+             "--sample-file this is safe with --all: every run is matched to "
+             "its own plug by id, and a file whose id disagrees is refused "
+             "rather than applied.",
     ),
     verify: bool = typer.Option(
         False, "--verify",
@@ -2333,6 +2342,20 @@ def reprocess_command(
         _fail(
             "--all already means every run in the runs directory. Drop it, or "
             "drop the run directories and --sample."
+        )
+        return
+    if sample_file is not None and samples_dir is not None:
+        # Both replace the whole sample section, so together one would silently
+        # win. Which one is not something to make anybody guess.
+        _fail(
+            "--sample-file and --samples-dir both replace the sample section. "
+            "Use --sample-file for one plug, --samples-dir for a folder of them."
+        )
+        return
+    if samples_dir is not None and not samples_dir.is_dir():
+        _fail(
+            f"--samples-dir {samples_dir} is not a directory. It should hold one "
+            "file per plug, named for its id, e.g. samples/C12.yaml."
         )
         return
     if all_runs and sample_file is not None:
@@ -2443,17 +2466,26 @@ def reprocess_command(
     failures: list[tuple[str, str]] = []
     pending: list[tuple[Any, tuple, Any]] = []
     batch: list[ReprocessJob] = []
+    #: The config each run was actually re-derived under, so ``--write`` records
+    #: that one rather than rebuilding a second and hoping the two agree.
+    written: dict[Path, tuple[GaspermConfig, Path | None]] = {}
+    sample_files: dict[Path, Any] = {}
     for record in records:
         try:
             base = on_disk if on_disk is not None else _stored_config(record)
+            replacement = (
+                _sample_from_folder(record, samples_dir, sample_files)
+                if samples_dir is not None
+                else replacement_sample
+            )
         except ConfigError as exc:
             failures.append((record.name, str(exc)))
             continue
 
         before_config = config_to_dict(base)
         data = config_to_dict(base)
-        if replacement_sample is not None:
-            data["sample"] = replacement_sample.model_dump(mode="json", by_alias=True)
+        if replacement is not None:
+            data["sample"] = replacement.model_dump(mode="json", by_alias=True)
         try:
             for assignment in overrides:
                 key, _, raw = assignment.partition("=")
@@ -2469,6 +2501,7 @@ def reprocess_command(
             return
 
         original = summary_from_run(record.directory)
+        written[record.directory] = (updated, base.config_dir)
         pending.append(
             (record, tuple(diff_configs(before_config, config_to_dict(updated))), original)
         )
@@ -2511,16 +2544,13 @@ def reprocess_command(
 
     if write:
         for result in results:
-            base = _stored_config(_record_from_directory(result.directory))
-            data = config_to_dict(base)
-            if replacement_sample is not None:
-                data["sample"] = replacement_sample.model_dump(mode="json", by_alias=True)
-            for assignment in overrides:
-                key, _, raw = assignment.partition("=")
-                _set_dotted(data, key.strip(), raw)
-            updated = GaspermConfig.model_validate(data)
-            updated.config_dir = base.config_dir
-            saved = _write_reprocessed(result, updated)
+            # The config this run was re-derived under, not a second one built
+            # to the same recipe: with a per-plug --samples-dir there is no one
+            # recipe, and a snapshot that did not produce the result beside it
+            # would make the written run un-self-describing.
+            config, config_dir = written[result.directory]
+            config.config_dir = config_dir
+            saved = _write_reprocessed(result, config)
             typer.secho(f"  wrote {saved}", fg=typer.colors.GREEN)
 
 
@@ -2739,6 +2769,56 @@ _PER_PLUG_SAMPLE_FIELDS = frozenset(
 )
 
 
+def _sample_from_folder(record, folder: Path, cache: dict[Path, Any]):
+    """The plug's own file inside a samples folder, matched to the run by id.
+
+    This is what makes a folder safe where a single ``--sample-file`` is not.
+    ``--sample-file`` is refused with ``--all`` because one file describes one
+    core, and applying it across a bench would stamp that plug's id, geometry
+    and porosity onto every other. A folder has no such failure mode: the run
+    says which plug it measured and the file is looked up by that name, so a
+    batch re-derives every core against **its own** re-measurement.
+
+    The id inside the file still has to agree with the one the run recorded. A
+    file named for one plug carrying another's id is a copy-paste, and applying
+    it would quietly re-label the measurement -- the same corruption ``--all``
+    refuses ``--sample-file`` to avoid, arriving by a different door.
+
+    Raises:
+        ConfigError: the run names no plug, the folder holds no file for it, or
+            that file describes a different core.
+    """
+    from gasperm.config import load_sample_config
+
+    if not record.sample_id:
+        raise ConfigError(
+            f"{record.name} does not record which plug it measured, so there is "
+            f"no file in {folder} to match it to."
+        )
+    path = None
+    for suffix in (".yaml", ".yml"):
+        candidate = folder / f"{record.sample_id}{suffix}"
+        if candidate.is_file():
+            path = candidate
+            break
+    if path is None:
+        raise ConfigError(
+            f"{folder} holds no file for {record.sample_id!r} "
+            f"(expected {record.sample_id}.yaml). A run re-derived against "
+            "another core's file would be worse than one not re-derived at all."
+        )
+    if path not in cache:
+        cache[path] = load_sample_config(path)
+    sample = cache[path]
+    if sample.id != record.sample_id:
+        raise ConfigError(
+            f"{path} is named for {record.sample_id!r} but its id is "
+            f"{sample.id!r}. One of the two is wrong, and applying it would "
+            "re-label the run's plug."
+        )
+    return sample
+
+
 def _describes_one_plug(assignment: str) -> bool:
     """Whether a ``--set KEY=VALUE`` names a field belonging to a single core."""
     key = assignment.partition("=")[0].strip()
@@ -2748,8 +2828,9 @@ def _describes_one_plug(assignment: str) -> bool:
     return rest.partition(".")[0] in _PER_PLUG_SAMPLE_FIELDS
 
 
-def _combined_changes(results) -> tuple[tuple, dict[str, int]]:
-    """Every field that changed anywhere in the batch, and how many runs saw it.
+def _combined_changes(results) -> tuple[tuple, dict[str, int], set[str]]:
+    """Every field that changed anywhere in the batch, how many runs saw it, and
+    which fields did not change to the *same* value everywhere.
 
     Each run is re-derived from **its own** stored snapshot, so what a single
     ``--set`` actually changes differs from run to run: a value already correct
@@ -2760,21 +2841,31 @@ def _combined_changes(results) -> tuple[tuple, dict[str, int]]:
 
     Keyed on the field name rather than the whole change, because ``before``
     legitimately differs between runs and is not always hashable.
+
+    The third return is what ``--samples-dir`` made necessary. Under ``--set``
+    every run moves a field to the *same* new value, so one representative pair
+    describes the batch. Under a folder of per-plug files each core moves its
+    own porosity to its own number, and printing the first run's pair as the
+    batch's would state a value most of the runs never used -- a wrong number
+    presented as fact, which is worse than no number.
     """
     seen: dict[str, Any] = {}
     counts: dict[str, int] = {}
+    varies: set[str] = set()
     for result in results:
         for change in result.changes:
-            seen.setdefault(change.key, change)
+            first = seen.setdefault(change.key, change)
+            if first is not change and first.after != change.after:
+                varies.add(change.key)
             counts[change.key] = counts.get(change.key, 0) + 1
-    return tuple(seen.values()), counts
+    return tuple(seen.values()), counts, varies
 
 
 def _print_reprocess(results, *, wrote: bool) -> None:
     """What changed, grouped by whether it moved the answer or only its cost."""
     from gasperm.reprocess import summarise_changes
 
-    changes, counts = _combined_changes(results)
+    changes, counts, varies = _combined_changes(results)
     typer.secho(f"\nReprocessing {len(results)} run(s) from raw voltages", bold=True)
     if not changes:
         typer.secho(
@@ -2799,7 +2890,13 @@ def _print_reprocess(results, *, wrote: bool) -> None:
             # Said only when it is not the whole batch, so the common case
             # stays uncluttered and the partial one cannot be missed.
             scope = "" if hit == len(results) else f"   ({hit} of {len(results)} runs)"
-            typer.echo(f"    {change.describe()}{scope}")
+            if change.key in varies:
+                # One value per plug -- see `_combined_changes`. The per-run
+                # numbers are in the table below; naming one here would name
+                # the wrong one for everybody else.
+                typer.echo(f"    {change.key}: a different value per run{scope}")
+            else:
+                typer.echo(f"    {change.describe()}{scope}")
 
     typer.echo("")
     typer.echo(

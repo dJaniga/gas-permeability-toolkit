@@ -301,6 +301,8 @@ is itemised. Exit code 2 means nothing measurable changed. Details:
 gasperm reprocess runs/core-041_2026...                        # check it re-derives
 gasperm reprocess --sample core-041 --set sample.porosity_uncertainty=0.005
 gasperm reprocess --sample core-041 --set sample.length=50.4 --write
+gasperm reprocess --sample core-041 --sample-file samples/core-041.yaml
+gasperm reprocess --all --samples-dir samples --write          # every plug, re-measured
 gasperm reprocess --sample core-041 --from-config              # after fixing hardware.yaml
 gasperm reprocess --all --from-config --write                  # every plug on the bench
 gasperm reprocess --all --verify -j -2                         # every core but one
@@ -317,6 +319,13 @@ runs directory, for a rig-level correction — a transducer recalibrated, a
 vessel re-measured — that applies to everything the bench recorded. Each run
 still re-derives from its **own** stored snapshot, so every plug keeps its own
 geometry.
+
+A re-measured *plug* is the other direction, and comes from its sample file
+rather than a `--set`: `--sample-file` replaces one run's sample section,
+**`--samples-dir`** does a whole bench by matching each run to
+`DIR/<plug id>.yaml`. `--samples-dir` is the one that is safe with `--all`,
+because every run is looked up by the plug it recorded — a file whose `id`
+disagrees with the run is refused rather than applied.
 
 Because runs do not interact, a batch is re-derived in parallel worker
 processes — one per CPU by default, which is most of an hour saved on a season's

@@ -1206,3 +1206,131 @@ class TestParallelMatchesSerial:
         )
         assert serial.exit_code == 0, serial.output
         assert strip_ansi(parallel.output) == strip_ansi(serial.output)
+
+
+class TestSamplesFolder:
+    """``--samples-dir``: a whole bench re-derived against re-measured plugs.
+
+    The point of the option is that it is safe where ``--sample-file`` is not.
+    One file describes one core, so applying it across a bench would stamp that
+    plug's id and geometry onto every other; a folder is looked up per run by
+    the plug the run recorded, so nothing crosses between cores.
+    """
+
+    def rig_with_two_plugs(self, tmp_path):
+        return record_two_plugs(tmp_path, second_length=51.0)
+
+    def set_porosity(self, rig: Path, sample_id: str, value: float) -> None:
+        """Re-measure one plug, the way an operator edits its file."""
+        import yaml
+
+        path = rig / "samples" / f"{sample_id}.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["porosity"] = value
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    def run(self, rig, *args):
+        return runner.invoke(
+            app,
+            ["reprocess", "--all", "-c", str(rig), "--samples-dir",
+             str(rig / "samples"), *args],
+        )
+
+    def test_each_run_takes_its_own_plugs_file(self, tmp_path):
+        """The invariant: one core's re-measurement never reaches another's runs."""
+        import yaml
+
+        rig = self.rig_with_two_plugs(tmp_path)
+        self.set_porosity(rig, "core-041", 0.21)
+        self.set_porosity(rig, "core-042", 0.31)
+        assert self.run(rig, "--write").exit_code == 0
+
+        found = {}
+        for directory in (rig / "runs").iterdir():
+            if "_reprocessed" not in directory.name:
+                continue
+            payload = yaml.safe_load(
+                (directory / "run_metadata.yaml").read_text(encoding="utf-8")
+            )
+            sample = payload["config"]["sample"]
+            found[sample["id"]] = sample["porosity"]
+        assert found == {"core-041": 0.21, "core-042": 0.31}
+
+    def test_it_is_allowed_with_all_where_sample_file_is_not(self, tmp_path):
+        """The whole reason the option exists."""
+        rig = self.rig_with_two_plugs(tmp_path)
+        assert self.run(rig).exit_code == 0
+
+        refused = runner.invoke(
+            app,
+            ["reprocess", "--all", "-c", str(rig), "--sample-file",
+             str(rig / "samples" / "core-041.yaml")],
+        )
+        assert refused.exit_code == 1
+        assert "describes one plug" in strip_ansi(refused.output)
+
+    def test_it_refuses_the_single_file_form_alongside(self, tmp_path):
+        """Both replace the sample section, so together one would silently win."""
+        rig = self.rig_with_two_plugs(tmp_path)
+        result = self.run(rig, "--sample-file", str(rig / "samples" / "core-041.yaml"))
+        assert result.exit_code == 1
+        assert "both replace the sample section" in strip_ansi(result.output)
+
+    def test_it_refuses_a_path_that_is_not_a_folder(self, tmp_path):
+        rig = self.rig_with_two_plugs(tmp_path)
+        result = runner.invoke(
+            app,
+            ["reprocess", "--all", "-c", str(rig), "--samples-dir",
+             str(rig / "samples" / "core-041.yaml")],
+        )
+        assert result.exit_code == 1
+        assert "is not a directory" in strip_ansi(result.output)
+
+    def test_a_plug_with_no_file_is_skipped_not_guessed(self, tmp_path):
+        """Re-deriving against another core's file is worse than not re-deriving."""
+        rig = self.rig_with_two_plugs(tmp_path)
+        (rig / "samples" / "core-042.yaml").unlink()
+        result = self.run(rig)
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "holds no file for 'core-042'" in output
+        assert "Reprocessing 1 run(s)" in output
+
+    def test_a_file_naming_a_different_plug_is_refused(self, tmp_path):
+        """A copy-paste that would quietly re-label the measurement."""
+        import yaml
+
+        rig = self.rig_with_two_plugs(tmp_path)
+        path = rig / "samples" / "core-042.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["id"] = "core-999"
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        result = self.run(rig)
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "its id is 'core-999'" in output
+        assert "Reprocessing 1 run(s)" in output
+
+    def test_a_per_run_value_is_not_reported_as_the_batchs(self, tmp_path):
+        """Each core moves its porosity to its own number.
+
+        Naming the first run's pair as though it described the batch would state
+        a value the other runs never used.
+        """
+        rig = self.rig_with_two_plugs(tmp_path)
+        self.set_porosity(rig, "core-041", 0.21)
+        self.set_porosity(rig, "core-042", 0.31)
+        result = self.run(rig)
+        assert result.exit_code == 0, result.output
+        output = strip_ansi(result.output)
+        assert "sample.porosity: a different value per run" in output
+        assert "0.21" not in output.split("run ")[0]
+
+    def test_one_shared_value_is_still_named(self, tmp_path):
+        """The common case stays concrete -- abstaining always would lose it."""
+        rig = self.rig_with_two_plugs(tmp_path)
+        self.set_porosity(rig, "core-041", 0.21)
+        self.set_porosity(rig, "core-042", 0.21)
+        result = self.run(rig)
+        assert result.exit_code == 0, result.output
+        assert "-> 0.21" in strip_ansi(result.output)

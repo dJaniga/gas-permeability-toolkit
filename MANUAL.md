@@ -1160,6 +1160,40 @@ whose runs are minutes long and not on one whose records are tens of megabytes
 each. There is no portable way to ask how much memory is free, so the default
 sizes itself against CPUs; lower `-j` if the machine starts swapping.
 
+### Re-measured plugs, a whole bench at once
+
+```bash
+gasperm reprocess --sample C12 --sample-file samples/C12.yaml   # one plug
+gasperm reprocess --all --samples-dir samples --write           # every plug
+```
+
+Editing `samples/C12.yaml` on its own changes nothing: a reprocess starts from
+each run's own stored snapshot, which is the whole point — otherwise the
+"before" half of the comparison would be a result nobody produced. The new file
+has to be handed in.
+
+`--sample-file` is one file for one plug, and it is **refused with `--all`**: it
+replaces the entire sample section, so across a bench it would stamp one plug's
+id, geometry and porosity onto every other core. `--samples-dir` has no such
+failure mode — each run says which plug it measured and its file is looked up by
+that name, so a batch re-derives every core against *its own* re-measurement.
+The id inside the file must still agree with the one the run recorded; a file
+named for one plug carrying another's id is a copy-paste, and applying it would
+quietly re-label the measurement. That run is refused, and the rest of the batch
+carries on.
+
+Whether this moves `k` or only `U(k)` depends on the method. Porosity enters the
+Darcy equation not at all, so on a steady-state run a re-measured porosity is a
+legitimate no-op — but it is an input to the Dicker–Smits storage correction, so
+on a pulse-decay rig it is a **correction**, and the re-derived runs supersede
+their parents everywhere runs are reduced.
+
+One reporting detail follows from the per-plug form. With `--set`, every run
+moves a field to the same new value, so the summary can name it once. With a
+folder, each core moves its own porosity to its own number, and the summary says
+`a different value per run` rather than quoting one — the per-run before and
+after are in each written run's `derived_from` block.
+
 ### Checking that a replay reproduces its original
 
 ```bash
