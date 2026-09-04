@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import pytest
@@ -921,3 +922,238 @@ class TestReprocessAll:
         result = self.run(rig)
         assert result.exit_code == 1
         assert "No runs found" in strip_ansi(result.output)
+
+
+class _RecordingExecutor:
+    """A pool that runs everything here, and remembers the submission order.
+
+    Stands in for ``ProcessPoolExecutor`` so the batch layer's own promises --
+    payload order out, exceptions carried rather than raised, longest run
+    submitted first -- can be pinned without paying for real interpreters. The
+    one thing it cannot exercise is pickling, which the end-to-end ``-j`` tests
+    do.
+    """
+
+    #: Payloads in the order they were handed out, newest batch only.
+    submitted: ClassVar[list] = []
+
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers
+        type(self).submitted = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+
+        type(self).submitted.append(args[0])
+        future = Future()
+        try:
+            future.set_result(fn(*args))
+        except Exception as exc:  # noqa: BLE001 -- exactly what a worker would do
+            future.set_exception(exc)
+        return future
+
+
+@pytest.fixture
+def in_process_pool(monkeypatch):
+    """Run the parallel path in this process, completing in **reverse** order.
+
+    Reverse specifically: results must come back in the caller's order, and a
+    stand-in that happened to complete in order would let a reversed one
+    through.
+    """
+    from gasperm import reprocess as module
+
+    monkeypatch.setattr(module, "ProcessPoolExecutor", _RecordingExecutor)
+    monkeypatch.setattr(module, "as_completed", lambda futures: reversed(list(futures)))
+    return _RecordingExecutor
+
+
+def _job_for(directory: Path):
+    from gasperm.reprocess import ReprocessJob
+
+    return ReprocessJob(directory=directory, config=_config_from_sidecar(directory))
+
+
+class TestWorkerCount:
+    """How many processes a batch gets, and why it is sometimes one.
+
+    A worker costs an interpreter start plus CoolProp and SciPy imports. Paying
+    that to re-derive a handful of short runs makes the command slower, which is
+    the opposite of the point.
+    """
+
+    def test_a_small_batch_stays_in_this_process(self, tmp_path):
+        from gasperm.reprocess import resolve_workers
+
+        _, directory, _ = record_steady_run(tmp_path)
+        job = _job_for(directory)
+        assert resolve_workers(None, [job, job]) == 1
+
+    def test_a_large_batch_spreads_over_the_cpus(self, tmp_path, monkeypatch):
+        import os
+
+        from gasperm import reprocess as module
+
+        _, directory, _ = record_steady_run(tmp_path)
+        monkeypatch.setattr(
+            module, "_record_size", lambda job: module._PARALLEL_MIN_BYTES
+        )
+        jobs = [_job_for(directory)] * 4
+        assert module.resolve_workers(None, jobs) == min(os.cpu_count() or 1, 4)
+
+    def test_it_never_asks_for_more_workers_than_runs(self, tmp_path):
+        from gasperm.reprocess import resolve_workers
+
+        _, directory, _ = record_steady_run(tmp_path)
+        job = _job_for(directory)
+        assert resolve_workers(64, [job, job]) == 2
+
+    def test_an_explicit_count_is_honoured_whatever_the_size(self, tmp_path):
+        """--jobs is an instruction, not a hint: a small batch still gets it."""
+        from gasperm.reprocess import resolve_workers
+
+        _, directory, _ = record_steady_run(tmp_path)
+        job = _job_for(directory)
+        assert resolve_workers(2, [job, job]) == 2
+
+    def test_no_jobs_at_all_is_refused(self):
+        from gasperm.reprocess import resolve_workers
+
+        with pytest.raises(ValueError, match="at least 1"):
+            resolve_workers(0, [])
+
+    def test_the_command_refuses_no_jobs(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(app, ["reprocess", str(directory), "-j", "0"])
+        assert result.exit_code == 1
+        assert "at least 1" in strip_ansi(result.output)
+
+
+class TestBatchScheduling:
+    """What the batch layer promises whatever order the pool works in."""
+
+    def test_results_come_back_in_the_order_given(self, tmp_path, in_process_pool):
+        """Completion order is the scheduler's; the report is keyed by run."""
+        from gasperm.reprocess import reprocess_batch
+        from gasperm.storage import find_runs
+
+        rig = record_two_plugs(tmp_path, second_length=51.0)
+        records = sorted(find_runs(rig / "runs"), key=lambda record: record.name)
+        jobs = [_job_for(record.directory) for record in records]
+        results = reprocess_batch(jobs, workers=2)
+        assert [result.sample_id for result in results] == [
+            job.config.sample.id for job in jobs
+        ]
+
+    def test_the_longest_run_is_submitted_first(self, tmp_path, monkeypatch):
+        """Otherwise the pool goes idle waiting on the run it started last."""
+        from gasperm import reprocess as module
+
+        _, directory, _ = record_steady_run(tmp_path)
+        config = _config_from_sidecar(directory)
+        jobs = [
+            module.ReprocessJob(directory=Path(name), config=config)
+            for name in ("short", "long", "middling")
+        ]
+        sizes = {"short": 10, "long": 300, "middling": 100}
+        monkeypatch.setattr(
+            module, "_record_size", lambda job: sizes[job.directory.name]
+        )
+        assert module._longest_first(jobs) == [1, 2, 0]
+
+    def test_that_order_is_the_order_it_submits_in(self, tmp_path, monkeypatch, in_process_pool):
+        from gasperm import reprocess as module
+
+        _, directory, _ = record_steady_run(tmp_path)
+        config = _config_from_sidecar(directory)
+        jobs = [
+            module.ReprocessJob(directory=Path(name), config=config)
+            for name in ("short", "long", "middling")
+        ]
+        sizes = {"short": 10, "long": 300, "middling": 100}
+        monkeypatch.setattr(
+            module, "_record_size", lambda job: sizes[job.directory.name]
+        )
+        module.reprocess_batch(jobs, workers=2)
+        assert [job.directory.name for job in in_process_pool.submitted] == [
+            "long", "middling", "short",
+        ]
+
+    def test_a_run_that_fails_does_not_cost_the_others(self, tmp_path, in_process_pool):
+        """One unreadable CSV must not take forty good runs with it."""
+        from gasperm.reprocess import ReprocessJob, reprocess_batch
+
+        _, directory, _ = record_steady_run(tmp_path)
+        config = _config_from_sidecar(directory)
+        jobs = [
+            _job_for(directory),
+            ReprocessJob(directory=tmp_path / "nowhere", config=config),
+            _job_for(directory),
+        ]
+        results = reprocess_batch(jobs, workers=2)
+        assert results[0].permeability_darcy is not None
+        assert isinstance(results[1], (ValueError, OSError))
+        assert results[2].permeability_darcy is not None
+
+    def test_a_broken_pool_finishes_the_batch_here(self, tmp_path, monkeypatch):
+        """A killed worker says nothing about whether the work can be done."""
+        from gasperm import reprocess as module
+
+        class _Broken:
+            def __init__(self, max_workers=None):
+                raise OSError("no processes available")
+
+        monkeypatch.setattr(module, "ProcessPoolExecutor", _Broken)
+        monkeypatch.setattr(
+            module, "_record_size", lambda job: module._PARALLEL_MIN_BYTES
+        )
+        _, directory, _ = record_steady_run(tmp_path)
+        job = _job_for(directory)
+        results = module.reprocess_batch([job, job])
+        assert all(result.permeability_darcy is not None for result in results)
+
+    def test_progress_counts_every_run(self, tmp_path, in_process_pool):
+        from gasperm.reprocess import reprocess_batch
+
+        _, directory, _ = record_steady_run(tmp_path)
+        job = _job_for(directory)
+        seen = []
+        reprocess_batch(
+            [job, job, job], workers=2,
+            on_done=lambda done, total: seen.append((done, total)),
+        )
+        assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+class TestParallelMatchesSerial:
+    """The only thing that finally matters: workers change speed, not answers.
+
+    Run through real worker processes rather than the in-process stand-in,
+    because what these catch is a config or a summary that does not survive the
+    trip to a worker and back.
+    """
+
+    def test_the_report_is_the_same_either_way(self, tmp_path):
+        rig = record_two_plugs(tmp_path, second_length=51.0)
+        serial = runner.invoke(app, ["reprocess", "--all", "-c", str(rig), "-j", "1"])
+        parallel = runner.invoke(app, ["reprocess", "--all", "-c", str(rig), "-j", "2"])
+        assert serial.exit_code == 0, serial.output
+        assert parallel.exit_code == 0, parallel.output
+        assert strip_ansi(parallel.output) == strip_ansi(serial.output)
+
+    def test_verify_is_the_same_either_way(self, tmp_path):
+        rig = record_two_plugs(tmp_path, second_length=51.0)
+        serial = runner.invoke(
+            app, ["reprocess", "--verify", "--all", "-c", str(rig), "-j", "1"]
+        )
+        parallel = runner.invoke(
+            app, ["reprocess", "--verify", "--all", "-c", str(rig), "-j", "2"]
+        )
+        assert serial.exit_code == 0, serial.output
+        assert strip_ansi(parallel.output) == strip_ansi(serial.output)

@@ -2272,6 +2272,14 @@ def reprocess_command(
              "whose replay is known to differ slightly. Reported alongside the "
              "verdict, since a pass means nothing without its threshold.",
     ),
+    jobs: Optional[int] = typer.Option(
+        None, "--jobs", "-j", metavar="N",
+        help="Re-derive N runs at a time in parallel worker processes. Default "
+             "is one per CPU, since runs do not interact -- each re-derives "
+             "from its own snapshot. Lower it on a rig with long runs, where "
+             "each worker holds a whole run in memory; 1 keeps everything in "
+             "this process, which is also the readable way to see a traceback.",
+    ),
     write: bool = typer.Option(
         False, "--write",
         help="Write each re-derived run to a NEW run directory beside the "
@@ -2304,9 +2312,10 @@ def reprocess_command(
     """
     from gasperm.reprocess import (
         ReprocessError,
+        ReprocessJob,
         ReprocessResult,
         diff_configs,
-        reprocess_run,
+        reprocess_batch,
     )
     from gasperm.storage import (
         _record_from_directory,
@@ -2386,6 +2395,12 @@ def reprocess_command(
         )
         return
 
+    if jobs is not None and jobs < 1:
+        _fail(
+            f"--jobs must be at least 1, got {jobs}. Pass 1 to re-derive "
+            "everything in this process."
+        )
+        return
     if tolerance is not None and not verify:
         _fail("--tolerance only applies to --verify. Add --verify, or drop it.")
         return
@@ -2397,7 +2412,7 @@ def reprocess_command(
                 "every run and localises nothing."
             )
             return
-        _verify_runs(records, tolerance)
+        _verify_runs(records, tolerance, workers=jobs)
         return
 
     overrides = list(set_values or [])
@@ -2415,8 +2430,14 @@ def reprocess_command(
     if from_config:
         on_disk = _load_or_fail(config_dir, None, None, None)
 
+    # Two passes, because only the second one is expensive. Resolving each
+    # run's config is cheap and must stay in this process: a malformed --set is
+    # the operator's mistake, and it should stop the command before an hour of
+    # work starts rather than come back as one failed job among a hundred.
     results: list[ReprocessResult] = []
     failures: list[tuple[str, str]] = []
+    pending: list[tuple[Any, tuple, Any]] = []
+    batch: list[ReprocessJob] = []
     for record in records:
         try:
             base = on_disk if on_disk is not None else _stored_config(record)
@@ -2442,21 +2463,35 @@ def reprocess_command(
             _fail(str(exc))
             return
 
-        changes = tuple(diff_configs(before_config, config_to_dict(updated)))
         original = summary_from_run(record.directory)
-        try:
-            redone = reprocess_run(
-                record.directory, updated,
+        pending.append(
+            (record, tuple(diff_configs(before_config, config_to_dict(updated))), original)
+        )
+        batch.append(
+            ReprocessJob(
+                directory=record.directory, config=updated,
                 started_at=original.started_at if original else None,
                 ended_at=original.ended_at if original else None,
             )
-        except (ReprocessError, ValueError, KeyError) as exc:
-            failures.append((record.name, str(exc)))
-            continue
+        )
 
+    # The re-derivation, spread over worker processes. Outcomes come back in
+    # the order given, so a run keeps its config, its diff and its original.
+    progress = _BatchProgress(len(batch), "re-deriving")
+    outcomes = reprocess_batch(batch, workers=jobs, on_done=progress)
+    progress.clear()
+    for (record, changes, original), outcome in zip(pending, outcomes):
+        if isinstance(outcome, BaseException):
+            # The same three a serial reprocess survived. Anything else is a
+            # defect rather than an unreplayable run, and is not swallowed
+            # merely because it happened on a worker.
+            if isinstance(outcome, (ReprocessError, ValueError, KeyError)):
+                failures.append((record.name, str(outcome)))
+                continue
+            raise outcome
         results.append(
             ReprocessResult(
-                directory=record.directory, before=original, after=redone,
+                directory=record.directory, before=original, after=outcome,
                 changes=changes,
             )
         )
@@ -2552,24 +2587,48 @@ def _write_reprocessed(result, config: GaspermConfig) -> Path:
     return target
 
 
-def _verify_runs(records, tolerance: float | None = None) -> None:
+def _verify_runs(
+    records, tolerance: float | None = None, *, workers: int | None = None
+) -> None:
     """Check that each run re-derives to its stored result, and localise any drift.
 
     The useful output for a run that does not reproduce is not the size of the
     difference but the **stage** it appeared at, because the three stages fail
     for unrelated reasons and only one of them is about the physics.
+
+    Verifying is a full re-derivation per run, so it costs exactly what a
+    reprocess does and is spread over worker processes the same way.
     """
-    from gasperm.reprocess import _MOVED_TOLERANCE, ReprocessError, verify_run
+    from gasperm.reprocess import (
+        _MOVED_TOLERANCE,
+        ReprocessError,
+        ReprocessJob,
+        verify_batch,
+    )
 
     resolved = _MOVED_TOLERANCE if tolerance is None else tolerance
     reports, failures = [], []
+    batch, verifying = [], []
     for record in records:
         try:
-            reports.append(
-                verify_run(record.directory, _stored_config(record), tolerance=resolved)
+            batch.append(
+                ReprocessJob(directory=record.directory, config=_stored_config(record))
             )
         except (ReprocessError, ConfigError, ValueError, KeyError) as exc:
             failures.append((record.name, str(exc)))
+            continue
+        verifying.append(record)
+
+    progress = _BatchProgress(len(batch), "verifying")
+    outcomes = verify_batch(batch, tolerance=resolved, workers=workers, on_done=progress)
+    progress.clear()
+    for record, outcome in zip(verifying, outcomes):
+        if isinstance(outcome, BaseException):
+            if isinstance(outcome, (ReprocessError, ConfigError, ValueError, KeyError)):
+                failures.append((record.name, str(outcome)))
+                continue
+            raise outcome
+        reports.append(outcome)
 
     for name, reason in failures:
         typer.secho(f"skipped {name}: {reason}", fg=typer.colors.YELLOW, err=True)
@@ -2625,6 +2684,34 @@ def _verify_runs(records, tolerance: float | None = None) -> None:
         )
         raise typer.Exit(code=2)
     typer.secho("\nAll runs reproduce their stored results.", fg=typer.colors.GREEN)
+
+
+class _BatchProgress:
+    """One line, rewritten in place, while a batch works through its runs.
+
+    A rig-level reprocess is minutes of work with no output until the table at
+    the end, and silence for that long is indistinguishable from a hang.
+
+    Says how many are done, never which: with workers in flight the completion
+    order is the scheduler's, and naming a run as it lands would suggest an
+    order the table does not have. Nothing is printed when the output is being
+    captured or piped, where a carriage return only makes the transcript
+    unreadable -- the same rule ``preview``'s live line follows.
+    """
+
+    def __init__(self, total: int, verb: str) -> None:
+        self.total = total
+        self.verb = verb
+        self.live = total > 1 and sys.stderr.isatty()
+
+    def __call__(self, done: int, total: int) -> None:
+        if self.live:
+            typer.echo(f"\r  {self.verb} {done}/{total} run(s)", nl=False, err=True)
+
+    def clear(self) -> None:
+        """Wipe the line so the report that follows starts on clean ground."""
+        if self.live:
+            typer.echo("\r" + " " * (len(self.verb) + 24) + "\r", nl=False, err=True)
 
 
 def _window_text(bounds) -> str:

@@ -1107,6 +1107,54 @@ whatever the config files say today, or the "before" half would be a result
 nobody ever produced. `--from-config` opts into the current files, for when the
 rig file itself is what was corrected.
 
+### A batch is re-derived in parallel
+
+```bash
+gasperm reprocess --all --write        # one worker per CPU
+gasperm reprocess --all --write -j 4   # four at a time
+gasperm reprocess --all --write -j 1   # all in this process
+```
+
+A replay costs what the original acquisition's *arithmetic* cost, and that is
+per sample: every reading goes back through the same processor, which looks the
+gas properties up at that reading's own temperature and pressure and, for a
+pulse run, solves the storage equation for `theta_1`. A fourteen-hour run at
+10 Hz is half a million samples. One run is tens of seconds; a season's work on
+a bench is an hour.
+
+The property that makes this parallelisable is the same one that makes `--all`
+safe: **runs do not interact**. Each re-derives from its own snapshot, reads its
+own CSV and builds its own property provider, so there is no shared state to
+guard and no ordering to preserve between runs.
+
+Worker **processes**, not threads. The time is spent inside CoolProp's `PropsSI`
+and SciPy's `brentq`, neither of which releases the GIL for the scalar calls
+made here, so threads would queue up on one core and change nothing.
+
+Three details that are only visible when they are wrong:
+
+- **Results keep the caller's order.** They are reported as a table keyed by
+  run, and completion order is whatever the scheduler decided.
+- **A run that cannot be replayed is still just a skip.** Its exception comes
+  back in its slot rather than being raised, so one unreadable CSV does not cost
+  the other forty runs — exactly as it did serially.
+- **The longest run is started first.** Handed out last, a fourteen-hour decay
+  would still be fitting long after every short burst had finished and the pool
+  had gone idle.
+
+Below a few megabytes of raw record the batch stays serial: a worker pays a
+fresh interpreter start plus the CoolProp and SciPy imports, a second or two,
+and a handful of short runs cannot win that back. An explicit `-j` overrides
+that either way — `-j 1` for a readable traceback, `-j N` when you know what the
+batch costs.
+
+`-j` is also the memory lever. A worker holds its whole run in memory as
+`Reading` objects, roughly twenty times the size of the CSV — an 86 MB record is
+about 1.7 GB — and the default runs one per CPU. That is comfortable on a rig
+whose runs are minutes long and not on one whose records are tens of megabytes
+each. There is no portable way to ask how much memory is free, so the default
+sizes itself against CPUs; lower `-j` if the machine starts swapping.
+
 ### Checking that a replay reproduces its original
 
 ```bash

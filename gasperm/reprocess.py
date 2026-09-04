@@ -43,9 +43,12 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, TypeVar
 
 from gasperm.config import GaspermConfig
 from gasperm.models import Reading, RunSummary
@@ -57,13 +60,17 @@ __all__ = [
     "ConfigChange",
     "RawSample",
     "ReprocessError",
+    "ReprocessJob",
     "ReprocessResult",
     "VerifyReport",
     "classify_change",
     "diff_configs",
     "read_raw_samples",
     "rebuild_readings",
+    "reprocess_batch",
     "reprocess_run",
+    "resolve_workers",
+    "verify_batch",
     "verify_run",
 ]
 
@@ -767,4 +774,274 @@ def verify_run(
         stored_expanded_darcy=_expanded(stored),
         replayed_expanded_darcy=_expanded(replayed),
         tolerance=tolerance,
+    )
+
+
+# --------------------------------------------------------------------------
+# Doing it to a whole campaign at once
+# --------------------------------------------------------------------------
+#
+# A reprocess is dominated by :func:`rebuild_readings`, and that cost is
+# per-*sample*: every reading is pushed back through the live processor, which
+# looks the gas properties up at that reading's own (T, P) and, for a pulse
+# run, solves the storage equation for ``theta_1``. A fourteen-hour run at
+# 10 Hz is half a million samples, so one run takes tens of seconds and a
+# rig-level ``--all`` over a season's work takes an hour.
+#
+# The saving grace is that **runs do not interact**. Each re-derives from its
+# own stored snapshot -- that is what makes ``--all`` safe in the first place
+# (see the module docstring) -- so the batch is embarrassingly parallel at the
+# granularity of one run.
+#
+# Processes, not threads: the time is spent inside CoolProp's ``PropsSI`` and
+# SciPy's ``brentq``, neither of which releases the GIL for the scalar calls
+# made here, so threads would serialise onto exactly the same core. Nothing is
+# shared between workers -- a job carries its own config and its own directory,
+# and the worker builds its own property provider -- so there is no state to
+# guard and no ordering to preserve inside a run.
+#
+# Two invariants the parallel path must not break, because both would fail
+# silently:
+#
+# - **The results stay in the caller's order.** They are reported as a table
+#   keyed by run, and completion order is whatever the scheduler decided.
+# - **A worker's exception is returned, not raised.** The serial loop reported
+#   a run that could not be replayed as a skip and carried on with the rest;
+#   losing forty good runs to one unreadable CSV would be a regression.
+#
+# And one thing it has to get right to be worth doing: the **longest run is
+# submitted first**. Runs on one bench differ by two orders of magnitude in
+# length, so a fourteen-hour decay handed out last leaves every worker idle
+# waiting on it, and the batch takes as long as that one run plus everything
+# queued ahead of it.
+
+#: Raw record below which the batch stays in this process, in bytes summed over
+#: every run in it.
+#:
+#: A worker is not free: it pays a fresh interpreter start plus CoolProp and
+#: SciPy imports, a second or two on Windows. Run *count* is the wrong thing to
+#: weigh that against, because runs differ by two orders of magnitude in length
+#: -- three fourteen-hour decays are worth spreading and thirty short bursts are
+#: not. CSV size is the honest proxy, since the cost is per sample and a sample
+#: is a row. At roughly three seconds of re-derivation per megabyte, this is a
+#: batch that would take about half a minute serially -- comfortably more than
+#: the workers cost to start.
+_PARALLEL_MIN_BYTES = 8 * 1024 * 1024
+
+_Payload = TypeVar("_Payload")
+_Outcome = TypeVar("_Outcome")
+
+
+@dataclass(frozen=True)
+class ReprocessJob:
+    """One run to re-derive, and the configuration to re-derive it under.
+
+    Carries everything a worker needs, because a worker shares nothing with the
+    parent: the config is the run's **own** snapshot with the requested edits
+    already applied, and the timestamps are the original measurement's, so a
+    re-derived summary still says when the experiment happened rather than when
+    it was recomputed.
+    """
+
+    directory: Path
+    config: GaspermConfig
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+def _record_size(job: ReprocessJob) -> int:
+    """Size of the CSV this job will replay, as a stand-in for what it will cost.
+
+    The re-derivation is per sample and a sample is a row, so bytes track work
+    closely enough for the two things this is used for: deciding whether workers
+    are worth starting, and deciding what to start first.
+
+    A run whose size cannot be read counts zero rather than raising. This is a
+    scheduling hint; a missing or unreadable record is a failure to report from
+    the replay, with a message about the record rather than about a stat call.
+    """
+    from gasperm.storage import resolve_run_paths
+
+    try:
+        readings, _ = resolve_run_paths(job.directory)
+        return Path(readings).stat().st_size
+    except (OSError, ValueError):
+        return 0
+
+
+def resolve_workers(requested: int | None, jobs: Sequence[ReprocessJob]) -> int:
+    """How many processes to use for this batch.
+
+    ``requested`` is the operator's ``--jobs``; ``None`` means decide. There is
+    no reason to hold a core back -- nothing else is running and the answer is
+    being waited on -- so the default is one worker per CPU, capped at the
+    number of runs, and a batch with less raw record than
+    ``_PARALLEL_MIN_BYTES`` stays serial rather than spend longer starting
+    workers than re-deriving.
+
+    An explicit ``--jobs`` is honoured whatever the size: someone who asked for
+    workers gets them, and someone who asked for one gets a single process and a
+    readable traceback. It is also the lever for **memory**, which is the one
+    resource this cannot size itself against: a worker holds its whole run in
+    memory as ``Reading`` objects, on the order of twenty times the CSV, so a
+    rig whose records run to tens of megabytes wants fewer workers than it has
+    cores. There is no portable way to ask how much memory is free, so the
+    default sizes against CPUs and the operator lowers ``-j`` if the machine
+    complains.
+
+    Raises:
+        ValueError: ``requested`` is below 1. Zero workers is not a slower
+            reprocess, it is no reprocess.
+    """
+    if requested is not None and requested < 1:
+        raise ValueError(
+            f"jobs must be at least 1, got {requested!r}. Pass 1 to re-derive "
+            "everything in this process."
+        )
+    count = len(jobs)
+    if count <= 0:
+        return 1
+    if requested is not None:
+        return min(requested, count)
+    if count < 2 or sum(_record_size(job) for job in jobs) < _PARALLEL_MIN_BYTES:
+        return 1
+    return max(1, min(os.cpu_count() or 1, count))
+
+
+def _map_jobs(
+    worker: Callable[[_Payload], _Outcome],
+    payloads: Sequence[_Payload],
+    *,
+    workers: int,
+    order: Sequence[int] | None = None,
+    on_done: Callable[[int, int], None] | None = None,
+) -> list[_Outcome | BaseException]:
+    """Apply ``worker`` to each payload, returning results **in payload order**.
+
+    Each entry is either the worker's return value or the exception it raised;
+    deciding which exceptions are survivable belongs to the caller, since that
+    is the layer that knows what it promised the operator.
+
+    ``order`` is the sequence to *submit* in, longest job first. It changes when
+    the batch finishes, not what it produces: a fourteen-hour decay handed out
+    last would still be running long after every short burst had finished and
+    the pool had gone idle, so the batch would take as long as its worst run
+    plus everything queued ahead of it. Results still come back in payload
+    order.
+
+    Falls back to the serial path if the pool cannot be started or breaks
+    part-way, finishing only the runs that had not come back. A batch that takes
+    longer is a much better outcome than a batch that dies, and a broken pool
+    means a worker was killed -- which says nothing about whether the work can
+    be done.
+    """
+    results: list[Any] = [None] * len(payloads)
+    done = 0
+
+    def record(index: int, outcome: Any) -> None:
+        nonlocal done
+        results[index] = outcome
+        done += 1
+        if on_done is not None:
+            on_done(done, len(payloads))
+
+    def serially(indices: Iterable[int]) -> None:
+        for index in indices:
+            try:
+                record(index, worker(payloads[index]))
+            except Exception as exc:  # noqa: BLE001 -- handed back to the caller
+                record(index, exc)
+
+    if workers <= 1 or len(payloads) <= 1:
+        serially(range(len(payloads)))
+        return results
+
+    pending = set(range(len(payloads)))
+    submission = range(len(payloads)) if order is None else order
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(worker, payloads[index]): index for index in submission
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    record(index, future.result())
+                except Exception as exc:  # noqa: BLE001 -- handed back to the caller
+                    record(index, exc)
+                pending.discard(index)
+    except Exception as exc:  # noqa: BLE001 -- the pool failed, not a job
+        logger.warning(
+            "Parallel reprocessing failed (%s); finishing the remaining %d "
+            "run(s) in this process.", exc, len(pending),
+        )
+        serially(sorted(pending))
+    return results
+
+
+def _longest_first(jobs: Sequence[ReprocessJob]) -> list[int]:
+    """Job indices ordered by descending raw record -- the order to submit in."""
+    return sorted(range(len(jobs)), key=lambda index: -_record_size(jobs[index]))
+
+
+def _reprocess_job(job: ReprocessJob) -> RunSummary:
+    """Worker body. Module-level, so it is picklable under ``spawn``."""
+    return reprocess_run(
+        job.directory, job.config,
+        started_at=job.started_at, ended_at=job.ended_at,
+    )
+
+
+def _verify_job(payload: tuple[ReprocessJob, float]) -> VerifyReport:
+    """Worker body for ``--verify``. See :func:`_reprocess_job`."""
+    job, tolerance = payload
+    return verify_run(job.directory, job.config, tolerance=tolerance)
+
+
+def reprocess_batch(
+    jobs: Sequence[ReprocessJob],
+    *,
+    workers: int | None = None,
+    on_done: Callable[[int, int], None] | None = None,
+) -> list[RunSummary | BaseException]:
+    """Re-derive many runs at once, one worker process per core by default.
+
+    Args:
+        jobs: What to re-derive, each carrying its own configuration.
+        workers: Process count, or ``None`` to decide from the CPU count and
+            the size of the batch. ``1`` keeps everything in this process.
+        on_done: Called ``(completed, total)`` as each run finishes, for a
+            progress line. Completion order is not payload order, so it says
+            how many are done and never which.
+
+    Returns:
+        One entry per job, **in the order given**: the re-derived summary, or
+        the exception that run raised.
+    """
+    jobs = list(jobs)
+    return _map_jobs(
+        _reprocess_job, jobs,
+        workers=resolve_workers(workers, jobs),
+        order=_longest_first(jobs), on_done=on_done,
+    )
+
+
+def verify_batch(
+    jobs: Sequence[ReprocessJob],
+    *,
+    tolerance: float = _MOVED_TOLERANCE,
+    workers: int | None = None,
+    on_done: Callable[[int, int], None] | None = None,
+) -> list[VerifyReport | BaseException]:
+    """Verify many runs at once. The parallel form of :func:`verify_run`.
+
+    Each job's ``config`` must be that run's **own** stored snapshot -- verifying
+    against anything else is a different question, and not this one. Returns one
+    entry per job in the order given: the report, or the exception it raised.
+    """
+    jobs = list(jobs)
+    return _map_jobs(
+        _verify_job, [(job, tolerance) for job in jobs],
+        workers=resolve_workers(workers, jobs),
+        order=_longest_first(jobs), on_done=on_done,
     )
