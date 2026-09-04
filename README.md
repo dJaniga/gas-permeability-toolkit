@@ -303,7 +303,7 @@ gasperm reprocess --sample core-041 --set sample.porosity_uncertainty=0.005
 gasperm reprocess --sample core-041 --set sample.length=50.4 --write
 gasperm reprocess --sample core-041 --from-config              # after fixing hardware.yaml
 gasperm reprocess --all --from-config --write                  # every plug on the bench
-gasperm reprocess --all --verify -j 4                          # four runs at a time
+gasperm reprocess --all --verify -j -2                         # every core but one
 ```
 
 Re-derives stored runs from their **raw voltages**, so a calibration correction
@@ -320,8 +320,10 @@ geometry.
 
 Because runs do not interact, a batch is re-derived in parallel worker
 processes — one per CPU by default, which is most of an hour saved on a season's
-work. `-j N` sets the count; `-j 1` keeps everything in this process. Small
-batches stay serial, since starting a worker costs more than a short run does.
+work. `-j N` sets the count, negative counting back from the CPUs as joblib does
+(`-1` all of them, `-2` all but one); `-j 1` keeps everything in this process.
+Small batches stay serial, since starting a worker costs more than a short run
+does.
 
 Reports only, unless `--write`, which writes a **new** `<original>_reprocessed`
 directory and never touches the original. Details:

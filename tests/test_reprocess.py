@@ -1022,17 +1022,51 @@ class TestWorkerCount:
         job = _job_for(directory)
         assert resolve_workers(2, [job, job]) == 2
 
-    def test_no_jobs_at_all_is_refused(self):
+    def test_minus_one_means_every_cpu(self, tmp_path):
+        """joblib's convention, because it is the one people arrive with."""
+        import os
+
         from gasperm.reprocess import resolve_workers
 
-        with pytest.raises(ValueError, match="at least 1"):
+        _, directory, _ = record_steady_run(tmp_path)
+        jobs = [_job_for(directory)] * 64
+        assert resolve_workers(-1, jobs) == (os.cpu_count() or 1)
+
+    def test_minus_two_holds_one_core_back(self, tmp_path):
+        """The useful form: the machine stays usable while the batch runs."""
+        import os
+
+        from gasperm.reprocess import resolve_workers
+
+        _, directory, _ = record_steady_run(tmp_path)
+        jobs = [_job_for(directory)] * 64
+        assert resolve_workers(-2, jobs) == max(1, (os.cpu_count() or 1) - 1)
+
+    def test_a_negative_past_the_core_count_clamps(self, tmp_path):
+        """-32 on an eight-core box means "as few as possible", not an error."""
+        from gasperm.reprocess import resolve_workers
+
+        _, directory, _ = record_steady_run(tmp_path)
+        assert resolve_workers(-999, [_job_for(directory)] * 4) == 1
+
+    def test_no_jobs_at_all_is_refused(self):
+        """Zero is the one integer that names no workers rather than some."""
+        from gasperm.reprocess import resolve_workers
+
+        with pytest.raises(ValueError, match="must not be 0"):
             resolve_workers(0, [])
 
     def test_the_command_refuses_no_jobs(self, tmp_path):
         _, directory, _ = record_steady_run(tmp_path)
         result = runner.invoke(app, ["reprocess", str(directory), "-j", "0"])
         assert result.exit_code == 1
-        assert "at least 1" in strip_ansi(result.output)
+        assert "must not be 0" in strip_ansi(result.output)
+
+    def test_the_command_takes_a_negative_count(self, tmp_path):
+        _, directory, _ = record_steady_run(tmp_path)
+        result = runner.invoke(app, ["reprocess", str(directory), "-j", "-2"])
+        assert result.exit_code == 0, result.output
+        assert "Reprocessing 1 run(s)" in strip_ansi(result.output)
 
 
 class TestBatchScheduling:

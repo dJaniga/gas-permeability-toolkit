@@ -1110,10 +1110,15 @@ rig file itself is what was corrected.
 ### A batch is re-derived in parallel
 
 ```bash
-gasperm reprocess --all --write        # one worker per CPU
-gasperm reprocess --all --write -j 4   # four at a time
-gasperm reprocess --all --write -j 1   # all in this process
+gasperm reprocess --all --write         # one worker per CPU
+gasperm reprocess --all --write -j 4    # four at a time
+gasperm reprocess --all --write -j -2   # every core but one
+gasperm reprocess --all --write -j 1    # all in this process
 ```
+
+`-j` follows joblib's convention, since that is the one people arrive with: a
+positive number is that many workers, `-1` is every CPU, `-2` every CPU but one.
+`-2` is the one to reach for while you still want the machine.
 
 A replay costs what the original acquisition's *arithmetic* cost, and that is
 per sample: every reading goes back through the same processor, which looks the

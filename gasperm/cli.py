@@ -2276,9 +2276,11 @@ def reprocess_command(
         None, "--jobs", "-j", metavar="N",
         help="Re-derive N runs at a time in parallel worker processes. Default "
              "is one per CPU, since runs do not interact -- each re-derives "
-             "from its own snapshot. Lower it on a rig with long runs, where "
-             "each worker holds a whole run in memory; 1 keeps everything in "
-             "this process, which is also the readable way to see a traceback.",
+             "from its own snapshot. Negative counts back from the CPUs as "
+             "joblib does: -1 all of them, -2 all but one, which leaves the "
+             "machine usable. Lower it on a rig with long runs, where each "
+             "worker holds a whole run in memory; 1 keeps everything in this "
+             "process, which is also the readable way to see a traceback.",
     ),
     write: bool = typer.Option(
         False, "--write",
@@ -2395,10 +2397,13 @@ def reprocess_command(
         )
         return
 
-    if jobs is not None and jobs < 1:
+    if jobs == 0:
+        import os
+
         _fail(
-            f"--jobs must be at least 1, got {jobs}. Pass 1 to re-derive "
-            "everything in this process."
+            "--jobs must not be 0. A positive count is that many worker "
+            f"processes; a negative one counts back from the {os.cpu_count() or 1} "
+            "CPU(s), so -1 is all of them and -2 all but one."
         )
         return
     if tolerance is not None and not verify:

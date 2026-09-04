@@ -879,6 +879,13 @@ def resolve_workers(requested: int | None, jobs: Sequence[ReprocessJob]) -> int:
     ``_PARALLEL_MIN_BYTES`` stays serial rather than spend longer starting
     workers than re-deriving.
 
+    A **negative** ``requested`` counts back from the CPU count, the convention
+    joblib and scikit-learn use and the one people arrive with: ``-1`` is every
+    CPU, ``-2`` every CPU but one -- the useful form, since it leaves the
+    machine usable while the batch runs. Below one worker it clamps rather than
+    raising: ``-32`` on an eight-core box means "as few as possible", and
+    refusing it would be pedantry about a number nobody typed deliberately.
+
     An explicit ``--jobs`` is honoured whatever the size: someone who asked for
     workers gets them, and someone who asked for one gets a single process and a
     readable traceback. It is also the lever for **memory**, which is the one
@@ -890,22 +897,26 @@ def resolve_workers(requested: int | None, jobs: Sequence[ReprocessJob]) -> int:
     complains.
 
     Raises:
-        ValueError: ``requested`` is below 1. Zero workers is not a slower
-            reprocess, it is no reprocess.
+        ValueError: ``requested`` is zero. Every other integer names a worker
+            count; zero names none, and no workers is not a slower reprocess,
+            it is no reprocess.
     """
-    if requested is not None and requested < 1:
+    cpus = os.cpu_count() or 1
+    if requested == 0:
         raise ValueError(
-            f"jobs must be at least 1, got {requested!r}. Pass 1 to re-derive "
-            "everything in this process."
+            "jobs must not be 0. A positive count is that many worker "
+            f"processes; a negative one counts back from the {cpus} CPU(s), so "
+            "-1 is all of them and -2 all but one."
         )
     count = len(jobs)
     if count <= 0:
         return 1
     if requested is not None:
-        return min(requested, count)
+        resolved = requested if requested > 0 else max(1, cpus + 1 + requested)
+        return min(resolved, count)
     if count < 2 or sum(_record_size(job) for job in jobs) < _PARALLEL_MIN_BYTES:
         return 1
-    return max(1, min(os.cpu_count() or 1, count))
+    return max(1, min(cpus, count))
 
 
 def _map_jobs(
