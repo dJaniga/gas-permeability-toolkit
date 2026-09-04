@@ -213,6 +213,8 @@ class TestClassification:
         [
             "sample.length",
             "sample.diameter",
+            "sample.porosity",
+            "sample.porosity_unit",
             "hardware.pressure_calibration.inlet.value_max",
             "hardware.flowmeters.low_range.flow_max",
             "run.gas.name",
@@ -235,6 +237,19 @@ class TestClassification:
         """`sample.porosity_uncertainty` sits under a result prefix in spelling only."""
         assert classify_change("sample.porosity_fraction") == "result"
         assert classify_change("sample.porosity_uncertainty") == "uncertainty"
+
+    def test_both_spellings_of_porosity_move_the_result(self):
+        """The model says `porosity`; snapshots predating the rename say
+        `porosity_fraction`. A re-measured porosity moves k under Dicker-Smits
+        either way, and classifying the current spelling as metadata made the
+        most ordinary correction there is trip the surprise warning.
+        """
+        assert classify_change("sample.porosity") == "result"
+        assert classify_change("sample.porosity_fraction") == "result"
+
+    def test_how_a_porosity_was_measured_is_not_an_input(self):
+        """`porosity_method` sits under the same prefix but enters no equation."""
+        assert classify_change("sample.porosity_method") == "metadata"
 
     def test_a_diff_reports_only_what_changed(self):
         before = {"sample": {"length": 5.0, "id": "core-041"}}

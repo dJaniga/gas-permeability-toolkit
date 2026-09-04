@@ -91,6 +91,23 @@ _RESULT_PREFIXES: tuple[str, ...] = (
     # pulse-decay run it moves k. On a steady-state run it moves nothing.
     # Classified as result-bearing because the conservative error is to warn
     # about a change that turns out to be harmless.
+    #
+    # Both spellings, and both are load-bearing: ``porosity`` is the field the
+    # model carries today and the one a diff reports, while
+    # ``porosity_fraction`` is the older name still sitting in snapshots
+    # recorded before the rename. Naming only the old one made a re-measured
+    # porosity read as *metadata* -- and since it does move k on a pulse-decay
+    # rig, every such run then tripped the "moved but was predicted not to"
+    # warning, on the single most ordinary correction there is.
+    #
+    # The unit belongs here too: it scales the number the correction consumes,
+    # so 17.883 in "%" and 0.17883 as a fraction must not be one field changing
+    # and the other not. ``porosity_method`` deliberately stays metadata -- how
+    # a porosity was obtained is not an input to the arithmetic -- and
+    # ``porosity_uncertainty`` is caught by the uncertainty markers first,
+    # which is checked ahead of these prefixes.
+    "sample.porosity",
+    "sample.porosity_unit",
     "sample.porosity_fraction",
     "hardware.daq",
     "hardware.pressure_calibration",
