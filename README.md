@@ -269,6 +269,8 @@ conventions (`--allow-mixed-conditions`), and mixed methods
 gasperm summarize                       # every plug the runs directory holds
 gasperm summarize core-041              # one plug, in full
 gasperm summarize core-041 -o core-041.yaml
+gasperm summarize core-041 --csv core-041.csv   # a spreadsheet table
+gasperm summarize --csv bench.csv               # ...every plug, in one file
 ```
 
 Identity — geometry, and the porosity and bulk density exactly as the sample
@@ -277,7 +279,14 @@ run with its result and uncertainty, the fit across them, the
 leak tests behind them — and **the gaps**: a run that never confirmed, a series
 one pressure short of a fit, two meters where there should be one, a
 pulse-decay campaign with no leak test. It also notices when a plug's history is
-two campaigns rather than one and points at `compare --split`. Details:
+two campaigns rather than one and points at `compare --split`.
+
+`--csv` writes the same reduction as one flat table for Excel: **one row per
+run**, carrying the plug's porosity, geometry and Klinkenberg result beside that
+run's `P_in`, `P_out`, `P_mean`, `dP0`, `k` and `U(k)`. Pressures and
+permeabilities are in the rig's display units, named in each heading. With no
+plug named, every plug goes into the one file. `-o` still writes the YAML, in
+stored units, for a script to parse. Details:
 [summarize](MANUAL.md#summarize-and-its-findings).
 
 ### `compare`

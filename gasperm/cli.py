@@ -1910,6 +1910,13 @@ def summarize_command(
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Write the summary to a YAML file."
     ),
+    csv_output: Optional[Path] = typer.Option(
+        None, "--csv", metavar="PATH",
+        help="Write a spreadsheet table: one row per run, carrying the plug's "
+             "porosity and geometry, P_in/P_out/P_mean, k and U(k), and the "
+             "plug's Klinkenberg result. With no plug named, every plug in the "
+             "runs directory goes into the one file.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Everything one core plug has been through, on one page.
@@ -1923,17 +1930,10 @@ def summarize_command(
     A re-derived run supersedes the original it came from, so one measurement is
     never counted twice.
 
-    With no plug named, lists every one the runs directory holds.
+    With no plug named, lists every one the runs directory holds -- or, with
+    ``--csv``, writes every one of them into a single spreadsheet table.
     """
-    from gasperm.klinkenberg import fit_klinkenberg
-    from gasperm.storage import (
-        drop_superseded,
-        find_runs,
-        runs_for_sample,
-        summary_from_run,
-        write_sample_summary,
-    )
-    from gasperm.summary import build_report
+    from gasperm.storage import find_runs, write_sample_summary, write_sample_summary_csv
 
     _configure_logging(verbose)
     resolved_runs_dir = _resolve_runs_dir(runs_dir, config_dir)
@@ -1943,18 +1943,90 @@ def summarize_command(
         return
 
     if sample is None:
-        _print_plug_roster(everything, resolved_runs_dir)
+        if csv_output is None:
+            _print_plug_roster(everything, resolved_runs_dir)
+            return
+        # A bench-wide export: the same per-plug report, for every plug, into
+        # one table. It costs what running the command once per plug costs,
+        # because each plug's Klinkenberg fit re-reduces that plug's runs.
+        plugs = sorted({r.sample_id for r in everything if r.sample_id})
+        reports = [
+            _sample_report(
+                everything, plug,
+                window=window,
+                allow_unsteady=allow_unsteady,
+                allow_mixed_methods=allow_mixed_methods,
+            )[0]
+            for plug in plugs
+        ]
+        saved = write_sample_summary_csv(
+            reports, csv_output,
+            pressure_unit=_summary_pressure_unit(config_dir),
+            permeability_unit=_summary_permeability_unit(config_dir),
+        )
+        rows = sum(
+            len(r.measurements) + len(r.excluded) + len(r.leak_tests) for r in reports
+        )
+        typer.secho(
+            f"{len(reports)} plug(s), {rows} run(s) written to {saved}",
+            fg=typer.colors.GREEN,
+        )
         return
 
     sample_id = _resolve_sample_id(sample)
+    report, superseded = _sample_report(
+        everything, sample_id,
+        window=window,
+        allow_unsteady=allow_unsteady,
+        allow_mixed_methods=allow_mixed_methods,
+        runs_dir=resolved_runs_dir,
+    )
+    _print_sample_summary(
+        report, resolved_runs_dir, superseded, _summary_pressure_unit(config_dir)
+    )
+
+    if output is not None:
+        saved = write_sample_summary(report, output)
+        typer.secho(f"\nSummary written to {saved}", fg=typer.colors.GREEN)
+
+    if csv_output is not None:
+        saved = write_sample_summary_csv(
+            [report], csv_output,
+            pressure_unit=_summary_pressure_unit(config_dir),
+            permeability_unit=_summary_permeability_unit(config_dir),
+        )
+        typer.secho(f"Table written to {saved}", fg=typer.colors.GREEN)
+
+
+def _sample_report(
+    everything,
+    sample_id: str,
+    *,
+    window: Optional[float],
+    allow_unsteady: bool,
+    allow_mixed_methods: bool,
+    runs_dir: Optional[Path] = None,
+):
+    """One plug's report and its superseded runs, from the discovered runs.
+
+    Shared by the single-plug page and the bench-wide ``--csv`` export, so the
+    two cannot drift: a row in the table has to be the same reduction the page
+    would have shown for that plug.
+
+    ``runs_dir`` is only for the error message when the plug is unknown, which
+    the export does not need -- it names plugs the runs themselves recorded.
+    """
+    from gasperm.klinkenberg import fit_klinkenberg
+    from gasperm.storage import drop_superseded, runs_for_sample, summary_from_run
+    from gasperm.summary import build_report
+
     records = runs_for_sample(everything, sample_id)
     if not records:
         present = sorted({r.sample_id for r in everything if r.sample_id})
         _fail(
-            f"No runs found for {sample_id!r} in {resolved_runs_dir}."
+            f"No runs found for {sample_id!r} in {runs_dir}."
             + (f" Plugs recorded there: {', '.join(present)}." if present else "")
         )
-        return
 
     records, superseded = drop_superseded(records)
     records = sorted(records, key=lambda r: (r.started_at is None, r.started_at))
@@ -1977,14 +2049,7 @@ def summarize_command(
             except ValueError as exc:
                 logger.debug("No Klinkenberg fit for %s: %s", sample_id, exc)
 
-    report = build_report(sample_id, records, summaries, klinkenberg=fit)
-    _print_sample_summary(
-        report, resolved_runs_dir, superseded, _summary_pressure_unit(config_dir)
-    )
-
-    if output is not None:
-        saved = write_sample_summary(report, output)
-        typer.secho(f"\nSummary written to {saved}", fg=typer.colors.GREEN)
+    return build_report(sample_id, records, summaries, klinkenberg=fit), superseded
 
 
 def _print_plug_roster(records, runs_dir: Path) -> None:
@@ -3454,6 +3519,22 @@ def _summary_pressure_unit(config_dir: Path) -> str:
         return load_run_config(config_dir / RUN_FILENAME).display_pressure_unit
     except (ConfigError, OSError):
         return "atm"
+
+
+def _summary_permeability_unit(config_dir: Path) -> str:
+    """The unit the ``summarize`` spreadsheet reports permeabilities in.
+
+    ``run.yaml``'s display unit, for the same reason as the pressure one: an
+    exported table is read by the operator, in the unit the console and the
+    plot already use for the same rig. The console table itself stays in mD,
+    which its caption names.
+    """
+    from gasperm.config import RUN_FILENAME, load_run_config
+
+    try:
+        return load_run_config(config_dir / RUN_FILENAME).display_permeability_unit
+    except (ConfigError, OSError):
+        return "mD"
 
 
 def _discover_points(records, *, window, allow_unsteady):

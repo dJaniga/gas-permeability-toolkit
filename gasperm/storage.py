@@ -62,9 +62,11 @@ __all__ = [
     "run_method",
     "run_purpose",
     "safe_sample_id",
+    "summary_csv_columns",
     "summary_from_run",
     "write_comparison_result",
     "write_sample_summary",
+    "write_sample_summary_csv",
     "write_klinkenberg_result",
 ]
 
@@ -1006,6 +1008,235 @@ def write_sample_summary(report, path: str | Path) -> Path:
     output_path.write_text(
         yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8"
     )
+    return output_path
+
+
+#: Plug-level columns, repeated on every row of that plug. A spreadsheet is
+#: filtered, sorted and pivoted rather than read top to bottom, so a row has to
+#: carry its own identity instead of inheriting it from a heading above it.
+_SUMMARY_CSV_SAMPLE_COLUMNS: tuple[str, ...] = (
+    "sample_id",
+    "porosity_fraction",
+    "porosity",
+    "porosity_unit",
+    "porosity_uncertainty",
+    "porosity_method",
+    "bulk_density_g_cm3",
+    "length_cm",
+    "diameter_cm",
+    "lithology",
+    "formation",
+    "well",
+    "depth",
+    "depth_unit",
+    "description",
+)
+
+#: Per-run columns that carry no unit, in order, after the pressures and
+#: permeabilities the units are chosen for.
+_SUMMARY_CSV_TAIL_COLUMNS: tuple[str, ...] = (
+    "gas",
+    "mean_temperature_C",
+    "duration_s",
+    "flowmeter",
+    "downstream_pressure",
+    "derived_from",
+    "excluded_reason",
+)
+
+
+def summary_csv_columns(
+    pressure_unit: str = "atm", permeability_unit: str = "mD"
+) -> tuple[str, ...]:
+    """The columns :func:`write_sample_summary_csv` writes, in order.
+
+    The unit is part of the heading, as it is in ``readings.csv``: a column of
+    numbers in a spreadsheet has nothing else to say what it is in, and the
+    caption the console table uses -- the unit stated once above the table --
+    does not survive being imported into Excel.
+    """
+    pressure = units.normalize_pressure_unit(pressure_unit)
+    permeability = units.normalize_permeability_unit(permeability_unit)
+    return (
+        *_SUMMARY_CSV_SAMPLE_COLUMNS,
+        "run",
+        "date",
+        "started_at",
+        "method",
+        "purpose",
+        "role",
+        "confirmed",
+        f"P_in_{pressure}",
+        f"P_out_{pressure}",
+        f"P_mean_{pressure}",
+        f"P_in_at_pulse_{pressure}",
+        f"P_out_at_pulse_{pressure}",
+        f"dP0_{pressure}",
+        f"k_{permeability}",
+        f"U_k_{permeability}",
+        "U_k_relative",
+        f"k_L_{permeability}",
+        f"U_k_L_{permeability}",
+        "b_atm",
+        "klinkenberg_r_squared",
+        "klinkenberg_points",
+        *_SUMMARY_CSV_TAIL_COLUMNS,
+    )
+
+
+def _csv_number(value: float | None) -> str:
+    """One number for a spreadsheet cell; an empty cell for a missing one.
+
+    ``%.10g`` rather than ``repr``: it keeps every digit a transducer or a fit
+    could justify, while keeping a converted value from arriving as
+    ``0.30000000000000004``, which is the form that makes a column of good
+    numbers look like it has a bug in it. An empty cell, not ``--`` or ``nan``,
+    because anything else turns the whole column into text.
+    """
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    return f"{value:.10g}"
+
+
+def write_sample_summary_csv(
+    reports: Sequence,
+    path: str | Path,
+    *,
+    pressure_unit: str = "atm",
+    permeability_unit: str = "mD",
+) -> Path:
+    """Write plug summaries as one flat table, one row per run.
+
+    The shape a spreadsheet wants: every row carries its plug's identity and
+    its plug's Klinkenberg result beside that run's own result, so filtering to
+    one plug, sorting by mean pressure, or plotting k against porosity are each
+    one operation and none of them need the rows read in order. Several reports
+    write into one file for the same reason -- a bench-wide table is a
+    concatenation of per-plug ones.
+
+    Two deliberate differences from the console table, both because a
+    spreadsheet column is read as a *series* rather than a row at a time:
+
+    * The **schema is fixed**. The table drops the dP0 column from a plug
+      measured only in steady state; here that column stays and its cells are
+      empty, so two exports stack without their headings being reconciled first.
+    * ``P_in``/``P_out`` are always the **means over the measured window**, and
+      the pressures at the pulse get columns of their own. The table shows one
+      or the other per row and says which in its caption, which is right for
+      something a person reads; a column whose meaning changed halfway down
+      would be averaged, plotted and compared as though it had not. This is the
+      same rule the YAML summary follows.
+
+    Pressures and permeabilities are converted out of the internal atm and
+    darcy into the units named in the headings: this file is read by an
+    operator in a spreadsheet, not parsed back by this package, and the YAML
+    written by ``--output`` remains the machine-readable form in stored units.
+
+    Args:
+        reports: The ``SampleReport``s to write, in the order they appear.
+        path: The CSV to write.
+        pressure_unit: Unit for every pressure column.
+        permeability_unit: Unit for every permeability column.
+
+    Returns:
+        The path written.
+    """
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = summary_csv_columns(pressure_unit, permeability_unit)
+
+    def pressure(value_atm: float | None) -> str:
+        if value_atm is None:
+            return ""
+        return _csv_number(units.from_atm(value_atm, pressure_unit))
+
+    def permeability(value_darcy: float | None) -> str:
+        if value_darcy is None:
+            return ""
+        return _csv_number(units.darcy_to(value_darcy, permeability_unit))
+
+    # utf-8-sig: the byte-order mark is what makes Excel open the file as UTF-8
+    # on a double click rather than guessing a local code page. Python's csv
+    # module and pandas both strip it, so no other reader notices.
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        for report in reports:
+            fit = report.klinkenberg
+            identity = [
+                report.sample_id,
+                _csv_number(report.porosity_fraction),
+                # Beside the fraction: the sample file's own words for the same
+                # number, unrounded and in the unit it was entered in.
+                _csv_number(report.porosity),
+                report.porosity_unit or "",
+                _csv_number(report.porosity_uncertainty),
+                report.porosity_method or "",
+                _csv_number(report.bulk_density_g_cm3),
+                _csv_number(report.length_cm),
+                _csv_number(report.diameter_cm),
+                report.lithology or "",
+                report.formation or "",
+                report.well or "",
+                _csv_number(report.depth),
+                report.depth_unit or "",
+                report.description or "",
+            ]
+            klinkenberg = [
+                permeability(
+                    fit.liquid_permeability_darcy if fit is not None else None
+                ),
+                permeability(
+                    fit.liquid_permeability_expanded_uncertainty_darcy
+                    if fit is not None
+                    else None
+                ),
+                _csv_number(fit.slippage_factor_atm if fit is not None else None),
+                _csv_number(fit.r_squared if fit is not None else None),
+                str(fit.point_count) if fit is not None else "",
+            ]
+            rows = (
+                *((line, "measurement") for line in report.measurements),
+                *((line, "excluded") for line in report.excluded),
+                *((line, "leak_test") for line in report.leak_tests),
+            )
+            for line, role in rows:
+                pulse = line.method == "pulse_decay"
+                writer.writerow(
+                    [
+                        *identity,
+                        line.name,
+                        line.started_at.date().isoformat() if line.started_at else "",
+                        line.started_at.isoformat() if line.started_at else "",
+                        line.method,
+                        line.purpose,
+                        role,
+                        # Not TRUE/FALSE: a spreadsheet reads those as booleans
+                        # in some locales and as text in others.
+                        "yes" if line.confirmed else "no",
+                        pressure(line.inlet_pressure_atm),
+                        pressure(line.downstream_pressure_atm),
+                        pressure(line.mean_pressure_atm),
+                        # The setup condition, in its own columns and only where
+                        # there was a pulse to have one.
+                        pressure(line.initial_inlet_pressure_atm if pulse else None),
+                        pressure(
+                            line.initial_downstream_pressure_atm if pulse else None
+                        ),
+                        pressure(line.pulse_amplitude_atm if pulse else None),
+                        permeability(line.permeability_darcy),
+                        permeability(line.expanded_uncertainty_darcy),
+                        _csv_number(line.relative_uncertainty),
+                        *klinkenberg,
+                        line.gas_name or "",
+                        _csv_number(line.temperature_c),
+                        _csv_number(line.duration_s),
+                        line.flowmeter or "",
+                        describe_convention(line.downstream_convention),
+                        line.derived_from or "",
+                        line.excluded_reason or "",
+                    ]
+                )
     return output_path
 
 

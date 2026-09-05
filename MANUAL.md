@@ -959,6 +959,49 @@ the plug's own typical spacing **and** at least three days, with two runs either
 side — so pressure steps hours apart never read as two campaigns, and neither
 does monthly monitoring.
 
+### The spreadsheet export
+
+`--csv` writes the same reduction as a flat table — **one row per run** — for
+the analysis that happens in Excel rather than in this package: k against
+porosity across a bench, a Klinkenberg series sorted by mean pressure, a plot
+for a report. With no plug named, every plug in the runs directory goes into the
+one file, which is what a bench-wide table is.
+
+```
+sample_id,porosity_fraction,porosity,porosity_unit,...,P_in_kPa,P_out_kPa,P_mean_kPa,...,k_mD,U_k_mD,U_k_relative,k_L_mD,...
+core-041,0.104321,10.4321,%,...,759.9375,253.3125,506.625,...,0.9,0.037757,0.041952,0.520566,...
+```
+
+Every row carries its **plug's** identity and its plug's Klinkenberg result
+beside that run's own numbers. That is redundant in a file read top to bottom
+and necessary in one that is filtered, sorted and pivoted, where a row has to
+stand on its own rather than inherit anything from a heading above it.
+
+Two rules differ from the printed table, both because a spreadsheet column is
+read as a **series** rather than a row at a time:
+
+- **The schema is fixed.** The table drops the `dP0` column from a plug measured
+  only in steady state; here the column stays and its cells are empty, so two
+  exports stack without their headings having to be reconciled first.
+- **`P_in` and `P_out` are always the window means**, and the pressures at the
+  pulse have columns of their own (`P_in_at_pulse_*`, `P_out_at_pulse_*`). The
+  table shows one or the other per row and says which in its caption, which is
+  right for something a person reads; a column whose meaning changed halfway
+  down would be averaged, plotted and compared as though it had not. This is the
+  rule `--output` already follows.
+
+Pressures and permeabilities are converted into `run.display_pressure_unit` and
+`run.display_permeability_unit`, with the unit in each heading — a column of
+numbers in a spreadsheet has nothing else to say what it is in, and the caption
+trick the console table uses does not survive being imported. A missing value is
+an **empty cell**, never `--` or `nan`, both of which turn the whole column into
+text. The file is written UTF-8 with a byte-order mark, which is what makes
+Excel open it as UTF-8 on a double click; Python and pandas both strip it.
+
+`--output` remains the machine-readable form: nested, in stored units, and
+carrying the findings prose that has nowhere to go in a rectangular table. The
+two can be written in the same invocation.
+
 ## Comparing two campaigns
 
 ### The measurand is the change, not either value

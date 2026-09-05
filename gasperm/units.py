@@ -73,6 +73,7 @@ __all__ = [
     "fahrenheit_to_celsius",
     "circle_area_cm2",
     "normalize_pressure_unit",
+    "normalize_permeability_unit",
     "normalize_porosity_unit",
     "porosity_to_fraction",
     "porosity_from_fraction",
@@ -469,7 +470,7 @@ _PERMEABILITY_ALIASES.update(
 )
 
 
-def _normalize_permeability_unit(unit: str) -> str:
+def normalize_permeability_unit(unit: str) -> str:
     canonical = _PERMEABILITY_ALIASES.get(unit.strip().lower())
     if canonical is None:
         supported = ", ".join(sorted(SUPPORTED_PERMEABILITY_UNITS))
@@ -481,12 +482,12 @@ def _normalize_permeability_unit(unit: str) -> str:
 
 def darcy_to(value_darcy: float, unit: str) -> float:
     """Convert an internal darcy value out to ``unit`` (display/storage)."""
-    return value_darcy * _PER_DARCY[_normalize_permeability_unit(unit)]
+    return value_darcy * _PER_DARCY[normalize_permeability_unit(unit)]
 
 
 def darcy_from(value: float, unit: str) -> float:
     """Convert a permeability expressed in ``unit`` back to darcy."""
-    return value / _PER_DARCY[_normalize_permeability_unit(unit)]
+    return value / _PER_DARCY[normalize_permeability_unit(unit)]
 
 
 # --------------------------------------------------------------------------

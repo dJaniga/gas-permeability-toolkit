@@ -8,6 +8,7 @@ has no leak test behind it -- and those are the reasons to run it.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -667,5 +668,173 @@ class TestSummaryFile:
     def test_the_flags_are_documented_in_help(self):
         result = runner.invoke(app, ["summarize", "--help"], env={"COLUMNS": "200"})
         output = strip_ansi(result.output)
-        for flag in ("--output", "--allow-unsteady", "--runs-dir"):
+        for flag in ("--output", "--csv", "--allow-unsteady", "--runs-dir"):
             assert flag in output
+
+
+class TestSummaryCsv:
+    """``--csv``: the same reduction as the page, flattened for a spreadsheet.
+
+    Everything that differs from the printed table follows from a column being
+    read as a *series*: the schema is fixed whatever the plug was measured by,
+    a pressure column means one thing all the way down, and every row carries
+    its own plug's identity rather than inheriting it from a heading above it.
+    """
+
+    def rows(self, rig, *args, path):
+        result = summarize(rig, *args, "--csv", str(path))
+        assert result.exit_code == 0, result.output
+        # utf-8-sig on the way in as well as out: the BOM is what makes Excel
+        # open the file as UTF-8, and every other reader strips it.
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_one_row_per_run_with_the_headline_numbers(self, tmp_path):
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,), porosity_fraction=0.11)
+        row = self.rows(rig, "core-041", path=tmp_path / "out.csv")[0]
+
+        assert row["sample_id"] == "core-041"
+        assert float(row["porosity_fraction"]) == pytest.approx(0.11)
+        # write_measured_run puts the pair at 1.5x and 0.5x the mean.
+        assert float(row["P_in_kPa"]) == pytest.approx(units.from_atm(15.0, "kPa"))
+        assert float(row["P_out_kPa"]) == pytest.approx(units.from_atm(5.0, "kPa"))
+        assert float(row["P_mean_kPa"]) == pytest.approx(units.from_atm(10.0, "kPa"))
+        assert float(row["k_mD"]) == pytest.approx(0.7, rel=1e-6)
+        assert float(row["U_k_mD"]) > 0.0
+        assert float(row["U_k_relative"]) == pytest.approx(
+            float(row["U_k_mD"]) / float(row["k_mD"])
+        )
+        assert row["role"] == "measurement"
+        assert row["confirmed"] == "yes"
+
+    def test_every_row_carries_the_plugs_klinkenberg_result(self, tmp_path):
+        """A spreadsheet is filtered and pivoted, not read top to bottom."""
+        rig = make_rig(tmp_path)
+        add_series(rig)
+        rows = self.rows(rig, "core-041", path=tmp_path / "out.csv")
+        assert len(rows) == 3
+        for row in rows:
+            assert float(row["k_L_mD"]) == pytest.approx(0.5, rel=1e-3)
+            assert float(row["b_atm"]) == pytest.approx(4.0, rel=1e-3)
+            assert int(row["klinkenberg_points"]) == 3
+
+    def test_a_plug_with_no_fit_leaves_those_cells_empty(self, tmp_path):
+        """Empty, not ``--``: anything else turns the whole column into text."""
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        row = self.rows(rig, "core-041", path=tmp_path / "out.csv")[0]
+        assert row["k_L_mD"] == ""
+        assert row["b_atm"] == ""
+
+    def test_the_units_are_the_rigs_and_are_named_in_the_headings(self, tmp_path):
+        """A column of numbers has nothing but its heading to say what it is in."""
+        from gasperm import units
+        from gasperm.config import RUN_FILENAME
+
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        path = rig / RUN_FILENAME
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace('display_pressure_unit: "kPa"', 'display_pressure_unit: "bar"')
+            .replace("display_pressure_unit: kPa", "display_pressure_unit: bar"),
+            encoding="utf-8",
+        )
+        row = self.rows(rig, "core-041", path=tmp_path / "out.csv")[0]
+        assert "P_mean_bar" in row
+        assert "P_mean_kPa" not in row
+        assert float(row["P_mean_bar"]) == pytest.approx(units.from_atm(10.0, "bar"))
+
+    def test_the_schema_does_not_depend_on_the_method(self, tmp_path):
+        """Two exports must stack without their headings being reconciled."""
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        steady = self.rows(rig, "core-041", path=tmp_path / "steady.csv")[0]
+        assert "dP0_kPa" in steady
+        assert steady["dP0_kPa"] == ""
+
+        pulse_rig = make_rig(tmp_path / "other")
+        write_measured_run(
+            pulse_rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        pulse = self.rows(pulse_rig, "core-041", path=tmp_path / "pulse.csv")[0]
+        assert list(pulse) == list(steady)
+
+    def test_a_pulse_row_keeps_its_means_and_its_setup_condition_apart(self, tmp_path):
+        """The table swaps one for the other per row and says so in its caption.
+
+        A column cannot: it would be averaged and plotted as though its meaning
+        had not changed halfway down. So the pressures at the pulse get columns
+        of their own, and P_in/P_out stay the window means all the way down.
+        """
+        from gasperm import units
+
+        rig = make_rig(tmp_path)
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 9, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1.2e-5,
+            method="pulse_decay", pulse_amplitude_atm=0.5,
+        )
+        row = self.rows(rig, "core-041", path=tmp_path / "out.csv")[0]
+        assert float(row["P_in_kPa"]) == pytest.approx(units.from_atm(45.0, "kPa"))
+        assert float(row["P_in_at_pulse_kPa"]) == pytest.approx(
+            units.from_atm(30.5, "kPa")
+        )
+        assert float(row["P_out_at_pulse_kPa"]) == pytest.approx(
+            units.from_atm(30.0, "kPa")
+        )
+        assert float(row["dP0_kPa"]) == pytest.approx(units.from_atm(0.5, "kPa"))
+
+    def test_leak_tests_and_unconfirmed_runs_say_what_they_are(self, tmp_path):
+        """They are on the page, so they are in the file -- named, not counted."""
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        unconfirm(
+            write_measured_run(
+                rig / "runs", "core-041",
+                datetime(2026, 1, 10, 15, tzinfo=timezone.utc),
+                mean_pressure_atm=12.0, permeability_darcy=9e-4,
+            )
+        )
+        write_measured_run(
+            rig / "runs", "core-041",
+            datetime(2026, 1, 10, 18, tzinfo=timezone.utc),
+            mean_pressure_atm=30.0, permeability_darcy=1e-8,
+            method="pulse_decay", purpose="leak_test", pulse_amplitude_atm=0.5,
+        )
+        rows = self.rows(rig, "core-041", path=tmp_path / "out.csv")
+        assert {row["role"] for row in rows} == {"measurement", "excluded", "leak_test"}
+        excluded = next(row for row in rows if row["role"] == "excluded")
+        assert excluded["confirmed"] == "no"
+        assert excluded["excluded_reason"]
+
+    def test_with_no_plug_named_every_plug_lands_in_one_file(self, tmp_path):
+        """A bench-wide table is a concatenation of the per-plug ones."""
+        rig = make_rig(tmp_path)
+        add_series(rig, "core-041", pressures=(10.0, 20.0))
+        add_series(rig, "core-099", pressures=(10.0,))
+        rows = self.rows(rig, path=tmp_path / "bench.csv")
+        assert len(rows) == 3
+        assert {row["sample_id"] for row in rows} == {"core-041", "core-099"}
+
+    def test_the_roster_is_still_what_prints_without_it(self, tmp_path):
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        assert "plug(s) in" in strip_ansi(summarize(rig).output)
+
+    def test_the_page_and_the_table_can_be_written_together(self, tmp_path):
+        rig = make_rig(tmp_path)
+        add_series(rig, pressures=(10.0,))
+        table, page = tmp_path / "out.csv", tmp_path / "out.yaml"
+        result = summarize(rig, "core-041", "--csv", str(table), "--output", str(page))
+        assert result.exit_code == 0, result.output
+        assert table.exists() and page.exists()
+        # The page is still printed: a file is an extra, not a redirection.
+        assert "core-041" in strip_ansi(result.output)
